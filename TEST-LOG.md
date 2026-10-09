@@ -114,3 +114,36 @@ All four RADV devices report the **SAME Device UUID** (`ac3da3d19386ed23d795ff78
 `-D/--use-device` cannot tell them apart. The ONLY way found to pin a benchmark to one GPU is
 `MESA_VK_DEVICE_SELECT=vid:did!` — which is exactly what `spirit run` emits. **On this box, spirit is
 not decoration; it is the mechanism that makes per-GPU benchmarking possible at all.**
+
+
+---
+
+## TEST J — THE LINK CLAIM, PROVEN (with a positive control) — ✅
+The claim that was only *suggested* by TEST G is now settled. Method: identical scene, identical
+duration, two frame sizes, three cards. If a card is transport-bound, shrinking the frame should send
+FPS soaring; if it is compute-bound, FPS will not move. Routed with `spirit run`, one card at a time.
+
+| card | 320x240 | fullscreen | ratio |
+|---|---|---|---|
+| card0  Instinct MI25 (x4 Gen3, 3.4 GB/s) | 5,039 | 113 | **44.6x** |
+| card2  Vega Frontier (x1 Gen3, 0.87 GB/s) | 1,350 | 29 | **46.6x** |
+| card1  RX 9070 XT (x16 Gen5, 54.4 GB/s) | 56,017 | 35,657 | **1.57x**  ← CONTROL |
+
+**A 76x reduction in per-frame pixels multiplies the Vega cards' throughput ~45x and the XT's by only
+1.57x.** So the Vega cards' throughput is dominated by PER-FRAME DATA MOVEMENT, and the XT's is not.
+**The link is the wall — proven, not suggested.**
+
+**Corroboration from the same data:** MI25 / FE = 3.73x (small) and 3.90x (fullscreen) — both very close
+to their **link-width ratio of 3.67x** (x4 vs x1). Two independent angles, one answer.
+
+**Clocks RULED OUT (this was the open question from TEST G):** memory clock identical on both (945 MHz),
+neither card boosted (core stayed at their idle levels, 1269 / 852 MHz), and both sat at trivial load.
+Equal clocks + 3.9x different throughput = the clock explanation is dead.
+
+**Honest caveat, stated so it is not over-read:** at 320x240 the FE moves only ~0.4 GB/s, *below* its
+0.87 GB/s ceiling — so this is a **SCALING** result, not a measurement of a saturated wire. What it
+proves is that per-frame volume governs these cards; it does not claim they were pinned at the ceiling.
+
+**Why this matters for the whole project:** it is the empirical basis for the Spiritual Successor's
+central law — *cross the link at FRAME rate or ONCE, never per pixel.* Per-frame pixel work is not slow
+here; it is 45x wrong.

@@ -50,7 +50,7 @@ def gpu_sample(card):
         "card": card,
         "vram_used_mib": (_i(b + "/mem_info_vram_used") or 0) // 1048576,
         "busy_pct": _i(b + "/gpu_busy_percent"),
-        "edge_c": None, "junction_c": None, "power_w": None, "sclk_mhz": None,
+        "edge_c": None, "junction_c": None, "power_w": None, "sclk_mhz": None, "mclk_mhz": None,
         "link_w": _i(b + "/current_link_width"),
         "link_gt": _r(b + "/current_link_speed"),
     }
@@ -66,6 +66,11 @@ def gpu_sample(card):
         for line in pps.splitlines():
             if line.rstrip().endswith("*") and ":" in line:
                 s["sclk_mhz"] = line.split(":", 1)[1].replace("*", "").strip()
+    ppm = _r(b + "/pp_dpm_mclk")
+    if ppm:
+        for line in ppm.splitlines():
+            if line.rstrip().endswith("*") and ":" in line:
+                s["mclk_mhz"] = line.split(":", 1)[1].replace("*", "").strip()
     return s
 
 
@@ -120,8 +125,8 @@ def main():
             time.sleep(max(0, 1.0 / a.hz))
 
     print("monitor — label=%s  samples=%d  over %.1fs  -> %s\n" % (a.label, n, a.seconds, a.out))
-    print("%-7s %-11s %-11s %-11s %-9s %-9s" % ("card", "peak VRAM", "peak busy%", "peak temp", "peak W", "clock"))
-    print("-" * 66)
+    print("%-7s %-11s %-11s %-11s %-9s %-10s %-10s" % ("card", "peak VRAM", "peak busy%", "peak temp", "peak W", "core clk", "mem clk"))
+    print("-" * 78)
     for c in cs:
         rows = [x for s in samples for x in s["gpus"] if x["card"] == c]
         if not rows:
@@ -131,8 +136,9 @@ def main():
         pt = max((r["junction_c"] or r["edge_c"] or 0) for r in rows)
         pw = max((r["power_w"] or 0) for r in rows)
         cl = next((r["sclk_mhz"] for r in reversed(rows) if r["sclk_mhz"]), "-")
-        print("%-7s %-11s %-11s %-11s %-9s %-9s" % (c, "%d MiB" % pv, "%d%%" % pb,
-              ("%.1fC" % pt) if pt else "-", ("%.1f" % pw) if pw else "-", cl))
+        ml = next((r["mclk_mhz"] for r in reversed(rows) if r["mclk_mhz"]), "-")
+        print("%-7s %-11s %-11s %-11s %-9s %-10s %-10s" % (c, "%d MiB" % pv, "%d%%" % pb,
+              ("%.1fC" % pt) if pt else "-", ("%.1f" % pw) if pw else "-", cl, ml))
     cpu = [s.get("cpu_busy_pct") for s in samples if s.get("cpu_busy_pct") is not None]
     ram = [s.get("ram_used_mib") for s in samples if s.get("ram_used_mib")]
     if cpu:
