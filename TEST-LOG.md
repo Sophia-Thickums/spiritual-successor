@@ -207,3 +207,32 @@ measure GPU contention on this card** — any "cost" it reports is chiefly CPU a
 - It is INVALID for measuring render cost under offload.
 - **To measure offload cost, the render load must be GPU-BOUND — i.e. a real game (NTE), at settings that
   saturate the card.** That is the next instrument, and it must be validated the same way (noise floor first).
+
+
+---
+
+## TEST L — the offload's cost, measured on a VALID instrument — and a genuine surprise
+**A GPU-BOUND instrument was found:** `ffmpeg -init_hw_device vulkan -vf nlmeans_vulkan` (4K denoise,
+pinned to the XT) holds the card at **86-100% busy, ~32 fps**. (vkmark's 35,000 fps is CPU/present-bound
+and CANNOT measure GPU contention — see TEST K pt2.)
+
+**`contend.py`, n=6 interleaved pairs:**
+```
+MAIN LOAD ALONE       mean 31.7 fps   sd 0.5   spread 1.5%
+MAIN LOAD + OFFLOAD   mean 33.8 fps   sd 0.4   spread 1.1%
+delta = +6.8%   pooled spread 1.3%   -> OUTSIDE NOISE
+```
+**The main load ran 6.8% FASTER while the offload was running on the other card.** Reproduced in all
+6/6 pairs, and again in a 4-condition re-run: `32, 34, 32, 34`.
+
+**Order/warmup RULED OUT:** running the SAME condition twice per pair (no offload anywhere) gives
+**-1.0%** (32.0 -> 31.7). So this is NOT a first-run/second-run artifact.
+
+**★ MECHANISM: UNEXPLAINED — and deliberately NOT claimed.** A clock attribution pass returned nonsense
+(XT core "median 38 MHz", mem 456 MHz during the offload vs 3147 / 1258 MHz alone), i.e. **that
+instrument is broken and its numbers are void.** Candidate causes, none verified: XT clock/power state,
+PCIe/SoC link state, CPU scheduling. **A real, reproducible +6.8% with no known cause is an open
+question, not a feature — do not quote it until the cause is found.**
+
+**What this session actually settled:** the link wall (proven), routing isolation (proven), the first
+working offload (proven), and the noise-floor discipline (which caught two would-be false results).
