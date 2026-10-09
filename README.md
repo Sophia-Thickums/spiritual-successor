@@ -18,6 +18,7 @@ spirit probe                     # the TRUE host link, VRAM, outputs, render nod
 spirit roles                     # assign a job to every card — all of them, or say why not
 spirit plan --workload 1440p60-framegen [--vram-mib N]
 spirit run --role encode --card card2 -- ffmpeg -i in.mkv -c:v hevc_vaapi out.mkv
+spirit play -- ./mygame                           # the GAME PATH — see below
 ```
 
 `spirit doctor` is the one to run first. It doesn't describe — it **tests**: it launches a real child
@@ -25,6 +26,30 @@ process per card and confirms the child sees exactly one GPU, reads every teleme
 that the role plan accounts for every card. Three verdicts — PASS / FAIL / UNKNOWN — and UNKNOWN is
 never a pass. It exits non-zero if anything fails. (Proven non-vacuous: fed a machine whose cards don't
 exist, it fails every check.)
+
+## ★ THE GAME PATH — `spirit play`
+
+```
+spirit play -- ./mygame
+```
+
+`spirit play` puts a game on the **strongest card** and puts the **other cards to work** while it runs.
+It picks the card that feeds your monitor, launches the game **pinned to it exclusively** with the
+other cards' device nodes hidden from it, and starts a **real H.264 VAAPI encode on every spare card**
+for as long as the game runs. The game exits, the offload stops. Every card earns its slot.
+
+## ★★ THE DEVICE PIN IS LOAD-BEARING, NOT JUST PROTECTIVE (measured 2026-10-09)
+
+This is the finding that made `play` necessary. Launched **without** a pin, a Vulkan game on a four-GPU
+box did not merely risk probing the wrong card — **it chose the wrong GPU outright.** On the dev box a
+UE5 game rendered on the **docked Instinct MI25** while the RX 9070 XT sat at **0% busytime, 39 C,
+22 W** — completely idle. The game was unplayable (multi-second freezes) and drove the docked card to
+**94 C, past its own 90 C trip.** Same game, same offload, **pinned to the display card: clean through
+combat and traversal, three other cards working underneath.**
+
+`MESA_VK_DEVICE_SELECT=<vid:did>!` — the trailing `!` is the **exclusive** flag: without it the loader
+merely *reorders* and the child still enumerates every GPU. With it, a child sees exactly **one**. Any
+multi-GPU launcher that omits this can silently run your game on the wrong card.
 
 ## The two truths it is built on (both measured — see the project folder)
 
@@ -92,11 +117,16 @@ Every number below is reproducible; raw monitor JSONL sits beside this file.
 - **Routing isolates.** Routed to each card, the child process sees exactly **one** GPU — the right one.
 - **The first real offload works.** A 1080p60 H.264 VAAPI encode ran on the **MI25 at ~197 fps** while
   the XT rendered at 100% busy (54 MiB allocated on the MI25 vs 7 idle).
-- **★ The feared penalty reversed.** With a GPU-bound load on the XT, running the offload on a second
-  card left the main card **~6.25% faster** (32.0→34.0 fps) — proven order-controlled (A-B-B-A: 32/34/34/32).
-  **Cause, identified:** with the second card busy the XT pins to **~3415 MHz / ~220 W**; idle it wanders
-  3.10–3.27 GHz. Co-running a GPU holds the main GPU in its top clock/power state.
-  *Scope: one synthetic GPU-bound load + one offload. Not yet generalised to games.*
+- **★ The feared penalty did not appear — and a tempting "gain" was retracted.** On a real UE5 game
+  (Black Myth Wukong) offloading to the second card cost the main card **~1–2%**; on the 8K benchmark
+  it cost **nothing** (+0.7%); on a full open-world session (NTE, all four cards working) the player
+  reported **no glitches or stutter.** The honest claim is the one we can stand behind: **the offload
+  costs the main card little to nothing, and the win is the WORK the other cards do — never free frames.**
+- **⚠ RETRACTED — do not quote.** A synthetic run once showed a second busy card making the main card
+  **~6.25% faster** (a real clock/power-state lift, order-controlled A-B-B-A). **It did not reproduce on
+  a real game**, where the effect is a small cost. And on 2026-10-09 the same trap caught us again: an
+  apparent **+1–2% on a benchmark was shader-cache warmup** — the first run compiles shaders and is far
+  slower in the tail. **Warm the cache before any A/B**, or the first run will manufacture a fake gain.
 
 **Dead ends — do not re-derive these:**
 - **Unigine Superposition** — its 2019 engine mis-detects RDNA4 ("Unknown GPU / 256 MB") and forces
@@ -111,6 +141,8 @@ Every number below is reproducible; raw monitor JSONL sits beside this file.
 
 - **MVP-0 (done):** `probe` + `roles` + `plan` + `run`. Honest link truth, role assignment across N
   cards, feasibility arithmetic, and a device router.
+- **Game path (done 2026-10-09):** `spirit play` — the game on the strongest card, every other card
+  working the tail. Verified live on UE5 and UE4 titles.
 - **MVP-1 (started):** a *measured* cross-device copy path, and VRAM budgeting in `plan` (a GPU-bound
   load costs ~10× the VRAM of a light one: 8.2 GiB vs 0.8 GiB measured).
 - **MVP-2:** a daemon holding role leases, so interactive roles pre-empt batch jobs.

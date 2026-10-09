@@ -12,8 +12,12 @@ SRC = "/tmp/sp_src.mp4"
 
 
 def enc(node, secs):
+    # ★ DO NOT pass -t: ffmpeg's -t counts OUTPUT seconds, and this encode runs ~2.2x realtime, so
+    #   "-t 240" finishes in ~107s of WALL time and the offload silently dies mid-round (cost us a
+    #   whole A-B-B-A on Boundary, 2026-10-09). With -stream_loop -1 and NO -t the encode runs until
+    #   this process terminates it at `secs` WALL seconds — which is what a "seconds of offload" means.
     return subprocess.Popen(
-        ["ffmpeg", "-y", "-stream_loop", "-1", "-i", SRC, "-t", str(secs),
+        ["ffmpeg", "-y", "-stream_loop", "-1", "-i", SRC,
          "-vf", "format=nv12,hwupload", "-vaapi_device", "/dev/dri/%s" % node,
          "-c:v", "h264_vaapi", "-f", "null", "-"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
