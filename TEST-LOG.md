@@ -619,3 +619,27 @@ XT -> Ryzen iGPU      : 2.91 GB/s                ->  1440p frame ~ 4.95 ms ONE W
 **So: the product's frame-gen feature is not blocked by our code — it is blocked by the platform's
 cross-device path on these links.** To ship it we need either a faster link to the frame-gen card, or the
 display moved onto that card (one-way), or the frame-gen on the iGPU-class device that shares memory.
+
+
+### TEST R, part 2 — ★ THE NEGATIVE TURNS A POSITIVE: the iGPU is a FEASIBLE frame-gen target
+Today's handoff measurements run against the frame budget, at 1440p@60 (budget 16.67 ms):
+```
+card3  Ryzen iGPU     2.91 GB/s   one-way  4.95 ms   round-trip  9.90 ms   FEASIBLE (both modes)
+card0  Instinct MI25  0.76 GB/s   one-way 18.95 ms   round-trip 37.91 ms   INFEASIBLE
+card2  Vega FE        0.25 GB/s   one-way 57.62 ms   round-trip 115.2 ms   INFEASIBLE
+```
+**The iGPU is the ONE card on this box that can carry the frame-gen/upscale pass — and it clears the
+budget even ROUND TRIP (9.9 of 16.7 ms), which means we can test it WITHOUT moving the monitor cable.**
+It has the fast path because it shares system RAM, so the "aperture" landing is its home memory rather
+than a PCIe crawl.
+
+**So the product is not dead on this box — it is REDIRECTED:**
+- Frame-gen/upscale to the MI25 or FE: dead by link (19 / 58 ms per frame).
+- Frame-gen/upscale to the **iGPU**: feasible, one-way OR round-trip, at 1440p60.
+- The iGPU is weak, so a *scaler/interpolator* is the realistic pass, not a heavy neural one — and it
+  already did 1,315 fps on vkmark's light scene, so real headroom exists for a per-frame pass at 60 Hz.
+
+**Shipped as a feature:** `spirit fg [--res 1440p60] [--mode round-trip]` — the tool now answers the
+gamer's actual question ("can my second card do frame-gen?") with measured rates and the arithmetic,
+and states the architecture rule it learned. It is honest about its inputs: the handoff table is
+measured on this box and must be re-measured elsewhere.
