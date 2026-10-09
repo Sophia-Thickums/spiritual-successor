@@ -358,3 +358,19 @@ GPU NOTHING — 329.3 vs 330.0 fps, i.e. within noise.**
 the main GPU has clock headroom it can even gain; where it is already saturated it is a wash.**
 *Scope: measured with one offload (VAAPI H.264 encode) on one secondary card (MI25). The generalisation
 to games is the obvious next test and needs a game run — which needs the owner's hands.*
+
+
+### TEST M, part 3 — baseline contamination CHECKED and CLEARED, + a thermal datum
+The baseline monitor's summary showed the MI25 with a 54 MiB peak, which COULD have meant an offload was
+running during the "alone" measurement and poisoned it. Checked the timeline sample-by-sample:
+```
+t=20-275   XT 100% busy, 1450-1500 MiB | MI25   7 MiB,  0% busy   <- Heaven ALONE, clean
+t=321-395  XT 100% busy, 1450-1500 MiB | MI25  54 MiB, ~25% busy  <- Heaven + OFFLOAD
+```
+The MI25 held **7 MiB and 0%** for the whole alone-window; its activity appears only in the later
+offload-window. **The 329.29 FPS baseline is uncontaminated and stands.** (The monitor simply spanned
+both runs — 430 s of window over two ~265 s runs.)
+
+**★ THERMAL DATUM:** under Heaven 4K the 9070 XT peaked at **92.0 C** — the heaviest thermal load
+recorded on this box (the light tests peaked at 75-77 C). 341-357 W sustained. Within spec, but it is
+the number to watch if a real game runs longer than a benchmark. Worth a `hotcard-guard` check.
