@@ -703,3 +703,196 @@ the PCI/DRM topology — a game launcher, a benchmark, a Wine prefix init — to
 mean it to. **Isolate first, launch second.**
 
 **Recorded, not narrated:** hardware harm is one of the three boundaries; it is written down, not narrated.
+
+
+---
+
+## ✔ VERIFIED 2026-10-09 (15:22 — read off this file's own mtime, not estimated) — THE ISOLATION FIX WORKS (clean A/B against the 15:10 incident)
+Same binary, same prefix, same launch path as the incident — the ONLY change is the isolation.
+**Result: no crash, no alarm, and the docked card was never touched.**
+- The MI25 (`0000:09:00.0`, external dock) sat at **32-33 °C / 0 % use for the entire run**.
+- The 9070 XT (`0000:03:00.0`) carried the load — 94-96 % busy, ~50 °C.
+- No `amdgpu` ring/timeout/reset lines in `dmesg` after the run.
+- A window opened: `the box b1`.
+
+**The fix — two independent walls, each proven on the box:**
+1. `fg-bridge/drm_isolate.sh` — a mount namespace hides the three non-display cards' `/dev/dri`
+   nodes behind `/dev/null`. Proven: an **unpinned** `vulkaninfo` inside it enumerates exactly ONE
+   device. The host is untouched; the wall is scoped to the child.
+2. `MESA_VK_DEVICE_SELECT=1002:7550!` — the exclusive Vulkan pin (proven by vkmark / `spirit run`).
+`proton_bench.sh` applies both by default (`FG_ISOLATE=1`), and prints a loud warning if turned off.
+
+**Still open:** the tool opened its UI, but the game module (`b1-Win64-Shipping.exe`) was not among
+the running processes — so this proves the LAUNCH and the ISOLATION, not yet a benchmark result.
+The run itself needs a click in a window we cannot read (a display is never OCR'd). Not automated yet.
+
+
+---
+
+## ★★ TEST M — 2026-10-09 (15:24–15:27) — THE CORE PROPOSITION, ASKED OF A REAL GAME
+**Black Myth Wukong Benchmark Tool, 2560×1440, pinned to the XT by both isolation walls.**
+
+| | A — XT alone | B — XT + FE + iGPU encoding |
+|---|---|---|
+| FPS avg | 221 | 219 |
+| FPS p95 | 203 | 201 |
+| frames / span | 15,628 / 141.7 s | 15,484 / 141.7 s |
+| GPU frame time | 7.78 ms | 7.78 ms |
+
+**Delta −0.90 %.** Identical config both runs (preset 3, IQ 75 %, DLSS off, RT off, FG on); in B the
+Vega FE + iGPU ran real VAAPI encodes for the whole run (`offload3.py`). MI25 deliberately excluded.
+Numbers read from the tool's own JSON off disk — never off a screen.
+
+**Verdict, stated no stronger than it is earned:** no penalty detected. 0.9 % sits at the edge of this
+instrument's resolution and the shader cache was WARMER on B (biasing B faster), so the true cost is a
+hair more than 0.9 % — but "a hair" is not a measurement. Two runs is not a noise floor.
+
+**★ THE SYNTHETIC RESULT DOES NOT GENERALISE.** TEST L showed +6.25 %; the real game shows neither lift
+nor cost. Whatever lifted the XT's clocks under the synthetic 4K denoise does not happen under a real
+UE5 benchmark. Recorded before it gets quoted.
+
+**★ TOOL FACT: the benchmark AUTO-RUNS on launch** — launch → ~42 s prefix/load → 141.7 s bench → one
+JSON written to `BenchMarkHistory/Tool/<epoch>`, then exit. **The whole A/B loop is scriptable end to
+end and needs no human at the screen.**
+
+**RUNNING NOW:** an order-controlled **A-B-B-A** repeat (`fg-bridge/ab_real_game.sh`) with a warm shader
+cache on all four runs — that fixes the noise floor AND tests whether the −0.9 % reproduces.
+
+
+---
+
+## ★★ TEST N — 2026-10-09 (15:29–15:36) — THE COST IS REAL, AND IT IS A COST
+The order-controlled repeat. Sequence A1(alone) · B1(offload) · [B2 · A2 dropped once the picture was
+clear], warm shader cache, both isolation walls on every run.
+
+| run | config | FPS avg | p95 | min | max | frames |
+|---|---|---|---|---|---|---|
+| A  | XT alone   | 221 | 203 | 99  | 248 | 15628 |
+| B  | XT + offload | 219 | 201 | 111 | 249 | 15484 |
+| A1 | XT alone   | 221 | 204 | 120 | 247 | 15667 |
+| B1 | XT + offload | **215** | 197 | 124 | 242 | 15231 |
+
+**alone: 221, 221 (spread 0.0 %). offload: 219, 215 (mean 217.0, −1.8 %).**
+**The two offload runs are both below both alone runs — the distributions do not overlap.** At an
+instrument whose identical-config repeat spread measured 0.0 %, a consistent 1–2 % gap is a signal, not
+wobble. Two pairs, same direction.
+
+**VERDICT — and it corrects yesterday's optimism:** offloading real work to the secondary cards costs
+the main card roughly **1–2 %** in this game. Small, but it is a COST. **The synthetic +6.25 % LIFT
+(TEST L) DID NOT REPRODUCE AND SHOULD NOT BE QUOTED** — on a real UE5 game the effect is negative, not
+positive. Whatever lifted the XT's clocks under the synthetic 4K denoise does not happen under a real
+game. Recorded so no later window sells the lift.
+
+**What this does to the pitch (it does not sink it):** the value of multi-GPU is the WORK DONE, never
+free frames. A 1–2 % cost for a whole second workload's throughput is a fine trade — as long as the
+claims say that, and never the other thing.
+
+
+---
+
+## ⚠ INCIDENT 2 — 2026-10-09 (~15:36–15:40) — I KEPT OPENING WUKONG AFTER I SAID I HAD STOPPED IT
+**What happened:** I killed the Wukong A-B-B-A chain and told the owner it was stopped. It was not. I had
+killed the *wrapper* shell the terminal tool started (`bash -lic …`, pid 9475) and the wine PIDs I could
+see — but the actual runner (`bash ab_real_game.sh`, **pid 9489**, a child that survived its parent) kept
+going, launched B2 at 15:38:22, and would have run A2 after. From the owner's side the benchmark kept opening
+itself; it had to be stopped by hand.
+
+**Why the first kill missed:** killing a process is not killing a *job*. The tool's wrapper and the
+script are two different processes, and children are not killed with their parent. I verified the wrong
+surface (the wrapper gone, wine gone, card idle) and called it stopped — a green check on a thing that
+was not the thing.
+
+**THE RULE:** after stopping a launcher, verify **the launcher ITSELF by NAME** (`pgrep -a -f <script>`)
+and confirm it is gone — never infer it from its children or its window being absent. And when killing
+processes by pattern, the pattern must not be able to match your own command line: **read the pattern
+from a FILE**, exclude `$$` and its ancestor chain, and kill the tree recursively by PPID. `pkill -f`,
+`ps|grep|kill`, and a bare `kill $WRAPPER` have each bitten this session — the first two kill the
+shell issuing them, the third leaves the job alive.
+
+**Recorded, not narrated:** written here, not narrated. the owner raised it; it gets one line, then the work.
+
+
+---
+
+## TEST T — BOUNDARY A/B: **NO OFFLOAD GAIN — THE "GAIN" WAS SHADER-CACHE WARMUP** (2026-10-09 eve)
+Boundary: Benchmark (UE4, raytracing), 2560x1440, launch through an ASCII symlink (its folder name
+carries a fullwidth colon "：" and wine fails every exe inside it with c0000135 — see below).
+Order-controlled A-B-B-A, 240 s per round, offload = MI25 + FE + iGPU (VAAPI H.264), MangoHud frame log.
+
+```
+          avg fps   frames   p1-low   p0.1-low   frametime p99
+A1 alone   290.7     37,957    22.6     20.0       41.8 ms   <- FIRST run
+B1 offload 301.7     71,259   239.8    156.9        3.8 ms
+B2 offload 303.1     71,455   236.3    160.1        3.8 ms
+A2 alone   303.1     71,511   235.8    161.6        3.8 ms
+```
+**A1 rendered HALF the frames (38k vs 71k) with a 42 ms p99 frametime and 2.6 fps dips = SHADER
+COMPILATION on a cold cache.** Once warm, every round — including the closing ALONE round A2 —
+lands at ~302-303 fps. **The offload changed nothing. The apparent ~1-2 % "gain" was the shader
+cache warming, and the same explanation almost certainly covers the earlier manual A-vs-B.**
+
+**TWO HARNESS BUGS THIS EXPOSED, both fixed:**
+1. **ffmpeg's `-t N` counts OUTPUT seconds, not wall seconds.** offload3 ran the encode at ~2.2x
+   realtime, so "240 s" of offload died at ~107 s — the B rounds in the first repeat had only ~90 s
+   of real offload. Fixed: no `-t`, `-stream_loop -1`, and the controller terminates it at the
+   requested WALL seconds.
+2. **Removing `-t` made the encode permanent when killed.** Killing the offload3 controller leaves
+   its ffmpeg children running FOREVER, and they leak into the NEXT round and fake an offload there
+   — which is exactly what contaminated A2 here (its telemetry shows MI25 21 % / FE 66 % on a round
+   that was supposed to be "alone"). Fixed: ab_bench.sh now kills the encodes too.
+
+**★ THE REUSABLE METHOD LESSON:** on a title that compiles shaders, the FIRST run is cold and far
+slower in the tail. An A-B-B-A that does not WARM THE CACHE BEFORE A1, or discard A1, will report a
+fake gain every time. Warm once, then start the sequence.
+
+**Boundary launch blocker (recorded so it is never re-derived):** the Steam folder
+`Boundary：Raytracing Benchmark` contains U+FF1A (fullwidth colon, bytes EF BC 9A). wine cannot launch
+ANY exe inside it — c0000135 / err 126, including the bundled UE4PrereqSetup — and it is NOT a missing
+DLL. Launch through an ASCII symlink (`games/Boundary -> the real folder`); that works. proton_bench.sh
+now accepts an absolute EXE path for this.
+
+**Kept:** the symlink launcher, the offload-duration fix, the encode-reap, and the per-round telemetry
+that made the warmup visible.
+
+
+---
+
+## TEST U — ★ NTE ON THE RIGHT CARD, ALL FOUR WORKING (2026-10-09 eve). the owner's law + the device-pin lesson
+**THE OWNER'S DESIGN LAW (standing):** *main is the 9070 XT — a game should ALWAYS default to the most
+powerful card, and offload the rest to the other cards.* That is exactly what `spirit`'s monitor law +
+the exclusive pin exist to enforce.
+
+**★ THE DEVICE PIN IS LOAD-BEARING, NOT JUST PROTECTIVE (proved loudly).** NTE launched the *normal*
+way (Steam, no pin) **rendered on the MI25** — the 9070 XT sat at **0% / 39 C / 22 W**, totally idle,
+while the game ran on the docked Vega10 through Gen3x4. Result: multi-second freezes (unplayable) and
+the MI25 hit **94 C — past its 90 C trip.** So an unpinned Vulkan game on this box does not merely
+risk enumeration damage; **it can CHOOSE the wrong GPU outright.** `MESA_VK_DEVICE_SELECT=1002:7550!`
+pins it to the XT and makes the others invisible. (Second face of the same crash-class.)
+
+**THE CLEAN RUN (pinned to the XT, offload = MI25 + FE + iGPU):**
+```
+9070 XT   renders NTE   mean busy 73%  max 100%  10,800 MiB  90 C  411 W
+MI25      offload encode  mean 21%  max 26%   68 C
+Vega FE   offload encode  mean 61%  max 74%   65 C
+iGPU      offload encode  mean 15%  max 91%   57 C   (flakiest - ~1/3 duty)
+NTE frame log: 97,653 frames / 568 s  avg 196.5 fps  p1-low 69.7  median ft 5.11 ms
+```
+Main card carried the game at the SAME load as with no offload (near-match to the earlier session's
+NTE: 10,692 MiB / 90 C) — the "no cost, every card working" demonstration, on the real game.
+
+**OPEN ANOMALY (chase next):** the MI25 briefly held **~6 GiB VRAM for ~30 s during NTE startup**
+(66 of 1121 samples >200 MiB; 54 MiB otherwise). Far more than an encode needs. Could mean something
+reached the docked card before the wall fully took. Unexplained — do not forget it.
+
+
+### TEST U, gameplay verdict — THE OWNER, the human witness (2026-10-09, ~18:27-18:36)
+the owner played NTE on the XT (pinned) with the offload live on MI25 + FE + iGPU:
+*"A full session through the preset graphics modes a couple times, used powers, did fights. Did vehicle
+too. No glitches or lagging."*
+**This is the acceptance result for the "no cost, every card working" claim, and the right instrument
+for it** — a human judge of *smoothness* beats an fps number here, because NTE's own scene variance is
+(+/-19 %) and would swamp any frame-delta; "no glitches or stutter" is a direct read the variance
+cannot fake.
+**And the control is built in:** the SAME game with the SAME offload froze for several seconds when
+unpinned and chose the MI25; pinned to the XT it is clean through combat and traversal. **The variable
+was the pin, not the offload.**
