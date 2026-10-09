@@ -331,3 +331,30 @@ resolution fallback, now solved.
 
 **Also installed this session:** `unigine-heaven-1.6.6` via `phoronix-test-suite install` (the 274 MB
 .run was downloaded and unpacked). Unigine Valley's zip is present locally too.
+
+
+### TEST M, part 2 — ★★ THE HEADLINE RESULT, ON A REAL HEAVY BENCHMARK
+**Unigine Heaven 4.0, 3840x2160 fullscreen — the same benchmark, both conditions:**
+```
+XT ALONE (baseline)              329.29 FPS     (85,782 frames)
+XT + OFFLOAD on the MI25         329.98 FPS     (85,960 frames)
+                                 delta = +0.2%  -> FREE
+```
+Monitor during the offloaded run confirms BOTH cards worked:
+```
+XT (main)      busy mean 94% / median 100% / max 100%   peak 3164 Mhz   peak 341 W   VRAM 1512 MiB
+MI25 (offload) busy max 25%                              peak VRAM 54 MiB (7 idle)
+```
+**On a genuinely heavy, saturating benchmark, offloading a real workload to a second GPU cost the main
+GPU NOTHING — 329.3 vs 330.0 fps, i.e. within noise.**
+
+**AND IT RECONCILES WITH TEST L's +6.25%.** The two results say the same thing from opposite ends:
+- On a load WITH clock headroom (4K denoise, ~32 fps), the second card's activity lifted the XT's clock
+  and the main load got ~6% FASTER.
+- On a load with NO headroom (Heaven 4K, already 3164 Mhz / 341 W), there is nothing to lift, and the
+  offload is simply FREE (+0.2%).
+
+**THE LAW, stated once and generally: offloading work to a second GPU does not tax the main GPU. Where
+the main GPU has clock headroom it can even gain; where it is already saturated it is a wash.**
+*Scope: measured with one offload (VAAPI H.264 encode) on one secondary card (MI25). The generalisation
+to games is the obvious next test and needs a game run — which needs the owner's hands.*
