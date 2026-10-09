@@ -318,7 +318,7 @@ WORKLOADS = {
 }
 
 
-def plan(db, workload):
+def plan(db, workload, vram_mib=None):
     w = WORKLOADS.get(workload)
     if not w:
         print("unknown workload. known: " + ", ".join(WORKLOADS)); return 1
@@ -331,8 +331,11 @@ def plan(db, workload):
     print("plan — %s\n  %s\n" % (workload, w["why"]))
     print("  payload: %.2f MB %s" % (S / 1e6, "per frame" if "res" in w else "per token"))
     print("  sustained one-way: %.2f GB/s\n" % (per_sec / 1e9))
-    print("  %-8s %-11s %-10s %-9s %s" % ("card", "link GB/s", "capacity", "verdict", "arithmetic"))
-    print("  " + "-" * 96)
+    if vram_mib:
+        print("  VRAM asked: %d MiB (measured on this box: a light load costs ~800 MiB, a GPU-bound"
+              " 4K load ~8,200 MiB — ~10x)\n" % vram_mib)
+    print("  %-8s %-11s %-10s %-9s %-8s %s" % ("card", "link GB/s", "capacity", "verdict", "VRAM", "arithmetic"))
+    print("  " + "-" * 104)
     for g in db["gpus"]:
         B = g["link"]["gbps_max"]
         if not B:
@@ -353,7 +356,15 @@ def plan(db, workload):
             arith = ("no panel attached — has %d connector(s); plug a display in to use as the frame-gen target"
                      % g["connectors_total"]) if g.get("connectors_total") else \
                     "no display outputs at all — cannot be a frame-gen target"
-        print("  %-8s %-11s %-10s %-9s %s" % (g["card"], B, "%.2f GB/s" % cap, verdict, arith))
+        vram = g.get("vram_total_mib")
+        vcol = ("%dM" % vram) if vram else "-"
+        if vram_mib and vram:
+            if vram_mib > vram:
+                verdict = "INFEASIBLE"
+                arith = "needs %d MiB VRAM; this card has %d MiB" % (vram_mib, vram)
+            else:
+                vcol = "%dM ok" % vram
+        print("  %-8s %-11s %-10s %-9s %-8s %s" % (g["card"], B, "%.2f GB/s" % cap, verdict, vcol, arith))
     return 0
 
 
@@ -434,10 +445,11 @@ def main():
     p = sub.add_parser("probe"); p.add_argument("--json", action="store_true")
     r = sub.add_parser("roles"); r.add_argument("--profile", default="game"); r.add_argument("--json", action="store_true")
     pl = sub.add_parser("plan"); pl.add_argument("--workload", default="1440p60-framegen")
+    pl.add_argument("--vram-mib", type=int, default=None, help="VRAM the workload needs on its card")
     a = ap.parse_args(argv)
     db = probe()
     if a.cmd == "plan":
-        return plan(db, a.workload)
+        return plan(db, a.workload, a.vram_mib)
     if a.cmd == "roles":
         if a.json:
             print(json.dumps(assign_roles(db, a.profile), indent=2))

@@ -74,14 +74,40 @@ Tested against a synthetic **10-GPU heterogeneous fleet**: `spirit roles` places
 (the tenth is an integrated GPU with no panel attached, and it says exactly why). The engine is
 N-generic — no 2-card or 4-card assumptions anywhere.
 
+## Measured — what is proven, and what is dead
+
+Every number below is reproducible; raw monitor JSONL sits beside this file.
+
+**Proven on the dev box (RX 9070 XT + Instinct MI25 + Vega FE + iGPU):**
+- **The link wall is real.** Shrinking the frame 76× multiplied the Vega cards' throughput ~45×
+  (MI25 5,039→113 fps; FE 1,350→29) while the XT moved only 1.57×. Bytes-per-frame governs them.
+  MI25/FE ≈ 3.7×, matching their x4/x1 link ratio of 3.67×. Clocks ruled out (identical 945 MHz memory).
+- **Routing isolates.** Routed to each card, the child process sees exactly **one** GPU — the right one.
+- **The first real offload works.** A 1080p60 H.264 VAAPI encode ran on the **MI25 at ~197 fps** while
+  the XT rendered at 100% busy (54 MiB allocated on the MI25 vs 7 idle).
+- **★ The feared penalty reversed.** With a GPU-bound load on the XT, running the offload on a second
+  card left the main card **~6.25% faster** (32.0→34.0 fps) — proven order-controlled (A-B-B-A: 32/34/34/32).
+  **Cause, identified:** with the second card busy the XT pins to **~3415 MHz / ~220 W**; idle it wanders
+  3.10–3.27 GHz. Co-running a GPU holds the main GPU in its top clock/power state.
+  *Scope: one synthetic GPU-bound load + one offload. Not yet generalised to games.*
+
+**Dead ends — do not re-derive these:**
+- **Unigine Superposition** — its 2019 engine mis-detects RDNA4 ("Unknown GPU / 256 MB") and forces
+  1600×900 regardless of preset. Unusable headless. Use a modern Vulkan benchmark.
+- **vkmark** — valid for routing and per-card capability; **useless for measuring GPU contention**
+  (35,000 fps means it is CPU/present-bound, not GPU-bound).
+- **`vkmark -D <uuid>`** — unusable here: all RADV devices report the *same* UUID. `MESA_VK_DEVICE_SELECT=vid:did!`
+  (what `spirit run` emits) is the only way to pin work to one GPU.
+- **`gpu_busy_percent` on Vega** — unreliable: the same FE read 71% and 0% with no load change.
+
 ## Roadmap
 
 - **MVP-0 (done):** `probe` + `roles` + `plan` + `run`. Honest link truth, role assignment across N
   cards, feasibility arithmetic, and a device router.
-- **MVP-1:** a *measured* cross-device DMA-BUF copy path (the negotiated link is not the real path —
-  the copy usually bounces through system memory), so `plan` sizes against the real wire.
-- **MVP-2:** a small daemon holding role leases, so interactive roles pre-empt batch jobs.
-- **MVP-3:** the frame-gen/upscale present path, contributed *into* `lsfg-vk` / `gamescope` rather
-  than as a new layer.
+- **MVP-1 (started):** a *measured* cross-device copy path, and VRAM budgeting in `plan` (a GPU-bound
+  load costs ~10× the VRAM of a light one: 8.2 GiB vs 0.8 GiB measured).
+- **MVP-2:** a daemon holding role leases, so interactive roles pre-empt batch jobs.
+- **MVP-3:** the frame-gen/upscale present path, contributed *into* `lsfg-vk` / `gamescope`.
+- **Packaging (last, per the owner):** GUI installer + easy uninstall, shipped as an AUR package and a Flatpak.
 
 Copyright 2026 Sophia Marie DeClue. MIT.
