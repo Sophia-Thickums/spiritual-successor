@@ -434,3 +434,41 @@ generalise one build's arguments to another.
 
 **Incidental (4-card monitor, completed):** during the 4-card concurrent run the FE peaked 75% busy and
 the iGPU 84% (both at 54/74 MiB), the XT at 91 C / 344 W. All four confirmed active a second time.
+
+
+---
+
+## TEST O — ★★ THE OFFICIAL 8K RESULT: Superposition 8K Optimized, via its GUI launcher
+the owner opened the launcher and put the cursor on Run; I clicked it (`xdotool click 1` — the button is an
+unlabelled icon, not an X window, so coordinates had to be supplied by hand). Preset 8K Optimized was already
+selected (verified by OCR of the window before clicking).
+
+**RESULT (read off the launcher by OCR; the tool saved no file — a .score needs a manual Save click):**
+```
+SUPERPOSITION BENCHMARK — 8K OPTIMIZED
+  Version 1.1        Graphics API: OpenGL      Resolution: 7680 x 4320
+  Fullscreen: Enabled    Shaders: 8K Optimized    DOF: enabled   Motion Blur: enabled
+  FPS: Min 45.62  ·  Avg 54.76  ·  Max 65.10
+```
+**How the 8K preset actually works (from the engine log):** it sets
+`render_virtual_resolution 7680 4320` and presents to the display's native mode — so the log's
+"Set 2560x1440 fullscreen" is the WINDOW, and 7680x4320 is the RENDER resolution. It is a real 8K run.
+
+**Telemetry, from OUR monitor (the instrument that works), during that run:**
+```
+XT  busy mean 97% / median 100% / max 100%     peak VRAM 6898 MiB
+    peak temp 89 C      peak power 417 W        peak clock 3183 MHz
+```
+
+**★ AND SUPERPOSITION'S OWN TELEMETRY IS BROKEN, WHICH WE CAN NOW PROVE SIDE BY SIDE:**
+it reports `GPU °C: Min 27.0, Max 56.0` while our monitor measured **89 C** on the same run.
+Its `GPUMonitor` plugin failed to initialise ("can't initialize GPUMonitor") — which is also why the log
+says "Unknown GPU". **Never quote the benchmark's own temperature/GPU readings from this build.**
+
+**Also established:** Superposition DOES enumerate all four cards by name once the launcher drives it —
+`ASUS RX 9070/9070 XT (Navi 48 XTX) · AMD Radeon PRO V320 16 GB (Vega 10) · AMD Radeon Vega Frontier
+Edition 16 GB · ASUS Radeon 610M (Granite Ridge)`. (Note it calls the MI25 a "PRO V320" — the same
+Vega 10 silicon under its datacentre SKU name.)
+
+**The VRAM lesson at scale:** 8K alone cost **6898 MiB** (vs 1514 MiB at 4K, 778 MiB for vkmark) — the
+budgeting `spirit plan --vram-mib` now enforces.
