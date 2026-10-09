@@ -548,3 +548,28 @@ offload effect.** The aggregate average must never be quoted from this run.
 2. **Longer phases** (90-120 s) so the scenery averages out.
 3. Or a game with a **built-in repeatable benchmark**.
 Anything less and we will keep measuring the game instead of the offload.
+
+
+### TEST Q, addendum — ★ A REAL GAME'S VRAM FOOTPRINT (the number `plan` has to live with)
+The game-session monitor's own summary (778 samples over 13 min, spanning the NTE run):
+```
+card1  RX 9070 XT   peak VRAM 10692 MiB   100% busy   90.0 C   366 W
+card0  Instinct MI25        54 MiB         25% max     53 C
+card2  Vega FE              54 MiB         74% max     50 C
+card3  Ryzen iGPU           74 MiB         91% max     46 C
+box: CPU peak 48.8% (mean 12.9%)   RAM peak 16753 MiB
+```
+**★ NTE alone demanded 10,692 MiB of VRAM on the 9070 XT.** That is the largest single VRAM footprint
+measured on this box, and it reframes the budgeting:
+- light benchmark (vkmark) ........ ~780 MiB
+- Heaven 4K ....................... 1,514 MiB
+- Superposition 8K ................ 6,898 MiB
+- **a real UE5 game (NTE) ......... 10,692 MiB**
+
+On a 16 GiB card that leaves barely 5 GiB of headroom, which is exactly why `spirit plan --vram-mib`
+exists — and why any role assignment has to ask the game's own footprint before handing a card to
+anything else. **The spare cards' VRAM is not interchangeable with the main card's**: a card with 54 MiB
+used is taking an offload, not holding the game.
+
+Also confirmed a fourth time: all three secondary cards did real work during the game session
+(MI25 25%, FE 74%, iGPU 91% peak) — the offload ran under a live game.
