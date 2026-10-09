@@ -350,7 +350,9 @@ def run(db, role, card, cmd):
     env = dict(os.environ)
     pci = "pci-%s" % g["bdf"]
     env["DRI_PRIME"] = pci
-    env["MESA_VK_DEVICE_SELECT"] = "%s:%s" % (g["vendor"][2:], g["device"][2:])
+    # the trailing `!` is EXCLUSIVE: without it the layer merely REORDERS and the child still
+    # enumerates every GPU. Measured 2026-10-09: `1002:6860` -> 4 devices visible, `1002:6860!` -> 1.
+    env["MESA_VK_DEVICE_SELECT"] = "%s:%s!" % (g["vendor"][2:], g["device"][2:])
     if role == "compute":
         env["GGML_VK_VISIBLE_DEVICES"] = g["bdf"]
     print("# routing role=%s to %s (%s, link %s GB/s)" % (role, g["card"], g["name"][:34], g["link"]["gbps_max"]))
