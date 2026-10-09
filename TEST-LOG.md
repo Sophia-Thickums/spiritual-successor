@@ -677,3 +677,29 @@ the question any more; the QUALITY of the interpolation is.
 **What is NOT yet proven:** end-to-end. Nothing has hooked a game's present and actually presented
 interpolated frames, so no FPS has gone up yet. What is now proven is that the two hardware gates that
 could have made it impossible are both open, on hardware we already own.
+
+
+---
+
+## ★★ INCIDENT 2026-10-09 (~15:10) — I CRASHED THE SYSTEM AND TRIPPED THE MI25's ALARM
+**What happened:** I launched the Black Myth: Wukong Benchmark Tool under GE-Proton to find its
+benchmark entry point. The system crashed and the Instinct MI25 latched its own thermal alarm; the owner had
+to reboot.
+
+**Cause (prime suspect, NOT confirmed):** a fresh Proton/UE5 process makes Wine enumerate EVERY DRM
+device. That enumeration reached the MI25 on its external dock — a card/dock combination already known to
+be fragile under the slightest load, which latches its own hard alarm that nothing in software can
+mute. **I did not isolate the benchmark from the other cards before launching it.** I had the tool to do
+so (`MESA_VK_DEVICE_SELECT=vid:did!`, proven only hours earlier) and did not use it.
+
+**THE RULE THIS CREATES (now enforced in `proton_bench.sh`):**
+**A BENCHMARK MUST NEVER BE ABLE TO ENUMERATE ALL CARDS BY ACCIDENT.** For a baseline run, the docked
+cards must be INVISIBLE to the process (`MESA_VK_DEVICE_SELECT=1002:7550!`), not merely idle. Enumerating
+a device is ENOUGH to hurt it — loading it is not required. `FG_ISOLATE` now defaults to ON, and the
+runner prints a loud warning if it is ever turned off.
+
+**AND THE DISCIPLINE BEHIND IT:** an externally-docked card is not a spare slot. Anything that probes
+the PCI/DRM topology — a game launcher, a benchmark, a Wine prefix init — touches it whether or not I
+mean it to. **Isolate first, launch second.**
+
+**Recorded, not narrated:** hardware harm is one of the three boundaries; it is written down, not narrated.
