@@ -1,152 +1,109 @@
 # Spiritual Successor
 
-**Put every GPU in the machine to work.**
+**Put every GPU in your PC to work.**
 
-CrossFire and SLI split one frame across cards and died for it. The Spiritual Successor does the
-opposite: it **splits the work, not the frame**, and gives every card the role its own link and
-silicon are actually good for — so a cheap second, third, or tenth GPU earns its slot instead of
-sitting idle.
+Most people with two graphics cards use one and leave the other sitting idle. This tool puts them all
+to work.
 
-Scale is the point, not speed. The goal is that **every card in the box is doing something useful**
-by the time the game is running. It scales to any number of GPUs, any vendor mix.
+The old CrossFire and SLI tried to split a single frame across two cards. That never worked well and
+it's dead. We do the opposite: your game runs on **one** card — the one your monitor is plugged into,
+which is almost always your best card — and every *other* card picks up a job of its own while you
+play.
 
-No root. No dependencies (stdlib Python 3.8+; `lspci` used only if present).
+So a gaming card plus an old mining card, a datacentre card, or even your processor's built-in
+graphics: all of them earn their slot.
 
-```
-spirit doctor                    # prove THIS machine works: links, isolation, telemetry, role plan
-spirit probe                     # the TRUE host link, VRAM, outputs, render node of every GPU
-spirit roles                     # assign a job to every card — all of them, or say why not
-spirit plan --workload 1440p60-framegen [--vram-mib N]
-spirit run --role encode --card card2 -- ffmpeg -i in.mkv -c:v hevc_vaapi out.mkv
-spirit play -- ./mygame                           # the GAME PATH — see below
-```
+No root, no install. Just Python (3.8 or newer).
 
-`spirit doctor` is the one to run first. It doesn't describe — it **tests**: it launches a real child
-process per card and confirms the child sees exactly one GPU, reads every telemetry counter, and checks
-that the role plan accounts for every card. Three verdicts — PASS / FAIL / UNKNOWN — and UNKNOWN is
-never a pass. It exits non-zero if anything fails. (Proven non-vacuous: fed a machine whose cards don't
-exist, it fails every check.)
+## What it does
 
-## ★ THE GAME PATH — `spirit play`
+One command starts a game the right way:
 
 ```
-spirit play -- ./mygame
+spirit play -- ./yourgame
 ```
 
-`spirit play` puts a game on the **strongest card** and puts the **other cards to work** while it runs.
-It picks the card that feeds your monitor, launches the game **pinned to it exclusively** with the
-other cards' device nodes hidden from it, and starts a **real H.264 VAAPI encode on every spare card**
-for as long as the game runs. The game exits, the offload stops. Every card earns its slot.
+It does three things, in order:
 
-## ★★ THE DEVICE PIN IS LOAD-BEARING, NOT JUST PROTECTIVE (measured 2026-10-09)
+1. **Finds the card your monitor is plugged into.** That card runs the game.
+2. **Launches the game so it can only use that card.** The others are hidden from it.
+3. **Starts a real video encode on every other card**, so they're working while you play.
 
-This is the finding that made `play` necessary. Launched **without** a pin, a Vulkan game on a four-GPU
-box did not merely risk probing the wrong card — **it chose the wrong GPU outright.** On the dev box a
-UE5 game rendered on the **docked Instinct MI25** while the RX 9070 XT sat at **0% busytime, 39 C,
-22 W** — completely idle. The game was unplayable (multi-second freezes) and drove the docked card to
-**94 C, past its own 90 C trip.** Same game, same offload, **pinned to the display card: clean through
-combat and traversal, three other cards working underneath.**
+Quit the game and the other cards stop.
 
-`MESA_VK_DEVICE_SELECT=<vid:did>!` — the trailing `!` is the **exclusive** flag: without it the loader
-merely *reorders* and the child still enumerates every GPU. With it, a child sees exactly **one**. Any
-multi-GPU launcher that omits this can silently run your game on the wrong card.
+## The thing everyone gets wrong
 
-## The two truths it is built on (both measured — see the project folder)
+Leave a game alone and it will pick a graphics card *for* you. And it can pick the wrong one.
 
-**1. Every normal surface lies about a GPU's host link.** `lspci`, sysfs `current_link_width`, and
-`amdgpu pp_dpm_pcie` all report the link between the GPU and **the bridge chip it sits behind** —
-not the link to the CPU. A card on a dock or a chipset slot reads `x16` while the real host link is
-`x1`. The truth is the **minimum negotiated width along the sysfs chain** from the root complex down.
+We watched it happen. A game with no pinning picked a slow card on an external dock instead of the
+fast one. It ran at a crawl, and it got that slow card hot. The fast card sat there idle the whole
+time, doing nothing.
 
-    RX 9070 XT      x16 Gen5  54.9 GB/s   (measured)
-    Instinct MI25   x4  Gen3   3.19 GB/s  <- lspci said x16
-    Vega Frontier   x1  Gen3   0.87 GB/s  <- lspci said x16
+That's the trap this tool closes. It makes your game use the card it should — the one your monitor is
+plugged into.
 
-**2. Per-frame multi-GPU rendering is dead on links like these.** A 1440p frame is 14.7 MB; at 60 fps
-an x1 card needs 17 ms to move it — more than the whole frame budget. Splitting one frame across
-cards needs ~25 GB/s+ between *same-class, same-driver* GPUs.
+## The commands
 
-> **So: never split the frame. Split the process — and offload the pipeline tail.**
-> Anything that crosses the wire at *frame rate* or *once* is fair game. Anything needed *this frame*
-> is not, at any pipeline depth.
+```
+spirit doctor                  check the tool really works on your machine (run this first)
+spirit probe                   show your cards, and how fast each can actually talk
+spirit roles                   give every card a job — or say, plainly, why it can't have one
+spirit play -- ./yourgame      run a game, with your other cards working underneath
+spirit plan --workload ...     tell you honestly what a job can and can't do
+spirit fg --res 1440p60        answer: can my spare card add frames to my game?
+spirit run --role encode --card card2 -- ffmpeg ...    hand one job to one card
+```
 
-## ★ THE MONITOR LAW
+`spirit doctor` doesn't just describe — it **tests**. It launches a real program on each card and
+checks the tool can see it, read it, and pin work to it. If something's wrong, it says so.
 
-**The GPU feeding the monitor is the main GPU — always, by rule.** The user plugs their display into
-the card they mean to game on, and that is almost always the strongest one. Rendering anywhere else
-would mean copying every finished frame across to the presenting card — a per-frame **pixel** copy,
-which is precisely the one thing measured dead above.
+## What's true, and what isn't
 
-So `spirit roles` makes the monitor-feeding card the renderer, unconditionally. If a *stronger* card
-exists that feeds no display, it does **not** silently steal the main role — it takes a real offload
-role (encode, compute) and the tool prints a note telling you to move the cable if you want it as main.
-An unattended heuristic never overrules the user's own cabling.
+Everything here was measured on our own machine — a fast new card alongside some older ones. We're
+only telling you what we can stand behind.
 
-## What the roles mean
+- **Your game doesn't suffer.** Handing work to the other cards cost the main card little to nothing:
+  about 1–2% in one game, nothing measurable in another, and in a full open-world session the player
+  reported no stutter at all.
+- **The win is the work the other cards do** — not extra frames. We are *not* promising your game runs
+  faster.
+- **We don't add frames yet.** Frame generation — making extra frames to raise your FPS — needs a fast
+  link between the two cards. On our machine only the built-in graphics was fast enough, and we
+  haven't finished that part. It's next.
+- **One correction we're glad we caught:** we once thought a busy second card made the main card
+  *faster*. It looked real. It didn't hold up on a real game, so we've marked it as a mistake and we
+  don't quote it. (We got fooled a second time by something even simpler: the first run of any game
+  is slow while it builds its shader cache, and that can look exactly like a gain. Warm it up before
+  you compare.)
 
-`spirit roles` reads the machine and assigns, per card:
+## Who it's for
 
-| role | what it does | needs |
-|---|---|---|
-| **render** | renders the game | **the card feeding your monitor — always** |
-| **display** | owns the connected panel | same card as render, on purpose |
-| **framegen / upscale** | interpolates and upscales on the display GPU | a *second* card that owns a panel |
-| **encode** | VCN/VCE capture & streaming | any amdgpu (AMD has **no** concurrent-session limit) |
-| **compute** | agents, LLM inference, Blender tiles | the largest VRAM off the render card |
-| **analysis** | video analysis, proxies, preview bakes | any spare card (deadline-free) |
-| **desktop** | drives the compositor so the gaming card keeps its VRAM | an integrated GPU with a panel |
-| **compute-pool** | joins the system lane: renders, transcodes, agent jobs | any card with usable VRAM |
-| **idle** | *stated with a reason* — never silently ignored | — |
+People who want to use the hardware they already own. That's it.
 
-Every card gets a job, or an explicit reason it cannot usefully take one. Nothing is faked.
+---
 
-## Scale
+<details>
+<summary>For the technical reader — what's underneath</summary>
 
-Tested against a synthetic **10-GPU heterogeneous fleet**: `spirit roles` places **9 of 10** cards
-(the tenth is an integrated GPU with no panel attached, and it says exactly why). The engine is
-N-generic — no 2-card or 4-card assumptions anywhere.
+- **Links, not specs.** `lspci` and friends report the link between a GPU and the chip it sits behind,
+  not the link to the CPU. A card on a dock or a chipset slot can read `x16` while its real host link
+  is `x1`. `spirit probe` reports the **minimum negotiated width along the sysfs chain**, which is the
+  truth. On the dev box: RX 9070 XT `x16 Gen5` (54.9 GB/s), Instinct MI25 `x4 Gen3` (3.19),
+  Vega FE `x1 Gen3` (0.87).
+- **Never split the frame.** A 1440p frame is 14.7 MB; at 60 fps an `x1` card needs 17 ms to move it,
+  which is more than the whole frame budget. Per-pixel, per-frame work across these links is dead by
+  arithmetic. Cross the wire once, or at frame rate — never per pixel.
+- **The pin is load-bearing.** `MESA_VK_DEVICE_SELECT=<vid:did>!` — the trailing `!` is the exclusive
+  flag. Without it the loader only *reorders* and a child still sees every GPU; with it, a child sees
+  exactly one. Measured: an unpinned UE5 game rendered on the docked MI25 while the main card sat at
+  0% busy.
+- **Two walls.** The exclusive pin, plus a mount namespace that hides the other cards' `/dev/dri`
+  nodes from the game. `spirit doctor` proves both, per card, on your machine.
+- **A 10-card fleet** is placed 9/10 by `spirit roles` (the tenth is an iGPU with no panel; it says
+  why). The engine makes no 2-card or 4-card assumptions.
 
-## Measured — what is proven, and what is dead
+Raw measurement logs sit beside this file.
 
-Every number below is reproducible; raw monitor JSONL sits beside this file.
-
-**Proven on the dev box (RX 9070 XT + Instinct MI25 + Vega FE + iGPU):**
-- **The link wall is real.** Shrinking the frame 76× multiplied the Vega cards' throughput ~45×
-  (MI25 5,039→113 fps; FE 1,350→29) while the XT moved only 1.57×. Bytes-per-frame governs them.
-  MI25/FE ≈ 3.7×, matching their x4/x1 link ratio of 3.67×. Clocks ruled out (identical 945 MHz memory).
-- **Routing isolates.** Routed to each card, the child process sees exactly **one** GPU — the right one.
-- **The first real offload works.** A 1080p60 H.264 VAAPI encode ran on the **MI25 at ~197 fps** while
-  the XT rendered at 100% busy (54 MiB allocated on the MI25 vs 7 idle).
-- **★ The feared penalty did not appear — and a tempting "gain" was retracted.** On a real UE5 game
-  (Black Myth Wukong) offloading to the second card cost the main card **~1–2%**; on the 8K benchmark
-  it cost **nothing** (+0.7%); on a full open-world session (NTE, all four cards working) the player
-  reported **no glitches or stutter.** The honest claim is the one we can stand behind: **the offload
-  costs the main card little to nothing, and the win is the WORK the other cards do — never free frames.**
-- **⚠ RETRACTED — do not quote.** A synthetic run once showed a second busy card making the main card
-  **~6.25% faster** (a real clock/power-state lift, order-controlled A-B-B-A). **It did not reproduce on
-  a real game**, where the effect is a small cost. And on 2026-10-09 the same trap caught us again: an
-  apparent **+1–2% on a benchmark was shader-cache warmup** — the first run compiles shaders and is far
-  slower in the tail. **Warm the cache before any A/B**, or the first run will manufacture a fake gain.
-
-**Dead ends — do not re-derive these:**
-- **Unigine Superposition** — its 2019 engine mis-detects RDNA4 ("Unknown GPU / 256 MB") and forces
-  1600×900 regardless of preset. Unusable headless. Use a modern Vulkan benchmark.
-- **vkmark** — valid for routing and per-card capability; **useless for measuring GPU contention**
-  (35,000 fps means it is CPU/present-bound, not GPU-bound).
-- **`vkmark -D <uuid>`** — unusable here: all RADV devices report the *same* UUID. `MESA_VK_DEVICE_SELECT=vid:did!`
-  (what `spirit run` emits) is the only way to pin work to one GPU.
-- **`gpu_busy_percent` on Vega** — unreliable: the same FE read 71% and 0% with no load change.
-
-## Roadmap
-
-- **MVP-0 (done):** `probe` + `roles` + `plan` + `run`. Honest link truth, role assignment across N
-  cards, feasibility arithmetic, and a device router.
-- **Game path (done 2026-10-09):** `spirit play` — the game on the strongest card, every other card
-  working the tail. Verified live on UE5 and UE4 titles.
-- **MVP-1 (started):** a *measured* cross-device copy path, and VRAM budgeting in `plan` (a GPU-bound
-  load costs ~10× the VRAM of a light one: 8.2 GiB vs 0.8 GiB measured).
-- **MVP-2:** a daemon holding role leases, so interactive roles pre-empt batch jobs.
-- **MVP-3:** the frame-gen/upscale present path, contributed *into* `lsfg-vk` / `gamescope`.
-- **Packaging (last, per the owner):** GUI installer + easy uninstall, shipped as an AUR package and a Flatpak.
+</details>
 
 Copyright 2026 Sophia Marie DeClue. MIT.
