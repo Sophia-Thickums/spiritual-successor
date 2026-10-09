@@ -654,7 +654,12 @@ def main():
                 rest = argv[i:]; break
         return play(probe(), rest, offload)
 
-    ap = argparse.ArgumentParser(prog="spirit", description="Spiritual Successor — put every GPU to work")
+    ap = argparse.ArgumentParser(
+        prog="spirit",
+        description="Spiritual Successor — put every GPU to work\n"
+                    "commands: probe · roles · plan · doctor · fg · run · play  "
+                    "(`run` and `play` take a command after `--`)",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd")
     p = sub.add_parser("probe"); p.add_argument("--json", action="store_true")
     r = sub.add_parser("roles"); r.add_argument("--profile", default="game"); r.add_argument("--json", action="store_true")
