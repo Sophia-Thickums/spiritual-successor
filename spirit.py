@@ -201,15 +201,21 @@ def assign_roles(db, profile="game"):
                 return c
         return None
 
-    # 1) render — the strongest card
-    render = ranked[0] if ranked else None
+    # 1) render — ALWAYS the card feeding the monitor. The user plugs the panel into the card they
+    #    mean to game on, which is almost always the strongest; and rendering on the presenter avoids
+    #    a cross-GPU present, which is a per-frame PIXEL copy -- the exact thing measured dead.
+    monitor_cards = [c for c in ranked if c["has_output"]]
+    render = max(monitor_cards, key=score) if monitor_cards else (ranked[0] if ranked else None)
     rd = render["card"] if render else None
     if render:
-        add(render, "render", "strongest link+VRAM: renders the game")
+        add(render, "render",
+            "FEEDS THE MONITOR — the main GPU by rule (rendering anywhere else costs a per-frame "
+            "cross-GPU present)" if render["has_output"] else
+            "strongest card by score (NO monitor detected — headless rig)")
 
-    # 2) display — a card with a panel attached (prefer the renderer: no cross-GPU present)
-    display = next((c for c in ranked if c["has_output"]), render)
-    dd = display["card"] if display else None
+    # 2) display — the render card owns the panel it presents to (render == display, on purpose)
+    display = render
+    dd = rd
     if display:
         add(display, "display", "owns the connected panel" if display["has_output"]
             else "assumed display (no panel detected)")
@@ -245,6 +251,15 @@ def assign_roles(db, profile="game"):
     # 7) desktop/compositor — an integrated GPU that owns the panel frees the gaming card's VRAM
     pick("desktop", lambda c: c.get("integrated") and c["has_output"],
          "drive the desktop/compositor so the gaming card keeps its VRAM for frames")
+
+    # honest advice: if a stronger card exists that feeds no monitor, say so (we still obey the rule)
+    if render and render["has_output"]:
+        stronger = [c for c in ranked if c["card"] != rd and not c["has_output"]
+                    and score(c) > score(render)]
+        if stronger:
+            reasons.setdefault(rd, []).append(
+                "NOTE: %s scores higher but feeds no monitor — plug your display into it to make IT "
+                "the main GPU (we keep the monitor card as main until you do)" % stronger[0]["name"][:26])
 
     # 8) compute-pool — every remaining card with usable VRAM joins the SYSTEM lane, so the box
     #    earns its slots even when a single game cannot use card #9 for frames.

@@ -38,14 +38,26 @@ cards needs ~25 GB/s+ between *same-class, same-driver* GPUs.
 > Anything that crosses the wire at *frame rate* or *once* is fair game. Anything needed *this frame*
 > is not, at any pipeline depth.
 
+## ★ THE MONITOR LAW
+
+**The GPU feeding the monitor is the main GPU — always, by rule.** The user plugs their display into
+the card they mean to game on, and that is almost always the strongest one. Rendering anywhere else
+would mean copying every finished frame across to the presenting card — a per-frame **pixel** copy,
+which is precisely the one thing measured dead above.
+
+So `spirit roles` makes the monitor-feeding card the renderer, unconditionally. If a *stronger* card
+exists that feeds no display, it does **not** silently steal the main role — it takes a real offload
+role (encode, compute) and the tool prints a note telling you to move the cable if you want it as main.
+An unattended heuristic never overrules the user's own cabling.
+
 ## What the roles mean
 
 `spirit roles` reads the machine and assigns, per card:
 
 | role | what it does | needs |
 |---|---|---|
-| **render** | renders the game | the strongest link+VRAM card |
-| **display** | owns the connected panel | a connected output |
+| **render** | renders the game | **the card feeding your monitor — always** |
+| **display** | owns the connected panel | same card as render, on purpose |
 | **framegen / upscale** | interpolates and upscales on the display GPU | a *second* card that owns a panel |
 | **encode** | VCN/VCE capture & streaming | any amdgpu (AMD has **no** concurrent-session limit) |
 | **compute** | agents, LLM inference, Blender tiles | the largest VRAM off the render card |
