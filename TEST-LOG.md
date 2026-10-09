@@ -257,3 +257,30 @@ and the clock series here is confounded by condition 1 itself warming up.
 is unidentified.** Open question. The experiment that would settle it: alternate the ORDER
 (offload-first, then alone) several times and watch whether the clock lift follows the OFFLOAD or the
 POSITION. Not yet run.
+
+
+### TEST L, part 3 — SETTLED: the effect FOLLOWS THE OFFLOAD, not the position
+The experiment named in part 2, run. Sequence A-B-B-A (alone, offload, offload, alone):
+```
+A alone    -> 32.0 fps
+B offload  -> 34.0 fps
+B offload  -> 34.0 fps
+A alone    -> 32.0 fps
+```
+**The gain follows the CONDITION, not the POSITION.** Alone is 32.0 whether it runs first or last;
+offloaded is 34.0 both times. Warmup and order are DEAD.
+
+**★★ RESULT (proven, reproducible, order-controlled):**
+**Running a real workload on the SECOND GPU left the main GPU ~6.25% FASTER** (32.0 -> 34.0 fps on a
+GPU-bound 4K denoise pinned to the 9070 XT), and the clock series shows why: with the second card busy,
+the XT holds **~150 Mhz higher core clock and ~20 W more power** (3375-3416 Mhz / 214-221 W) than it does
+alone (3047-3383 Mhz / 154-213 W).
+
+**So, on this box, offloading to a second card did not cost the main card anything — it lifted the main
+card's own clock/power state.** The remaining unknown is only the low-level trigger of that lift (GPU
+power-management state vs PCIe/SoC link state); the EFFECT and its clock signature are established.
+
+**Scope, stated so it is not over-read:** measured on ONE synthetic GPU-bound workload (4K Vulkan
+denoise) and ONE offload (VAAPI H.264 encode on the MI25). It does NOT yet generalise to games, and it
+is NOT a claim that "more GPUs = more FPS". It IS a claim that the feared per-card penalty did not
+appear here — which is the first evidence that the Spiritual Successor's core proposition is sound.
