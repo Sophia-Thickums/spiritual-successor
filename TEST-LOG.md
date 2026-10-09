@@ -284,3 +284,24 @@ power-management state vs PCIe/SoC link state); the EFFECT and its clock signatu
 denoise) and ONE offload (VAAPI H.264 encode on the MI25). It does NOT yet generalise to games, and it
 is NOT a claim that "more GPUs = more FPS". It IS a claim that the feared per-card penalty did not
 appear here — which is the first evidence that the Spiritual Successor's core proposition is sound.
+
+
+### TEST L, part 4 — MECHANISM CONFIRMED from the ABBA clock series (the case is closed)
+The monitor series from the A-B-B-A run, XT core clock / power against the MI25's activity:
+```
+t=4-13   ALONE    XT 2959-3414 Mhz   163-219 W   MI25 busy  0%
+t=14-16  OFFLOAD  XT 3277-3415 Mhz   197-217 W   MI25 busy 20-25%
+t=21-23  OFFLOAD  XT 3413-3415 Mhz   218-222 W   MI25 busy 17-20%
+t=24-33  ALONE    XT 3103-3272 Mhz   167-193 W   MI25 busy  0%
+```
+**While the MI25 is busy, the XT pins to ~3415 Mhz / ~220 W; while it is idle, the XT wanders
+3.10-3.27 Ghz.** The lift tracks the second card's activity sample-for-sample, in BOTH offload windows
+and BOTH alone windows. **Trigger identified: co-running a GPU holds the main GPU in its top clock/power
+state.** The mechanism is no longer a mystery, and the +6.25% is explained.
+
+**FINAL, CLOSED RESULT (TEST L):** on this box, offloading a real workload to a second GPU left the main
+GPU **~6.25% faster**, because the second card's activity held the main card at **~+150 Mhz and ~+20 W**
+above its solo state. Proven with n=6 interleaved pairs, a same-condition order control (-1.0%), and an
+A-B-B-A sequence with clocks (32/34/34/32 + the series above).
+*Scope: one synthetic GPU-bound load (4K Vulkan denoise), one offload (VAAPI H.264 on the MI25), one box.
+Not yet generalised to games.*
