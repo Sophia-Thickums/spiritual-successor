@@ -643,3 +643,37 @@ than a PCIe crawl.
 gamer's actual question ("can my second card do frame-gen?") with measured rates and the arithmetic,
 and states the architecture rule it learned. It is honest about its inputs: the handoff table is
 measured on this box and must be re-measured elsewhere.
+
+
+---
+
+## TEST S — ★★★ BOTH GATES CLEARED: the iGPU can carry frame-generation at 1440p
+Built `interp_bench` (Vulkan compute; the CHEAPEST possible frame-gen pass — a 50/50 blend of two real
+frames producing one interpolated frame, looped in a single command buffer for the steady-state rate).
+
+```
+Ryzen iGPU (610M) : 600 dispatches in 554.3 ms  =  0.924 ms per interpolated frame  ->  1082.5 fps
+RX 9070 XT        : 600 dispatches in  19.1 ms  =  0.032 ms per interpolated frame  -> 31420.7 fps
+     memory traffic (2 reads + 1 write per output frame): 44.6 GB/s (iGPU), 1294.5 GB/s (XT)
+```
+
+**THE TWO GATES, BOTH CLEARED FOR THE iGPU:**
+1. **Handoff (TEST R):** 2.91 GB/s -> 4.95 ms one-way, 9.90 ms round trip. Fits the 16.67 ms 1440p60 budget.
+2. **Compute (TEST S):** 1082 fps capacity for an interpolation pass where **120 fps** is the target —
+   a **~9x margin**.
+
+**Total for a 1440p60 -> 120 presented-fps pipeline through the iGPU: ~9.9 ms handoff + ~0.9 ms pass
+= ~10.8 ms of a 16.67 ms budget.** Feasible by measurement.
+
+**The honest caveat, stated up front:** a 50/50 blend is the OPTIMISTIC CEILING — it does no motion
+estimation and its quality is ghosting, not frame-generation. A real motion-compensated pass costs
+strictly more. But with a 9x margin, a pass even ~9x more expensive still fits. So the ceiling is not
+the question any more; the QUALITY of the interpolation is.
+
+**Which card, decided by measurement (not preference):**
+- Frame-gen to the **MI25 / FE**: dead (19 / 58 ms per frame, over budget before any compute).
+- Frame-gen to the **iGPU**: feasible, and it is the only card that clears both gates on this box.
+
+**What is NOT yet proven:** end-to-end. Nothing has hooked a game's present and actually presented
+interpolated frames, so no FPS has gone up yet. What is now proven is that the two hardware gates that
+could have made it impossible are both open, on hardware we already own.
