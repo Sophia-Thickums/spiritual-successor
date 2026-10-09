@@ -507,3 +507,44 @@ cards concurrently active: 2 cards = 33 samples, 3 = 60, 4 = 23      PEAK SIMULT
 **And the instrument lesson, proven side by side on the same run:** Superposition's own reading said
 `GPU °C: Min 27.0, Max 56.0`; our monitor measured **90 C**. Its `GPUMonitor` plugin failed to init, so
 the benchmark's built-in GPU/temperature numbers are worthless for this build. Ours owns the truth.
+
+
+---
+
+## TEST Q — FIRST GAME TEST (NTE): capture worked, result INCONCLUSIVE — and why
+Protocol: NTE (UE10, 100 GB, the only real game installed — Control is a 577 MB stub) launched with
+`MANGOHUD=1 MANGOHUD_CONFIG=fps_logging,output_folder=/tmp/mangologs,autostart_log=1`. the owner played while
+I alternated the 3-card offload **OFF 45 s / ON 45 s**, 5 cycles. Monitor + frame log throughout.
+
+**The capture worked.** 45,382 frames over 281 s. Two traps cost time and are both now known:
+- MangoHud's CSV has a TWO-ROW METADATA PREAMBLE; the real header (`fps,frametime,...`) is line 3.
+- **`elapsed` is in NANOSECONDS**, not seconds (280,552,615,802 ns = 280.6 s). Parsing it as seconds
+  gave a 280-billion-second session.
+
+**The intervention was verified:** the monitor shows the offload cards busy for ~half the session
+(MI25 225 samples, FE 226, iGPU 78) — matching the 50% duty cycle. The offload really ran.
+
+**Aggregate looked like a win... and it is NOT one.**
+```
+ALL phases   OFF 164.8 fps  median 6.11 ms  p99 9.29 ms  1%low 107.6 fps
+             ON  171.5 fps  median 6.06 ms  p99 8.42 ms  1%low 118.7 fps    (+4.1%)
+```
+But per PAIR — same length, same session, alternating:
+```
+pair 1:  OFF 177.3 -> ON 157.3 fps   -11.3%
+pair 2:  OFF 160.3 -> ON 190.5 fps   +18.8%
+pair 3:  OFF 156.8 -> ON 166.7 fps    +6.4%
+```
+**Deltas from -11% to +19% between identical-length phases = the GAME's own scene variance.** The
++4.1% aggregate is an artifact of which scenery landed in which window.
+
+**VERDICT: INCONCLUSIVE on any FPS effect.** What it DOES establish: **no systematic penalty** — 2 of 3
+pairs had ON faster, 1 slower, i.e. scatter, not a cost. This is the noise-floor law again, one level up:
+at the benchmark level the floor was +/-9%; **in an open-world game it is +/-19%, which swamps any
+offload effect.** The aggregate average must never be quoted from this run.
+
+**THE PROTOCOL FIX (what a conclusive game test needs):**
+1. A **STATIC scene** — stand still, no camera movement; the variance is scene change.
+2. **Longer phases** (90-120 s) so the scenery averages out.
+3. Or a game with a **built-in repeatable benchmark**.
+Anything less and we will keep measuring the game instead of the offload.
