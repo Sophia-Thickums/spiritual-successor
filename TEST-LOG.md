@@ -305,3 +305,29 @@ above its solo state. Proven with n=6 interleaved pairs, a same-condition order 
 A-B-B-A sequence with clocks (32/34/34/32 + the series above).
 *Scope: one synthetic GPU-bound load (4K Vulkan denoise), one offload (VAAPI H.264 on the MI25), one box.
 Not yet generalised to games.*
+
+
+---
+
+## TEST M — A REAL HEAVY BENCHMARK, WORKING: Unigine Heaven 4.0 at 4K fullscreen
+**The discovery that unblocked it:** the Unigine benchmarks IGNORE `-preset` entirely (every preset 0-5
+gave the same 1600x900 / 1280x720 fallback) — but they DO honour **`-video_width W -video_height H`**
+(with `-video_fullscreen 1`). That is the resolution knob. (Superposition's `superposition_cli -config`
+path also does nothing; Heaven's PTS launcher path works.)
+
+**Baseline — Unigine Heaven 4.0, 3840x2160 fullscreen, 9070 XT alone:**
+```
+Frames: 85782      FPS: 329.293      Time: 260.5 s
+monitor: XT busy mean 96% / median 99% / max 100%   peak power 357 W   peak VRAM 1514 MiB
+```
+**IT SATURATES THE CARD** — 96% mean busy and **357 W** (against 250 W for the light tests). This is a
+genuine stress test, which is exactly what the earlier vkmark runs were not. **329.3 FPS at 4K is the
+heavy-load baseline.**
+
+**Note on the "Unknown GPU / 256 MB" line:** both Superposition and Heaven print it — their Unigine 2.5
+engine predates RDNA4 and cannot NAME the card. It still renders on it correctly (357 W of real work).
+So that log line is cosmetic, NOT evidence the benchmark is broken. What was actually broken was the
+resolution fallback, now solved.
+
+**Also installed this session:** `unigine-heaven-1.6.6` via `phoronix-test-suite install` (the 274 MB
+.run was downloaded and unpacked). Unigine Valley's zip is present locally too.
