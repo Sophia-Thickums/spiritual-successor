@@ -181,3 +181,29 @@ supported by that data.**
 **The law that caught it, restated with a fresh receipt:** *measure your noise floor first; a
 difference smaller than the spread is not a difference.* Without that step this session would have
 shipped a fake number into the project record.
+
+
+### TEST K, part 2 — the cost IS real, but the INSTRUMENT is wrong (recorded)
+Repeated properly: **n=8 interleaved pairs**, A (render alone) vs C (render + encode on the MI25):
+```
+A  render alone            mean 34,806   sd  788   spread 2.26%   (min 32,982  max 35,427)
+C  render + encode @MI25   mean 31,338   sd 2876   spread 9.18%   (min 27,681  max 35,251)
+delta mean(C-A) = -9.97%  -> ~1.9 sd, marginally OUTSIDE noise
+```
+Note the ALONE case became stable (2.26%) once repeated — the earlier one-shot 9.31% floor was contaminated
+by warmup/outliers. **Repeating changed the instrument's character, not just its precision.**
+
+**Then the confound check (D): render alone + a CPU-ONLY ffmpeg decode, no GPU encode at all.**
+```
+D  render + CPU-only load  mean 32,795   sd 2635   spread 8.03%   -> -5.8% vs A, ~1.2 sd = INSIDE noise
+```
+A CPU-only load already produces a ~6% dip. So **the offload's measured cost is partly the encoder's
+SOFTWARE DECODE burning CPU — not GPU contention.** At this n, CPU-vs-GPU cause is NOT separable.
+
+**★ THE REAL FINDING — the instrument cannot measure what we want:** vkmark renders at **35,000+ FPS** on
+the XT. A card doing 35k fps is **not GPU-bound**; it is CPU/present-bound. Therefore **vkmark can NEVER
+measure GPU contention on this card** — any "cost" it reports is chiefly CPU and scheduler noise.
+- vkmark remains valid for what TEST G/J used it for: ROUTING and per-card CAPABILITY.
+- It is INVALID for measuring render cost under offload.
+- **To measure offload cost, the render load must be GPU-BOUND — i.e. a real game (NTE), at settings that
+  saturate the card.** That is the next instrument, and it must be validated the same way (noise floor first).
