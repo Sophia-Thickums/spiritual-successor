@@ -573,3 +573,49 @@ used is taking an offload, not holding the game.
 
 Also confirmed a fourth time: all three secondary cards did real work during the game session
 (MI25 25%, FE 74%, iGPU 91% peak) — the offload ran under a live game.
+
+
+---
+
+## TEST R — BUILDING THE FRAME-GEN HANDOFF: my hypothesis was FALSIFIED, and the real wall found
+**Goal:** the frame-gen/upscale pass must run on a SECOND card, so a rendered frame has to reach that
+card. that project's bridge measured 41.4 ms per 64 MiB and blamed its own `vkQueueWaitIdle` per copy. I built
+the pipelined version (`bridge_pipelined.c`) — bounded ring, 8 copies in flight, drained only at the end.
+
+**RESULT: pipelining changed NOTHING.**
+```
+serialized (the earlier bridge)    41.367 ms/copy    0.76 GB/s per direction
+pipelined (8 in flight) 41.371 ms/copy    0.76 GB/s per direction
+```
+**Hypothesis FALSIFIED.** The per-copy stall was never the bottleneck.
+
+**THE REAL CAUSE — the instrument was measuring the wrong road.** My code insists on DEVICE_LOCAL for
+the imported buffer; the first pass FAILED on every target and fell back. The tool prints it plainly:
+```
+B landing type 2 heap 0 (15615 MiB)  !! NOT DEVICE-LOCAL !!
+```
+On RADV the dma_buf import lands in a **host-visible aperture heap**, so the B-side read walks **system
+RAM**, not the PCIe peer link. (that project's source carries a long comment about this exact bug on the FE.)
+
+**What it costs, per target (XT as the renderer, 64 MiB buffer, pipelined):**
+```
+XT -> Instinct MI25   : 0.76 GB/s per direction  ->  1440p frame ~19.0 ms ONE WAY
+XT -> Vega FE         : 0.25 GB/s                ->  1440p frame ~57.6 ms ONE WAY
+XT -> Ryzen iGPU      : 2.91 GB/s                ->  1440p frame ~ 4.95 ms ONE WAY
+```
+
+**★ THE IMPLICATION, stated plainly:**
+- A 1440p60 frame budget is **16.7 ms**. Sending one frame to the **MI25 costs ~19 ms one way** — already
+  over budget before any frame-gen compute, and a round trip doubles it. **The frame-gen offload to the
+  discrete Vega cards is NOT viable on this box.**
+- The **FE is 3x worse than the MI25** (0.25 vs 0.76), i.e. in the ratio of their links (x1 vs x4) — so the
+  aperture path *is* link-bound, just at ~24% of the raw link (3.19 GB/s measured) because it is an
+  uncached aperture walk, not a clean copy.
+- The **iGPU is the outlier and the only feasible round-trip target** (~4.95 ms one way, ~10 ms round
+  trip) because it shares system RAM, so the "aperture" IS its home memory.
+- **The clean architecture stands confirmed:** if a card OWNS the display, frames cross ONE WAY only. That
+  is what makes the offload sane — and it is why the design ranked present-on-secondary above round-trip.
+
+**So: the product's frame-gen feature is not blocked by our code — it is blocked by the platform's
+cross-device path on these links.** To ship it we need either a faster link to the frame-gen card, or the
+display moved onto that card (one-way), or the frame-gen on the iGPU-class device that shares memory.
