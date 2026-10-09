@@ -487,6 +487,59 @@ def doctor(db, as_json=False):
     return 1 if bad else 0
 
 
+# ── fg: can THIS card actually carry frame-gen / upscale for a game? ────────────────────
+# Measured on the dev box 2026-10-09 (dma_buf bridge, RADV, pipelined, 64 MiB): the import lands in a
+# HOST-VISIBLE aperture heap, so these are aperture rates, NOT peer-VRAM rates. Re-measure on any
+# other machine — the numbers are a property of the LINKS, not of the tool.
+HANDOFF_GBPS = {"card0": 0.76, "card2": 0.25, "card3": 2.91}
+FRAME_MIB = {"1080p": 8.29, "1440p": 14.75, "4k": 33.18}
+
+
+def fg(db, res="1440p60", mode="present-on-secondary"):
+    """Frame budget arithmetic: can a rendered frame reach this card in time, one way or round trip?"""
+    try:
+        r, hz = res.rsplit("@", 1) if "@" in res else (res[:-2], res[-2:])
+    except Exception:
+        r, hz = "1440p", "60"
+    r = r.rstrip("@")
+    res = r if r in FRAME_MIB else "1440p"
+    try:
+        hz = int(hz)
+    except ValueError:
+        hz = 60
+    payload = FRAME_MIB[res]
+    budget = 1000.0 / hz
+    one_way = (mode == "present-on-secondary")
+
+    print("spirit fg — can a card carry the frame-gen/upscale pass for %s@%d?\n" % (res, hz))
+    print("  frame payload: %.2f MiB    frame budget: %.2f ms\n" % (payload, budget))
+    print("  %-8s %-12s %-14s %-12s %s" % ("card", "handoff", "one-way ms", "round-trip ms", "verdict"))
+    print("  " + "-" * 84)
+    for g in db["gpus"]:
+        c = g["card"]
+        rate = HANDOFF_GBPS.get(c)
+        if rate is None:
+            print("  %-8s %-12s %-14s %-12s %s" % (c, "n/a", "-", "-", "not a card pair here / not measured"))
+            continue
+        ow = payload / 1024.0 / rate * 1000.0
+        rt = ow * 2
+        if one_way:
+            ok = ow <= budget
+            verdict = "FEASIBLE one-way" if ok else "INFEASIBLE one-way"
+            arith = "%.1f ms vs %.1f ms budget" % (ow, budget)
+        else:
+            ok = rt <= budget
+            verdict = "FEASIBLE round-trip" if ok else "INFEASIBLE round-trip"
+            arith = "%.1f ms vs %.1f ms budget" % (rt, budget)
+        print("  %-8s %-12s %-14.2f %-12.2f %s (%s)" % (c, "%.2f GB/s" % rate, ow, rt, verdict, arith))
+    print("\n  ★ ARCHITECTURE RULE, from measurement: put the DISPLAY on the card doing the frame-gen, so a")
+    print("    frame crosses ONE WAY. A round trip doubles the cost and is the first thing to fail.")
+    print("  ★ The handoff table above is MEASURED ON THE DEV BOX and is a property of its links — on any")
+    print("    other machine re-measure it before trusting a verdict. RADV lands the import in a")
+    print("    HOST-VISIBLE aperture heap, so these are aperture rates, not peer-VRAM rates.")
+    return 0
+
+
 def main():
     argv = sys.argv[1:]
     # `run` needs to pass an arbitrary command through untouched (it may contain -i, --flags, `--`).
@@ -515,8 +568,15 @@ def main():
     pl = sub.add_parser("plan"); pl.add_argument("--workload", default="1440p60-framegen")
     pl.add_argument("--vram-mib", type=int, default=None, help="VRAM the workload needs on its card")
     sub.add_parser("doctor")
+    f = sub.add_parser("fg")
+    f.add_argument("--res", default="1440p60", help="resolution@refresh, e.g. 1440p60 / 4k120 / 1080p144")
+    f.add_argument("--mode", default="present-on-secondary",
+                   choices=["present-on-secondary", "round-trip"],
+                   help="one-way (display on the frame-gen card) or round trip")
     a = ap.parse_args(argv)
     db = probe()
+    if a.cmd == "fg":
+        return fg(db, a.res, a.mode)
     if a.cmd == "doctor":
         return doctor(db)
     if a.cmd == "plan":
