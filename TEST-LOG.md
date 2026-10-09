@@ -472,3 +472,38 @@ Vega 10 silicon under its datacentre SKU name.)
 
 **The VRAM lesson at scale:** 8K alone cost **6898 MiB** (vs 1514 MiB at 4K, 778 MiB for vkmark) — the
 budgeting `spirit plan --vram-mib` now enforces.
+
+
+---
+
+## TEST P — ★★★ THE 8K RESULT WITH THE WHOLE MACHINE ENGAGED (the premise, closed at 8K)
+Same official benchmark, same 8K Optimized preset, driven the same way (cursor from the owner, click by
+`xdotool`), but with a real VAAPI H.264 encode running on ALL THREE other cards for the entire pass.
+
+```
+SUPERPOSITION 8K OPTIMIZED — 7680 x 4320, fullscreen, OpenGL
+
+XT ALONE (TEST O)                   FPS  Min 45.62  ·  Avg 54.76  ·  Max 65.10
+XT + OFFLOAD on 3 other cards       FPS  Min 46.02  ·  Avg 55.14  ·  Max 65.24     (+0.7%)
+```
+**Three cards working the whole time cost the benchmark card nothing — it came out marginally faster.**
+
+**All four verified working simultaneously** (monitor, 23 samples with 4 cards active at once):
+```
+card1  RX 9070 XT   benchmark   85% mean / 100% max   6901 MiB   90 C
+card0  Instinct MI25 offload    22% mean /  25% max     54 MiB   52 C
+card2  Vega FE       offload    61% mean /  72% max     54 MiB   52 C
+card3  Ryzen iGPU    offload    58% mean /  89% max     74 MiB   42 C
+cards concurrently active: 2 cards = 33 samples, 3 = 60, 4 = 23      PEAK SIMULTANEOUS = 4
+```
+
+**★ THE PROJECT'S PREMISE IS NOW CLOSED, end to end:**
+1. The link wall is real and measured (TEST J).
+2. Routing isolates one card at a time (TEST B, after being caught broken).
+3. A real offload runs on a secondary card (TEST K).
+4. It costs the main GPU nothing — and with clock headroom, it can help (TEST L, M).
+5. **All four cards work AT ONCE, and the official 8K benchmark is unaffected (TEST N, P).**
+
+**And the instrument lesson, proven side by side on the same run:** Superposition's own reading said
+`GPU °C: Min 27.0, Max 56.0`; our monitor measured **90 C**. Its `GPUMonitor` plugin failed to init, so
+the benchmark's built-in GPU/temperature numbers are worthless for this build. Ours owns the truth.
