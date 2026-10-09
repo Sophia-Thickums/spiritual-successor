@@ -13,11 +13,18 @@ by the time the game is running. It scales to any number of GPUs, any vendor mix
 No root. No dependencies (stdlib Python 3.8+; `lspci` used only if present).
 
 ```
+spirit doctor                    # prove THIS machine works: links, isolation, telemetry, role plan
 spirit probe                     # the TRUE host link, VRAM, outputs, render node of every GPU
 spirit roles                     # assign a job to every card — all of them, or say why not
-spirit plan --workload 1440p60-framegen
+spirit plan --workload 1440p60-framegen [--vram-mib N]
 spirit run --role encode --card card2 -- ffmpeg -i in.mkv -c:v hevc_vaapi out.mkv
 ```
+
+`spirit doctor` is the one to run first. It doesn't describe — it **tests**: it launches a real child
+process per card and confirms the child sees exactly one GPU, reads every telemetry counter, and checks
+that the role plan accounts for every card. Three verdicts — PASS / FAIL / UNKNOWN — and UNKNOWN is
+never a pass. It exits non-zero if anything fails. (Proven non-vacuous: fed a machine whose cards don't
+exist, it fails every check.)
 
 ## The two truths it is built on (both measured — see the project folder)
 

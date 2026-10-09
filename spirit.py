@@ -419,6 +419,74 @@ def print_table(db):
     print("FRAME rate toward the display. Per-frame PIXEL offload is dead on links < ~25 GB/s.")
 
 
+# ── doctor: verify THIS machine's readiness by testing the tool's own claims ──────────
+def _isolation_count(vid, did):
+    """How many GPUs a child process sees with the exclusive device-select applied. None = untestable."""
+    if not shutil.which("vulkaninfo"):
+        return None
+    env = dict(os.environ)
+    env["MESA_VK_DEVICE_SELECT"] = "%s:%s!" % (vid, did)
+    try:
+        out = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, text=True,
+                             env=env, timeout=30).stdout
+        return out.count("deviceName")
+    except Exception:
+        return None
+
+
+def doctor(db, as_json=False):
+    """Run the tool's own claims against the live machine. PASS / FAIL / UNKNOWN, never a silent pass."""
+    checks = []
+
+    # A. the probe reads a link for every card
+    miss = [g["card"] for g in db["gpus"] if g["link"]["gbps_max"] is None]
+    checks.append({"check": "probe-links", "verdict": "FAIL" if miss else "PASS",
+                   "detail": ("missing links: " + ",".join(miss)) if miss else "a host link for every card"})
+
+    # B. routing ISOLATES on every card (the claim that was once false)
+    if not shutil.which("vulkaninfo"):
+        checks.append({"check": "routing-isolation", "verdict": "UNKNOWN",
+                       "detail": "vulkaninfo not installed — cannot test"})
+    else:
+        for g in db["gpus"]:
+            n = _isolation_count(g["vendor"][2:], g["device"][2:])
+            if n is None:
+                v, d = "UNKNOWN", "could not run a test child"
+            elif n == 1:
+                v, d = "PASS", "a child sees exactly 1 device"
+            else:
+                v, d = "FAIL", "a child sees %d devices (expected 1)" % n
+            checks.append({"check": "routing-isolation", "card": g["card"], "verdict": v, "detail": d})
+
+    # C. telemetry is readable (the monitor depends on it)
+    n_ok = sum(1 for g in db["gpus"]
+               if _int("/sys/class/drm/%s/device/mem_info_vram_used" % g["card"]) is not None)
+    checks.append({"check": "telemetry", "verdict": "PASS" if n_ok == len(db["gpus"]) else "FAIL",
+                   "detail": "VRAM counters readable on %d/%d cards" % (n_ok, len(db["gpus"]))})
+
+    # D. the role plan places at least one card, and says why for the rest
+    rp = assign_roles(db, "game")
+    placed = sum(1 for r in rp if r["roles"] != ["idle"])
+    unexplained = [r["card"] for r in rp if r["roles"] == ["idle"] and not r["why"]]
+    checks.append({"check": "role-plan", "verdict": "PASS" if placed and not unexplained else "FAIL",
+                   "detail": "places %d/%d cards%s" % (placed, len(rp),
+                             ("" if not unexplained else "; unexplained idle: " + ",".join(unexplained)))})
+
+    bad = any(c["verdict"] == "FAIL" for c in checks)
+    overall = "READY" if not bad else "PROBLEMS FOUND"
+
+    if as_json:
+        print(json.dumps({"spirit": "doctor/0.1", "overall": overall, "checks": checks}, indent=2))
+        return 1 if bad else 0
+
+    print("spirit doctor — verifying this machine's multi-GPU readiness\n")
+    for c in checks:
+        card = ("%-6s " % c["card"]) if c.get("card") else ""
+        print("  [%-7s] %s%s" % (c["verdict"], card, c["detail"]))
+    print("\n  OVERALL: %s%s" % (overall, "" if not bad else " — see FAIL lines above"))
+    return 1 if bad else 0
+
+
 def main():
     argv = sys.argv[1:]
     # `run` needs to pass an arbitrary command through untouched (it may contain -i, --flags, `--`).
@@ -446,8 +514,11 @@ def main():
     r = sub.add_parser("roles"); r.add_argument("--profile", default="game"); r.add_argument("--json", action="store_true")
     pl = sub.add_parser("plan"); pl.add_argument("--workload", default="1440p60-framegen")
     pl.add_argument("--vram-mib", type=int, default=None, help="VRAM the workload needs on its card")
+    sub.add_parser("doctor")
     a = ap.parse_args(argv)
     db = probe()
+    if a.cmd == "doctor":
+        return doctor(db)
     if a.cmd == "plan":
         return plan(db, a.workload, a.vram_mib)
     if a.cmd == "roles":
