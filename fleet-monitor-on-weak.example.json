@@ -1,0 +1,113 @@
+{
+ "gpufan": "probe/0.1",
+ "gpus": [
+  {
+   "card": "card0",
+   "bdf": "0000:01:00.0",
+   "name": "RX 5500 XT  (has the monitor)",
+   "driver": "amdgpu",
+   "vendor": "0x1002",
+   "device": "0x0000",
+   "integrated": false,
+   "render_node": "renderD128",
+   "vram_total_mib": 4096,
+   "vram_used_mib": 0,
+   "display_outputs": 1,
+   "connectors_total": 3,
+   "has_output": true,
+   "link": {
+    "binding_element": "0000:00:01.0",
+    "max_width": 4,
+    "max_gen": null,
+    "gbps_max": 3.4,
+    "current_width": 4,
+    "current_gen": null,
+    "gbps_current": 3.4,
+    "idle_degraded": false,
+    "own_reports_width": 16,
+    "capped_by_topology": true
+   }
+  },
+  {
+   "card": "card1",
+   "bdf": "0000:02:00.0",
+   "name": "RX 7900 XTX (no monitor)",
+   "driver": "amdgpu",
+   "vendor": "0x1002",
+   "device": "0x0000",
+   "integrated": false,
+   "render_node": "renderD129",
+   "vram_total_mib": 24576,
+   "vram_used_mib": 0,
+   "display_outputs": 0,
+   "connectors_total": 3,
+   "has_output": false,
+   "link": {
+    "binding_element": "0000:00:01.0",
+    "max_width": 16,
+    "max_gen": null,
+    "gbps_max": 13.5,
+    "current_width": 16,
+    "current_gen": null,
+    "gbps_current": 13.5,
+    "idle_degraded": false,
+    "own_reports_width": 16,
+    "capped_by_topology": false
+   }
+  },
+  {
+   "card": "card2",
+   "bdf": "0000:03:00.0",
+   "name": "RX 6600",
+   "driver": "amdgpu",
+   "vendor": "0x1002",
+   "device": "0x0000",
+   "integrated": false,
+   "render_node": "renderD130",
+   "vram_total_mib": 8192,
+   "vram_used_mib": 0,
+   "display_outputs": 0,
+   "connectors_total": 3,
+   "has_output": false,
+   "link": {
+    "binding_element": "0000:00:01.0",
+    "max_width": 4,
+    "max_gen": null,
+    "gbps_max": 3.4,
+    "current_width": 4,
+    "current_gen": null,
+    "gbps_current": 3.4,
+    "idle_degraded": false,
+    "own_reports_width": 16,
+    "capped_by_topology": true
+   }
+  },
+  {
+   "card": "card3",
+   "bdf": "0000:04:00.0",
+   "name": "Ryzen iGPU",
+   "driver": "amdgpu",
+   "vendor": "0x1002",
+   "device": "0x0000",
+   "integrated": true,
+   "render_node": "renderD131",
+   "vram_total_mib": 512,
+   "vram_used_mib": 0,
+   "display_outputs": 0,
+   "connectors_total": 2,
+   "has_output": false,
+   "link": {
+    "binding_element": "0000:00:01.0",
+    "max_width": 1,
+    "max_gen": null,
+    "gbps_max": 0.85,
+    "current_width": 1,
+    "current_gen": null,
+    "gbps_current": 0.85,
+    "idle_degraded": false,
+    "own_reports_width": 16,
+    "capped_by_topology": true
+   }
+  }
+ ]
+}
