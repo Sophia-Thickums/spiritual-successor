@@ -414,3 +414,23 @@ cards concurrently active: 4 cards = 29 samples, 3 = 62, 2 = 37   PEAK SIMULTANE
 
 **Implementation:** `multigpu.py` — discovers the card->render-node map from sysfs (never a remembered
 number) and offloads to every non-main card at once.
+
+
+### TEST M, part 4 — SUPERPOSITION'S CLI: resolution is IMPOSSIBLE (definitive, do not retry)
+Systematically falsified, four variants, every one fell back to the same mode:
+```
+-video_width 7680 -video_height 4320 + config_readonly 1   -> Set 1600x900
+-video_width 7680 -video_height 4320 + plain world_load     -> Set 1600x900
+-video_width 7680 -video_height 4320 + no console_command   -> Set 1600x900
+-video_width 3840 -video_height 2160 + plain world_load     -> Set 1600x900
+```
+The binary LISTS `video_width`, `video_height`, `video_fullscreen` and `preset` as arguments, and
+**ignores all of them.** The "config_readonly 1 blocks the video args" hypothesis is FALSE (falsified
+with and without it, and with no console command at all).
+**CONCLUSION: Superposition 1.1 cannot be driven to a chosen resolution headlessly on this box. Its GUI
+launcher is the only path.** Contrast: **Heaven 4.0 DOES honour `-video_width`/`-video_height`** — so the
+two Unigine builds differ, and "same engine family" was a false assumption that cost time. Do not
+generalise one build's arguments to another.
+
+**Incidental (4-card monitor, completed):** during the 4-card concurrent run the FE peaked 75% busy and
+the iGPU 84% (both at 54/74 MiB), the XT at 91 C / 344 W. All four confirmed active a second time.
