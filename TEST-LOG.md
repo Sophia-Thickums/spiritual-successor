@@ -147,3 +147,37 @@ proves is that per-frame volume governs these cards; it does not claim they were
 **Why this matters for the whole project:** it is the empirical basis for the Spiritual Successor's
 central law — *cross the link at FRAME rate or ONCE, never per pixel.* Per-frame pixel work is not slow
 here; it is 45x wrong.
+
+
+---
+
+## TEST K — the FIRST REAL OFFLOAD: encode on the MI25 while the XT renders
+**VAAPI H.264 encode works on both cards** (1080p60 source, software decode -> hwupload -> vaapi):
+XT (renderD128) **385-415 fps**; MI25 (renderD129) **197-198 fps** (= 3.3x realtime). `vainfo` is not
+installed but the VA driver (`radeonsi_drv_video.so`) is, and libva is present.
+
+**The offload RAN.** During the offloaded case the monitor shows the MI25 allocating **54 MiB** of VRAM
+(idle: 7 MiB) while the XT sat at **100% busy** rendering — so the encode genuinely landed on the
+secondary card.
+
+### ★ AND THEN THE RESULT COLLAPSED, CORRECTLY — MEASURE THE NOISE FLOOR FIRST
+I had a tempting story: encode-on-the-render-card cost the render **-16.5%**, and offloading it cost
+only **-9.8%**, so "offloading saves you ~7 points." **That reading is RETRACTED.** Measuring vkmark's
+own run-to-run spread, alone, 5 runs:
+```
+27871, 29486, 33402, 35145, 35160   ->  mean 32213, sd 2999, SPREAD 9.31%
+```
+**The noise floor is +/-9.31%.** The "offloaded" delta (-9.8%) sits INSIDE it, and even the
+same-card delta (-16.5%) is only barely outside. **No claim about the FPS cost of offloading is
+supported by that data.**
+
+**What IS established, and what is NOT:**
+- ✅ ESTABLISHED: a real 1080p60 H.264 encode runs on the MI25 at ~197 fps *concurrently with* the XT
+  rendering at full tilt, routed by `spirit` (render-node + `MESA_VK_DEVICE_SELECT` isolation).
+- ❌ NOT ESTABLISHED: whether an offloaded encode costs the render card any measurable FPS.
+- **Method fix required (next):** n>=10 per condition and compare DISTRIBUTIONS, or a lower-variance
+  render load. A single-run A/B/C on a +/-9% instrument cannot decide a 7-point effect.
+
+**The law that caught it, restated with a fresh receipt:** *measure your noise floor first; a
+difference smaller than the spread is not a difference.* Without that step this session would have
+shipped a fake number into the project record.
