@@ -72,3 +72,45 @@ First real-game test target: **NTE** (UE5), under `mangohud` + `monitor.py`.
 looked fine — env set, no error, exit 0 — and was false. It took a child process *counting the devices
 it could see* to expose it. Peak GPU busy is the same kind of witness for a benchmark: a score that
 appears without the GPU loading is a fake green, not a result.
+
+
+---
+
+## TEST F — vkmark BASELINE, 9070 XT ONLY — ✅ PASS (a real number, verified)
+    spirit run --role compute --card card1 -- vkmark --fullscreen \
+      -b "shading:shading=phong:duration=15" -b "texture:anisotropy=16:duration=15" \
+      -b "vertex:device-local=true:duration=15"
+vkmark's own header confirmed the device was the XT (Device ID 0x7550).
+**shading 35,635 FPS · texture 31,880 FPS · vertex 36,805 FPS · vkmark Score 34,773.**
+Monitor (58 samples) across the run: **card1 peak busy 100%, 250 W, 75 C**; card0/2/3 all 0%, 0 W.
+=> the load was PROVABLY on exactly one card. **Positive control established. This is the baseline.**
+
+## TEST G — per-card capability map — ✅ real numbers
+Same test, one card at a time (shading=phong, fullscreen):
+
+| card | device | FPS |
+|---|---|---|
+| card1 | RX 9070 XT | **35,635** |
+| card3 | Ryzen iGPU | 1,315 |
+| card0 | Instinct MI25 | 113 |
+| card2 | Vega Frontier Edition | 29 |
+
+Each card's run allocated its OWN VRAM (MI25 7→140 MiB, FE 8→141 MiB, iGPU 15→147 MiB) and the run
+header named that card only — so the routing is confirmed again, four for four.
+**★ The striking datum: the MI25 (113) and the Vega FE (29) are the SAME Vega10 silicon. The only
+structural difference is the link — x4 Gen3 (3.4 GB/s) vs x1 Gen3 (0.87 GB/s) — and the FE is ~4x slower.
+Consistent with the link-wall thesis. NOT isolated from clocks/power-state yet — do not over-claim it.**
+
+## TEST H — Unigine Superposition — ❌ DEAD on this box (documented, not blamed)
+The engine (UNIGINE 2.5-dev superposition-1.1, Apr 2019) **mis-detects RDNA4**: its log reads
+`GPU: Unknown GPU x1 / Video memory: 256 MB`, and it falls back to a **1600x900** video mode no matter
+what `-preset` / `-video_fullscreen` is passed. That fallback *is* the broken low-res window observed.
+`superposition_cli -config <xml>` exits instantly and writes nothing. Its correct driver is the GUI
+launcher, which cannot be run headlessly here. **Verdict: use a modern Vulkan benchmark (vkmark).**
+(The Cyberpunk "benchmark" remains a non-item — that game is not installed.)
+
+## TEST I — `vkmark -D <uuid>` is UNUSABLE here, and that is precisely the gap spirit fills
+All four RADV devices report the **SAME Device UUID** (`ac3da3d19386ed23d795ff786b3cb33e`), so vkmark's
+`-D/--use-device` cannot tell them apart. The ONLY way found to pin a benchmark to one GPU is
+`MESA_VK_DEVICE_SELECT=vid:did!` — which is exactly what `spirit run` emits. **On this box, spirit is
+not decoration; it is the mechanism that makes per-GPU benchmarking possible at all.**
