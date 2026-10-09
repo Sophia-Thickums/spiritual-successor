@@ -236,3 +236,24 @@ question, not a feature — do not quote it until the cause is found.**
 
 **What this session actually settled:** the link wall (proven), routing isolation (proven), the first
 working offload (proven), and the noise-floor discipline (which caught two would-be false results).
+
+
+### TEST L, part 2 — the +6.8% NARROWED to a CLOCK effect (mechanism still unsettled)
+Re-measured with the trusted monitor (not the broken inline reader). XT time series, alone then offloaded:
+```
+ALONE  (t=4-13):  XT core 3047-3383 Mhz   154-213 W   83-99% busy
++OFFL  (t=14-18): XT core 3375-3416 Mhz   214-221 W   99-100% busy
+```
+So during the offload the XT held **~150 Mhz higher core clock and ~20 W more power** — and ~150 Mhz on
+~3250 = +4.6%, which tracks the measured +6.2-6.8% throughput gain. **The effect is a clock/power-state
+difference, not magic.**
+
+**What is NOT settled:** whether that clock lift is (a) a real consequence of co-running a second GPU
+(power/SoC/PCIe link state staying higher), or (b) an ordering artifact in the clock domain only. The FPS
+order-control (same condition twice = -1.0%) argues AGAINST pure warmup, but it measured FPS, not clocks —
+and the clock series here is confounded by condition 1 itself warming up.
+
+**Honest status: a reproducible +6.2-6.8% main-load gain, caused by a ~150 Mhz clock lift, whose TRIGGER
+is unidentified.** Open question. The experiment that would settle it: alternate the ORDER
+(offload-first, then alone) several times and watch whether the clock lift follows the OFFLOAD or the
+POSITION. Not yet run.
