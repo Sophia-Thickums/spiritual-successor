@@ -14,7 +14,24 @@ play.
 So a gaming card plus an old mining card, a datacentre card, or even your processor's built-in
 graphics: all of them earn their slot.
 
-No root, no install. Just Python (3.8 or newer).
+No root, no dependencies — just Python (3.8 or newer).
+
+## Install
+
+One line puts the `spirit` command on your PATH:
+
+```
+curl -fsSL https://raw.githubusercontent.com/Sophia-Thickums/spiritual-successor/main/install.sh | sh
+```
+
+Then check it works:
+
+```
+spirit doctor
+```
+
+That's it. It's a single Python file with no dependencies — if you'd rather do it by hand, download
+`spirit.py`, drop it anywhere on your PATH, and run it. You need **Python 3.8 or newer** and **Linux**.
 
 ## What it does
 
