@@ -374,3 +374,43 @@ both runs — 430 s of window over two ~265 s runs.)
 **★ THERMAL DATUM:** under Heaven 4K the 9070 XT peaked at **92.0 C** — the heaviest thermal load
 recorded on this box (the light tests peaked at 75-77 C). 341-357 W sustained. Within spec, but it is
 the number to watch if a real game runs longer than a benchmark. Worth a `hotcard-guard` check.
+
+
+---
+
+## TEST N — ★★ THE MULTI-GPU CAPABILITY, DEMONSTRATED (not two cards: FOUR, at once)
+the owner's question: the project is about MULTIPLES, not a second card. Status, tested:
+
+**All four cards can hardware-encode** (measured, 1080p60 H.264, `vainfo` absent but VAAPI works):
+`MI25 198 fps · iGPU 174 fps · FE 133 fps · XT 300 fps`.
+
+**The 4-card concurrent run** — Unigine Heaven 4K fullscreen on the XT while ALL THREE other cards
+encode simultaneously:
+```
+XT ALONE (baseline)                          329.29 FPS
+XT + offload on 1 card  (MI25)              329.98 FPS    (+0.2%)
+XT + offload on 3 cards (MI25+FE+iGPU)      329.70 FPS    (+0.1%)   <- 85,887 frames, 265 s
+```
+**Three extra cards working at once did not cost the benchmark card anything.**
+
+**And the monitor proves all four really were working, simultaneously:**
+```
+card1  RX 9070 XT    benchmark   88% mean / 100% max   1514 MiB   91 C
+card0  Instinct MI25 offload      6% mean /  25% max     54 MiB   52 C
+card2  Vega FE       offload     27% mean /  75% max     54 MiB   52 C
+card3  Ryzen iGPU    offload      5% mean /  84% max     74 MiB   43 C
+
+cards concurrently active: 4 cards = 29 samples, 3 = 62, 2 = 37   PEAK SIMULTANEOUS = 4
+```
+
+**STATUS OF THE CAPABILITY, stated precisely:**
+- **Planning at N:** proven. `spirit roles` places 9/10 cards on a synthetic 10-GPU heterogeneous fleet.
+- **Routing to any card:** proven. All four cards, one at a time, child sees exactly one GPU.
+- **Executing on N simultaneously:** **PROVEN at 4** (the whole machine), with the main card's
+  benchmark unaffected. Every card allocated its own VRAM and did its own work.
+- **NOT yet tested above 4** — the box has four cards. The engine is N-generic by construction (no
+  2-card or 4-card assumptions anywhere in `spirit.py`), but >4 is unverified hardware-wise, and that
+  must be said plainly rather than assumed.
+
+**Implementation:** `multigpu.py` — discovers the card->render-node map from sysfs (never a remembered
+number) and offloads to every non-main card at once.
