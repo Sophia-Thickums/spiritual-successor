@@ -356,7 +356,8 @@ def run(db, role, card, cmd):
     print("# routing role=%s to %s (%s, link %s GB/s)" % (role, g["card"], g["name"][:34], g["link"]["gbps_max"]))
     print("# env: DRI_PRIME=%s  MESA_VK_DEVICE_SELECT=%s" % (pci, env["MESA_VK_DEVICE_SELECT"]))
     if role == "encode" and g.get("render_node"):
-        print("#      add to ffmpeg:  -vaapi_device /dev/dri/%s" % g["render_node"])
+        env["SPIRIT_VAAPI_DEVICE"] = "/dev/dri/%s" % g["render_node"]
+        print("#      add to ffmpeg:  -vaapi_device %s" % env["SPIRIT_VAAPI_DEVICE"])
     if role == "compute":
         print("#      ggml: GGML_VK_VISIBLE_DEVICES=%s" % g["bdf"])
     sys.stdout.flush()
