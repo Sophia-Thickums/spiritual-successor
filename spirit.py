@@ -391,14 +391,32 @@ def print_table(db):
 
 
 def main():
+    argv = sys.argv[1:]
+    # `run` needs to pass an arbitrary command through untouched (it may contain -i, --flags, `--`).
+    # argparse's REMAINDER mangles option-like args, so parse `run` by hand.
+    if argv and argv[0] == "run":
+        role = card = None
+        rest, i = [], 1
+        while i < len(argv):
+            if argv[i] == "--role":
+                role = argv[i + 1]; i += 2
+            elif argv[i] == "--card":
+                card = argv[i + 1]; i += 2
+            elif argv[i] == "--":
+                rest = argv[i + 1:]; break
+            else:
+                rest = argv[i:]; break
+        if not role or not card:
+            print("usage: spirit run --role <role> --card <card> [-- <cmd>...]", file=sys.stderr)
+            return 1
+        return run(probe(), role, card, rest)
+
     ap = argparse.ArgumentParser(prog="spirit", description="Spiritual Successor — put every GPU to work")
     sub = ap.add_subparsers(dest="cmd")
     p = sub.add_parser("probe"); p.add_argument("--json", action="store_true")
     r = sub.add_parser("roles"); r.add_argument("--profile", default="game"); r.add_argument("--json", action="store_true")
     pl = sub.add_parser("plan"); pl.add_argument("--workload", default="1440p60-framegen")
-    rn = sub.add_parser("run"); rn.add_argument("--role", required=True)
-    rn.add_argument("--card", required=True); rn.add_argument("cmd", nargs=argparse.REMAINDER)
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     db = probe()
     if a.cmd == "plan":
         return plan(db, a.workload)
@@ -408,8 +426,6 @@ def main():
         else:
             print_roles(db, a.profile)
         return 0
-    if a.cmd == "run":
-        return run(db, a.role, a.card, a.cmd)
     if a.cmd == "probe":
         if a.json:
             print(json.dumps(db, indent=2))
