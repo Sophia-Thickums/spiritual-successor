@@ -2,8 +2,9 @@
 
 **Put every GPU in your PC to work.**
 
-Most people with two graphics cards use one and leave the other sitting idle. This tool puts them all
-to work.
+Most people with more than one graphics chip use one and leave the rest sitting idle. This tool puts
+them all to work — two cards, four cards, ten, or just your processor's built-in graphics alongside a
+real card.
 
 The old CrossFire and SLI tried to split a single frame across two cards. That never worked well and
 it's dead. We do the opposite: your game runs on **one** card — the one your monitor is plugged into,
@@ -76,9 +77,51 @@ only telling you what we can stand behind.
   is slow while it builds its shader cache, and that can look exactly like a gain. Warm it up before
   you compare.)
 
-## Who it's for
+## Who this is for
 
-People who want to use the hardware they already own. That's it.
+Anyone with more than one graphics chip and a budget.
+
+- **You have two or more GPUs** — a newer card plus an older one, or a couple of second-hand cards.
+- **You have built-in graphics and a card as well** (or the other way around). Your processor's
+  integrated graphics is a card here, not an afterthought.
+- **You have a pile of old cards.** This is not a two-card trick. It doesn't care how many you have or
+  who made them. We tested the job-assignment side against a made-up **10-card** machine and it placed
+  9 of them — the tenth had nowhere to plug a monitor, and it says so.
+
+If you've ever wanted a cheap second or third card to *do something* instead of sitting there, this is
+for you.
+
+## What this could do for you
+
+It's early days, so we're careful about promises. Here's the honest shape of it:
+
+- **Put more of your machine to work.** Your game runs on one card; the others take on real jobs at the
+  same time. That means a gaming card plus old cards can do more at once — record or stream while you
+  play, run a job in the background — without the game falling over.
+- **The potential is more frames and better ray tracing on budget builds.** The whole idea is spreading
+  work across several weaker cards. Several cheap cards together can, in principle, take on work that
+  one of them couldn't alone. That's the direction we're building toward.
+- **It spreads the load for games that want a lot of VRAM.** A game that needs more video memory than
+  your main card has is a real wall. Handing the other work off to the other cards frees your main card
+  up to hold the game.
+
+## What this is NOT
+
+**It is not a miracle.** It will not turn an old card into a new one. It will not let a GTX 1080 Ti run
+Cyberpunk 2077 at 4K. It will not make a slow card fast, and it will not raise your frame rate today —
+that part isn't built yet.
+
+What it does is honest: it puts the cards you already own to work, and tells you the truth about what
+each one can and can't do. If that's what you want, you're in the right place.
+
+## Found a bug, or have an idea?
+
+Email me: **sophia.wanders@proton.me**
+
+Broken cards, things that didn't work, technical suggestions, or just a thought about how this should
+work better — all welcome. **The more detail the better.** Tell me what cards you have, what game or
+job you were running, what you expected, and what actually happened (error text helps a lot). A wall of
+detail beats a one-line report every time.
 
 ---
 
