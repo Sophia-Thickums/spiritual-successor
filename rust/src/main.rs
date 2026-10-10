@@ -2187,7 +2187,35 @@ fn start_encode(node: &str) -> std::io::Result<Child> {
         .spawn()
 }
 
+/// True if this is a Proton/Wine launch, where the mount-namespace wall MUST be skipped.
+///
+/// ★ MEASURED 2026-10-10: `unshare -r` maps our uid to 0 inside, and Wine/Proton REFUSE TO RUN AS
+/// ROOT — the launch dies with `bin_steam.sh: Error: Cannot run as root user` before the game ever
+/// starts. So on any Proton title (i.e. most Windows games, which is most of the audience) our
+/// second wall breaks the launch outright. Detect it and fall back to the pin alone, which is the
+/// load-bearing half anyway, and SAY SO rather than silently weakening the wall.
+///
+/// ★ NO ENV LOOKUP HERE. An earlier version also checked STEAM_COMPAT_DATA_PATH, which meant a
+/// stray variable left in a shell silently disabled the wall for NATIVE games too — the same
+/// ambient-state trap that let SPIRIT_DEVICES poison a whole session. Decide on the ARGV, which
+/// is what actually describes the launch.
+fn is_wine_target(cmd: &[String]) -> bool {
+    for a in cmd {
+        let b = Path::new(a)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if b.ends_with(".exe") || b.contains("proton") || b == "wine" || b.starts_with("wine") {
+            return true;
+        }
+    }
+    false
+}
+
 fn hidden_argv(cmd: &[String], main: &Json, db: &Json) -> Vec<String> {
+    if is_wine_target(cmd) {
+        return cmd.to_vec();
+    }
     let mut hide: Vec<String> = Vec::new();
     for g in &gpus_of(db) {
         if card_of(g) == card_of(main) {
@@ -2235,9 +2263,9 @@ fn spawn_argv(argv: &[String], env_pins: &[(OsString, OsString)]) -> i32 {
     }
 }
 
-fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framegen: Option<i64>) -> i32 {
+fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framegen: Option<i64>, overlay: bool) -> i32 {
     if cmd.is_empty() {
-        eprintln!("usage: spirit play [--no-offload] [--scale F] [--framegen N] -- <game command...>");
+        eprintln!("usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] -- <game command...>");
         return 1;
     }
     let cmd: Vec<String> = cmd.to_vec();
@@ -2290,7 +2318,6 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
 
     // UPSCALING: validate and report. The gamescope wrapper is applied AFTER the mount namespace
     // is built (below), so gamescope stays OUTSIDE the namespace.
-    let mut scale_native: Option<(i64, i64)> = None;
     if let Some(s) = scale {
         let (gs_state, gs_detail) = gamescope_state();
         let native = native_res(db);
@@ -2306,7 +2333,6 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
             }
         };
         let (rw, rh) = render_res(native, s);
-        scale_native = Some(native);
         println!(
             "  scale: render {}x{} -> present {}x{} via gamescope FSR 1.0  ({:.0}% of the pixels)",
             rw, rh, native.0, native.1, 100.0 * s * s
@@ -2326,9 +2352,10 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
             match prof {
                 Some(p) => {
                     env_pins.push(("LSFGVK_PROFILE".into(), p.clone().into()));
-                    if scale.is_some() {
+                    if scale.is_some() || overlay {
                         // ★ lsfg-vk's own troubleshooting: under gamescope with vsync pacing,
                         // set ENABLE_GAMESCOPE_WSI=0 or frame generation does not engage at all.
+                        // This applies whenever gamescope is in play — including --overlay alone, with no upscaling.
                         env_pins.push(("ENABLE_GAMESCOPE_WSI".into(), "0".into()));
                     }
                     println!(
@@ -2343,6 +2370,11 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
                 }
             }
         }
+    }
+
+    if is_wine_target(&cmd) {
+        println!("  wall: Proton/Wine detected — skipping the mount namespace (Wine refuses to run as");
+        println!("        root, and `unshare -r` makes us root); the exclusive pin still applies.");
     }
 
     let mut procs: Vec<Child> = Vec::new();
@@ -2373,28 +2405,48 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
     // nested gamescope dies at xwayland/sockets.c:83 followed by "Failed to create Xwayland server".
     // gamescope MUST be the OUTER wrapper; only the game goes inside the namespace. Measured 2026-10-10.
     let mut inner = hidden_argv(&cmd, &main, db);
-    if let Some(s) = scale {
-        let native = scale_native.unwrap_or((0, 0));
-        let (rw, rh) = render_res(native, s);
-        let mut wrapped: Vec<String> = vec![
+    if overlay && scale.is_none() {
+        let (gs_state, gs_detail) = gamescope_state();
+        if gs_state != "READY" || native_res(db).is_none() {
+            println!("  overlay: REFUSED - gamescope not ready ({})", gs_detail);
+            return 1;
+        }
+    }
+    if scale.is_some() || overlay {
+        let nat = native_res(db).unwrap_or((0, 0));
+        let (rw, rh) = match scale {
+            Some(s) => render_res(nat, s),
+            None => nat,
+        };
+        let mut gs: Vec<String> = vec![
+            // -w/-h = the GAME's render size; -W/-H = the OUTPUT (were swapped: --scale was a no-op)
             "gamescope".into(),
             "-w".into(),
-            native.0.to_string(),
-            "-h".into(),
-            native.1.to_string(),
-            "-W".into(),
             rw.to_string(),
-            "-H".into(),
+            "-h".into(),
             rh.to_string(),
+            "-W".into(),
+            nat.0.to_string(),
+            "-H".into(),
+            nat.1.to_string(),
             "-f".into(),
-            "-F".into(),
-            "fsr".into(),
-            "--fsr-sharpness".into(),
-            "2".into(),
-            "--".into(),
         ];
-        wrapped.extend(inner);
-        inner = wrapped;
+        if scale.is_some() {
+            gs.push("-F".into());
+            gs.push("fsr".into());
+            gs.push("--fsr-sharpness".into());
+            gs.push("2".into());
+        }
+        if overlay {
+            // THE PRESENT-COUNTER. mangoapp runs INSIDE gamescope as a transparent overlay, so its
+            // FPS readout is the COMPOSITOR's present rate - the only number frame generation moves.
+            // The game's own counter reports frames IT rendered, which frame gen does not change.
+            gs.push("--mangoapp".into());
+            println!("  overlay: mangoapp inside gamescope - on-screen FPS is the COMPOSITOR's present rate");
+        }
+        gs.push("--".into());
+        gs.extend(inner);
+        inner = gs;
     }
     let rc = spawn_argv(&inner, &env_pins);
     for p in procs.iter_mut() {
@@ -2547,6 +2599,7 @@ fn dispatch(argv: &[String]) -> i32 {
         let mut rest: Vec<String> = Vec::new();
         let mut scale: Option<f64> = None;
         let mut framegen: Option<i64> = None;
+        let mut overlay = false;
         let mut i = 1;
         while i < argv.len() {
             if argv[i] == "--no-offload" {
@@ -2570,6 +2623,9 @@ fn dispatch(argv: &[String]) -> i32 {
                     }
                 }
                 i += 2;
+            } else if argv[i] == "--overlay" {
+                overlay = true;
+                i += 1;
             } else if argv[i] == "--" {
                 rest = argv[i + 1..].to_vec();
                 break;
@@ -2590,7 +2646,7 @@ fn dispatch(argv: &[String]) -> i32 {
                 return 2;
             }
         }
-        return play(&probe(), &rest, offload, scale, framegen);
+        return play(&probe(), &rest, offload, scale, framegen, overlay);
     }
 
     let cmd = argv[0].as_str();
