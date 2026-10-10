@@ -472,6 +472,19 @@ def doctor(db, as_json=False):
                    "detail": "places %d/%d cards%s" % (placed, len(rp),
                              ("" if not unexplained else "; unexplained idle: " + ",".join(unexplained)))})
 
+    # E. UPSCALING — the path the tool advertises actually exists on this machine.
+    gs_state, gs_detail = _gamescope_state()
+    checks.append({"check": "upscaling",
+                   "verdict": "PASS" if gs_state == "READY" else "UNKNOWN",
+                   "detail": "%s — %s" % (gs_state, gs_detail)})
+
+    # F. FRAME GENERATION — reported honestly; UNKNOWN is never green, and absent is not a failure
+    #    of THIS machine (it needs software the user must own). Only a broken install is a FAIL.
+    ls_state, ls_detail = _lsfg_state()
+    ls_verdict = {"READY": "PASS", "NOT-WORKING": "FAIL"}.get(ls_state, "UNKNOWN")
+    checks.append({"check": "frame-generation", "verdict": ls_verdict,
+                   "detail": "%s — %s" % (ls_state, ls_detail)})
+
     bad = any(c["verdict"] == "FAIL" for c in checks)
     overall = "READY" if not bad else "PROBLEMS FOUND"
 
@@ -540,6 +553,158 @@ def fg(db, res="1440p60", mode="present-on-secondary"):
     return 0
 
 
+
+# ── boost: what extra frames can THIS machine give you, right now ───────────────────────
+# Two ways to more frames, and they are NOT the same thing:
+#   UPSCALING  — render below native and scale up. Fewer pixels rendered. Real FPS, any card,
+#                any Vulkan game. We drive gamescope's FSR 1.0 (permissive) for this.
+#   FRAME GEN  — interpolate extra frames. The big multiplier. We do NOT ship an implementation
+#                and we do NOT ship anyone else's: we detect lsfg-vk, which requires the user to
+#                own Lossless Scaling, and drive it if it is there. See the README.
+LSFG_LAYER = "/usr/share/vulkan/implicit_layer.d/VkLayer_LSFGVK_frame_generation.json"
+LSFG_CONF = os.path.expanduser("~/.config/lsfg-vk/conf.toml")
+LSFG_APPID = "993090"
+STEAM_MANIFEST = os.path.expanduser("~/.local/share/Steam/steamapps/appmanifest_%s.acf" % LSFG_APPID)
+LOSSLESS_DIR = os.path.expanduser("~/.local/share/Steam/steamapps/common/Lossless Scaling")
+
+
+def _gamescope_state():
+    """(state, detail). READY / ABSENT / PARTIAL / UNKNOWN — never a silent pass."""
+    if not shutil.which("gamescope"):
+        return "ABSENT", "gamescope is not installed"
+    try:
+        r = subprocess.run(["gamescope", "--help"], capture_output=True, text=True, timeout=15)
+    except Exception as exc:
+        return "UNKNOWN", "gamescope --help failed (%s)" % exc
+    # ★ gamescope prints its ENTIRE help to STDERR, not stdout (measured: 0 lines on stdout,
+    # all of it on stderr). Reading stdout only reported "no fsr filter" about a build that has
+    # one — a confident answer about a stream that is empty by design.
+    out = (r.stdout + "\n" + r.stderr).lower()
+    if "fsr" in out:
+        return "READY", "gamescope present; FSR 1.0 upscaling available"
+    return "PARTIAL", "gamescope present but no fsr filter is listed in --help"
+
+
+def _lsfg_state():
+    """(state, detail) for lsfg-vk — checked against the surfaces that OWN the answer.
+
+    ★ NOT `lsfg-vk-cli validate`: that only validates its own config file, and it reports a clean
+    "valid" while the runtime cannot initialise at all. Measured 2026-10-10: with Lossless Scaling
+    installed on Steam's DEFAULT branch, the layer loads, finds Lossless.dll, and then dies with
+    "The specified shader DLL does not exist" — because the frame-gen shaders ship only on Steam's
+    "lsfg-vk" BETA BRANCH. The manifest is what distinguishes a working install from a broken one.
+    """
+    stood = sorted(glob.glob(LSFG_LAYER + ".disabled*"))
+    if stood and not os.path.exists(LSFG_LAYER):
+        return "STOOD-DOWN", ("installed but disabled at the loader; enable with: sudo mv %s %s"
+                              % (stood[-1], LSFG_LAYER))
+    if not os.path.exists(LSFG_LAYER):
+        return "ABSENT", "lsfg-vk is not installed"
+    if not os.path.exists(LOSSLESS_DIR):
+        return "NEEDS-GAME", "Lossless Scaling is not in the Steam library"
+    if not os.path.exists(os.path.join(LOSSLESS_DIR, "Lossless.dll")):
+        return "NEEDS-GAME", "no Lossless.dll in the Lossless Scaling install"
+    try:
+        man = open(STEAM_MANIFEST, encoding="utf-8", errors="replace").read()
+    except OSError:
+        man = ""
+    low = man.lower()
+    # ★ the manifest spells it "BetaKey"; a lowercase literal never matches. Compare folded.
+    if "betakey" not in low or '"lsfg-vk"' not in low:
+        return "NEEDS-BRANCH", ("Lossless Scaling is on Steam's DEFAULT branch; switch it to the "
+                                "\"lsfg-vk\" beta (Steam > Lossless Scaling > Properties > Betas). "
+                                "Without it the frame-gen shaders are absent and the layer fails "
+                                "with \"The specified shader DLL does not exist\"")
+    if not shutil.which("lsfg-vk-cli"):
+        return "PARTIAL", "layer present but lsfg-vk-cli is missing"
+    return "INSTALLED", "layer + the lsfg-vk branch are present (path not exercised until a game runs)"
+
+
+def _native_res(db):
+    """The preferred mode of a connected output on the monitor card, or None. Rootless sysfs read."""
+    main = _main_card(db)
+    best = None
+    for path in sorted(glob.glob("/sys/class/drm/%s-*/modes" % main["card"])):
+        try:
+            first = open(path).read().split("\n")[0].strip()
+        except OSError:
+            continue
+        m = re.match(r"^(\d+)x(\d+)$", first)
+        if not m:
+            continue
+        w, h = int(m.group(1)), int(m.group(2))
+        if w < 1024:
+            continue
+        if best is None or w * h > best[0] * best[1]:
+            best = (w, h)
+    return best
+
+
+def _render_res(native, factor):
+    """Render resolution for a scale factor, forced even (video encoders and FSR want even)."""
+    # ★ ROUND, do not truncate: 1440 * 0.7 is 1007.9999999999999 in binary float, and int()
+    # turned a clean 1008 into 1006. A resolution that is off by two looks like a typo, not a bug.
+    w = max(2, int(round(native[0] * factor))) // 2 * 2
+    h = max(2, int(round(native[1] * factor))) // 2 * 2
+    return w, h
+
+
+def _ensure_lsfg_profile(multiplier):
+    """Make sure a profile exists for this multiplier. Returns (profile_name, note). Never silent."""
+    name = "spirit %dx" % multiplier
+    try:
+        text = open(LSFG_CONF, encoding="utf-8").read()
+    except OSError:
+        return None, "no lsfg-vk config at %s — create a profile in lsfg-vk-ui first" % LSFG_CONF
+    if ('name = "%s"' % name) in text:
+        return name, "profile %r already present" % name
+    block = ('\n[[profile]]\nactive_in = []\nflow_scale = 1.0\nmultiplier = %d\nname = "%s"\n'
+             'override_present_mode = true\npacing_mode = "vsync"\nperformance_mode = false\n'
+             'preserve_swapchain_image_count = false\n' % (multiplier, name))
+    try:
+        shutil.copy2(LSFG_CONF, LSFG_CONF + ".bak-spirit")
+        with open(LSFG_CONF, "a", encoding="utf-8") as fh:
+            fh.write(block)
+    except OSError as exc:
+        return None, "could not write the profile (%s)" % exc
+    return name, "added profile %r (backup: %s.bak-spirit)" % (name, LSFG_CONF)
+
+
+def boost(db):
+    gs_state, gs_detail = _gamescope_state()
+    ls_state, ls_detail = _lsfg_state()
+    native = _native_res(db)
+
+    print("spirit boost — what extra frames this machine can give you, right now\n")
+    print("  UPSCALING — render below native and scale up. Fewer pixels rendered = real FPS.")
+    print("    gamescope : %-11s %s" % (gs_state, gs_detail))
+    if native:
+        print("    display   : %dx%d native, on the monitor card" % native)
+        for f in (0.9, 0.8, 0.7, 0.6):
+            rw, rh = _render_res(native, f)
+            print("      --scale %.1f  ->  render %dx%d  (%.0f%% of the pixels)"
+                  % (f, rw, rh, 100.0 * f * f))
+    else:
+        print("    display   : no connected output's preferred mode could be read")
+    print()
+    print("  FRAME GENERATION — interpolated frames. The big multiplier, and the one that needs")
+    print("  software we do not ship: lsfg-vk, which requires owning Lossless Scaling.")
+    print("    lsfg-vk   : %-11s %s" % (ls_state, ls_detail))
+    print()
+    if gs_state == "READY":
+        print("  ⇒ Upscaling is available NOW:   spirit play --scale 0.7 -- <your game>")
+    else:
+        print("  ⇒ Upscaling is not ready: %s" % gs_detail)
+    if ls_state == "INSTALLED":
+        print("  ⇒ Frame generation is available: spirit play --framegen 2 -- <your game>")
+    else:
+        print("  ⇒ Frame generation is not ready: %s" % ls_detail)
+    print("\n  ★ Neither one is a miracle, and this tool will not pretend otherwise. Upscaling adds")
+    print("    frames by rendering fewer pixels. Frame generation adds frames by inventing them,")
+    print("    and it can look wrong on fast motion — that is the technology, not this tool.")
+    return 0
+
+
 # ── play: the game path — the strongest card renders, every other card works the tail ──
 def _main_card(db):
     """The card that feeds the monitor MUST render (the monitor law). Fallback: the top scorer."""
@@ -558,12 +723,18 @@ def _start_encode(node):
         env={**os.environ, "LIBVA_DRIVER_NAME": "radeonsi"})
 
 
-def _spawn_hidden(cmd, env, main, db):
-    """Run the game pinned to the main card, with the OTHER cards' /dev/dri nodes hidden from it.
+def _hidden_argv(cmd, main, db):
+    """[build] the game argv with the OTHER cards' /dev/dri nodes hidden behind a mount namespace.
 
     Two walls, both measured on the dev box: the EXCLUSIVE device-select (a child then sees exactly
     one GPU) and a mount namespace that makes the other cards' nodes invisible. The pin alone is
     load-bearing — WITHOUT it a Vulkan game chose the docked card outright on our box (2026-10-09).
+
+    ★ KEEP THE NAMESPACE INSIDE ANY OUTER WRAPPER. `unshare -r` maps our uid to root, so the
+    ROOT-OWNED `/tmp/.X11-unix` presents as the overflow uid inside — and a nested gamescope then
+    dies at `xwayland/sockets.c:83 ... not owned by root or us`, followed by "Failed to create
+    Xwayland server". Measured 2026-10-10. gamescope goes OUTSIDE this function; only the game is
+    inside. Build here, call from the caller.
     """
     hide = []
     for g in db["gpus"]:
@@ -576,13 +747,18 @@ def _spawn_hidden(cmd, env, main, db):
         script = ('hide="$1"; shift; for n in $hide; do '
                   '[ -e "/dev/dri/$n" ] && mount --bind /dev/null "/dev/dri/$n" 2>/dev/null || true; '
                   'done; exec "$@"')
-        return subprocess.call(["unshare", "-rm", "sh", "-c", script, "sh", " ".join(hide)] + cmd, env=env)
-    return subprocess.call(cmd, env=env)
+        return ["unshare", "-rm", "sh", "-c", script, "sh", " ".join(hide)] + list(cmd)
+    return list(cmd)
 
 
-def play(db, cmd, do_offload=True):
+def _spawn_hidden(cmd, env, main, db):
+    return subprocess.call(_hidden_argv(cmd, main, db), env=env)
+
+
+def play(db, cmd, do_offload=True, scale=None, framegen=None):
     if not cmd:
-        print("usage: spirit play [--no-offload] -- <game command...>", file=sys.stderr)
+        print("usage: spirit play [--no-offload] [--scale F] [--framegen N] -- <game command...>",
+              file=sys.stderr)
         return 1
     main = _main_card(db)
     spares = [g for g in db["gpus"] if g["card"] != main["card"]]
@@ -601,6 +777,40 @@ def play(db, cmd, do_offload=True):
     print("\n  pin: MESA_VK_DEVICE_SELECT=%s   DRI_PRIME=%s" %
           (env["MESA_VK_DEVICE_SELECT"], env["DRI_PRIME"]))
 
+    # UPSCALING: wrap the game in gamescope and scale it up with FSR 1.0.
+    if scale:
+        gs_state, gs_detail = _gamescope_state()
+        native = _native_res(db)
+        if gs_state != "READY":
+            print("  scale: REFUSED — %s" % gs_detail)
+            return 1
+        if not native:
+            print("  scale: REFUSED — could not read the native mode of the monitor card's output")
+            return 1
+        rw, rh = _render_res(native, scale)
+        print("  scale: render %dx%d -> present %dx%d via gamescope FSR 1.0  (%.0f%% of the pixels)"
+              % (rw, rh, native[0], native[1], 100.0 * scale * scale))
+
+    # FRAME GENERATION: drive lsfg-vk if it is here. We never ship or modify it.
+    if framegen:
+        st, detail = _lsfg_state()
+        # ★ "READY" was renamed to "INSTALLED" when this check moved to the Steam manifest.
+        # A rename that misses one caller is exactly how a working feature reports itself broken.
+        if st != "INSTALLED":
+            print("  framegen: UNAVAILABLE — %s" % detail)
+            print("            (launching without it; spirit boost explains the state)")
+        else:
+            prof, note = _ensure_lsfg_profile(framegen)
+            if prof:
+                env["LSFGVK_PROFILE"] = prof
+                if scale:
+                    # ★ lsfg-vk's own troubleshooting: under gamescope with vsync pacing, set
+                    # ENABLE_GAMESCOPE_WSI=0 or frame generation does not engage at all.
+                    env["ENABLE_GAMESCOPE_WSI"] = "0"
+                print("  framegen: %dx via lsfg-vk, profile %r — %s" % (framegen, prof, note))
+            else:
+                print("  framegen: UNAVAILABLE — %s" % note)
+
     procs = []
     if do_offload and shutil.which("ffmpeg"):
         for g in spares:
@@ -612,8 +822,14 @@ def play(db, cmd, do_offload=True):
     print("\n  launching…\n")
     sys.stdout.flush()
 
+    inner = _hidden_argv(cmd, main, db)
+    if scale:
+        inner = (["gamescope", "-w", str(_native_res(db)[0]), "-h", str(_native_res(db)[1]),
+                  "-W", str(_render_res(_native_res(db), scale)[0]),
+                  "-H", str(_render_res(_native_res(db), scale)[1]),
+                  "-f", "-F", "fsr", "--fsr-sharpness", "2", "--"] + inner)
     try:
-        rc = _spawn_hidden(cmd, env, main, db)
+        rc = subprocess.call(inner, env=env)
     finally:
         for p in procs:
             p.terminate()
@@ -644,20 +860,40 @@ def main():
 
     # `play` also takes an arbitrary game command — parse by hand, same reason as `run`.
     if argv and argv[0] == "play":
-        offload, rest, i = True, [], 1
+        offload, rest, i, scale, framegen = True, [], 1, None, None
         while i < len(argv):
             if argv[i] == "--no-offload":
                 offload = False; i += 1
+            elif argv[i] == "--scale":
+                try:
+                    scale = float(argv[i + 1])
+                except (IndexError, ValueError):
+                    print("spirit play: --scale needs a number, e.g. --scale 0.7", file=sys.stderr)
+                    return 2
+                i += 2
+            elif argv[i] == "--framegen":
+                try:
+                    framegen = int(argv[i + 1])
+                except (IndexError, ValueError):
+                    print("spirit play: --framegen needs 2, 3 or 4", file=sys.stderr)
+                    return 2
+                i += 2
             elif argv[i] == "--":
                 rest = argv[i + 1:]; break
             else:
                 rest = argv[i:]; break
-        return play(probe(), rest, offload)
+        if scale is not None and not (0.3 <= scale <= 1.0):
+            print("spirit play: --scale must be between 0.3 and 1.0", file=sys.stderr)
+            return 2
+        if framegen is not None and framegen not in (2, 3, 4):
+            print("spirit play: --framegen must be 2, 3 or 4", file=sys.stderr)
+            return 2
+        return play(probe(), rest, offload, scale, framegen)
 
     ap = argparse.ArgumentParser(
         prog="spirit",
         description="Spiritual Successor — put every GPU to work\n"
-                    "commands: probe · roles · plan · doctor · fg · run · play  "
+                    "commands: probe · roles · plan · doctor · fg · boost · run · play  "
                     "(`run` and `play` take a command after `--`)",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd")
@@ -666,6 +902,7 @@ def main():
     pl = sub.add_parser("plan"); pl.add_argument("--workload", default="1440p60-framegen")
     pl.add_argument("--vram-mib", type=int, default=None, help="VRAM the workload needs on its card")
     sub.add_parser("doctor")
+    sub.add_parser("boost")
     f = sub.add_parser("fg")
     f.add_argument("--res", default="1440p60", help="resolution@refresh, e.g. 1440p60 / 4k120 / 1080p144")
     f.add_argument("--mode", default="present-on-secondary",
@@ -677,6 +914,8 @@ def main():
         return fg(db, a.res, a.mode)
     if a.cmd == "doctor":
         return doctor(db)
+    if a.cmd == "boost":
+        return boost(db)
     if a.cmd == "plan":
         return plan(db, a.workload, a.vram_mib)
     if a.cmd == "roles":
