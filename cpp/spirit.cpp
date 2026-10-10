@@ -1807,12 +1807,32 @@ static pid_t start_encode(const string &node) {
     return spawn_detached(argv, env);
 }
 
+// True if this is a Proton/Wine launch, where the mount-namespace wall MUST be skipped.
+// MEASURED 2026-10-10: `unshare -r` maps our uid to 0 inside, and Wine/Proton REFUSE TO RUN AS
+// ROOT — the launch dies with `bin_steam.sh: Error: Cannot run as root user` before the game ever
+// starts. Detect it and fall back to the pin alone, and SAY SO rather than silently weakening it.
+// NO ENV LOOKUP HERE. An earlier version also checked STEAM_COMPAT_DATA_PATH, which meant a stray
+// variable left in a shell silently disabled the wall for NATIVE games too. Decide on the ARGV.
+static bool is_wine_target(const vector<string> &cmd) {
+    for (const string &a : cmd) {
+        size_t sl = a.rfind('/');
+        string b = (sl == string::npos) ? a : a.substr(sl + 1);
+        for (char &c : b) c = (char)tolower((unsigned char)c);
+        if (b.size() >= 4 && b.compare(b.size() - 4, 4, ".exe") == 0) return true;
+        if (b.find("proton") != string::npos) return true;
+        if (b == "wine") return true;
+        if (b.compare(0, 4, "wine") == 0) return true;
+    }
+    return false;
+}
+
 // [build] the game argv with the OTHER cards' /dev/dri nodes hidden behind a mount namespace.
 // KEEP THE NAMESPACE INSIDE ANY OUTER WRAPPER: `unshare -r` maps our uid to root, so the
 // ROOT-OWNED /tmp/.X11-unix presents as the overflow uid inside — a nested gamescope then dies
 // at xwayland/sockets.c:83 "not owned by root or us". gamescope goes OUTSIDE this function; only
 // the game is inside. Build here, call from the caller.
 static vector<string> hidden_argv(const vector<string> &cmd, const J &main, const J &db) {
+    if (is_wine_target(cmd)) return cmd;
     vector<string> hide;
     const J *ga = gpus_arr(db);
     if (ga) for (auto &g : ga->arr) {
@@ -1833,9 +1853,9 @@ static vector<string> hidden_argv(const vector<string> &cmd, const J &main, cons
 }
 
 static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
-                    std::optional<double> scale, std::optional<int> framegen) {
+                    std::optional<double> scale, std::optional<int> framegen, bool overlay) {
     if (cmd_in.empty()) {
-        fprintf(stderr, "usage: spirit play [--no-offload] [--scale F] [--framegen N] -- <game command...>\n");
+        fprintf(stderr, "usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] -- <game command...>\n");
         return 1;
     }
     vector<string> cmd = cmd_in;
@@ -1902,9 +1922,10 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
             auto prof = ensure_lsfg_profile(*framegen);
             if (prof.first) {
                 set_env(env, "LSFGVK_PROFILE", *prof.first);
-                if (scale && *scale != 0.0) {
+                if ((scale && *scale != 0.0) || overlay) {
                     // ★ lsfg-vk's own troubleshooting: under gamescope with vsync pacing, set
-                    // ENABLE_GAMESCOPE_WSI=0 or frame generation does not engage at all.
+                    // ENABLE_GAMESCOPE_WSI=0 or frame generation does not engage at all. This applies
+                    // whenever gamescope is in play — including --overlay alone, with no upscaling.
                     set_env(env, "ENABLE_GAMESCOPE_WSI", "0");
                 }
                 printf("  framegen: %dx via lsfg-vk, profile %s — %s\n", *framegen,
@@ -1913,6 +1934,11 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                 printf("  framegen: UNAVAILABLE — %s\n", prof.second.c_str());
             }
         }
+    }
+
+    if (is_wine_target(cmd)) {
+        printf("  wall: Proton/Wine detected — skipping the mount namespace (Wine refuses to run as\n");
+        printf("        root, and `unshare -r` makes us root); the exclusive pin still applies.\n");
     }
 
     vector<pid_t> procs;
@@ -1934,15 +1960,37 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
     // Build the hidden game argv FIRST, then wrap it in gamescope — gamescope stays OUTSIDE the
     // mount namespace (see hidden_argv).
     vector<string> inner = hidden_argv(cmd, *main, db);
-    if (scale && *scale != 0.0) {
-        auto native = native_res(db);
-        auto r = render_res(*native, *scale);
-        vector<string> wrapped = {"gamescope", "-w", std::to_string(native->first), "-h",
-                                  std::to_string(native->second), "-W", std::to_string(r.first),
-                                  "-H", std::to_string(r.second), "-f", "-F", "fsr",
-                                  "--fsr-sharpness", "2", "--"};
-        for (auto &c : inner) wrapped.push_back(c);
-        inner = wrapped;
+    bool scale_on = scale && *scale != 0.0;
+    if (overlay && !scale_on) {
+        auto gs = gamescope_state();
+        if (gs.first != "READY" || !native_res(db)) {
+            printf("  overlay: REFUSED - gamescope not ready (%s)\n", gs.second.c_str());
+            return 1;
+        }
+    }
+    if (scale_on || overlay) {
+        auto nat = native_res(db);
+        std::pair<long long, long long> rr =
+            scale_on ? render_res(*nat, *scale) : *nat;
+        // -w/-h = the GAME's render size; -W/-H = the OUTPUT (were swapped: --scale was a no-op)
+        vector<string> gs = {"gamescope", "-w", std::to_string(rr.first), "-h",
+                             std::to_string(rr.second), "-W", std::to_string(nat->first),
+                             "-H", std::to_string(nat->second), "-f"};
+        if (scale_on) {
+            gs.push_back("-F"); gs.push_back("fsr");
+            gs.push_back("--fsr-sharpness"); gs.push_back("2");
+        }
+        if (overlay) {
+            // THE PRESENT-COUNTER. mangoapp runs INSIDE gamescope as a transparent overlay, so its
+            // FPS readout is the COMPOSITOR's present rate - the only number frame generation moves.
+            // The game's own counter reports frames IT rendered, which frame gen does not change.
+            gs.push_back("--mangoapp");
+            printf("  overlay: mangoapp inside gamescope - on-screen FPS is the COMPOSITOR's present rate\n");
+            fflush(stdout);   // same buffering reason as the Python
+        }
+        gs.push_back("--");
+        for (auto &c : inner) gs.push_back(c);
+        inner = gs;
     }
     int rc = spawn_wait(inner, env, false);
     for (pid_t p : procs) kill(p, SIGTERM);
@@ -2063,6 +2111,7 @@ int main(int argc, char **argv) {
     // `play` parsed by hand
     if (!args.empty() && args[0] == "play") {
         bool offload = true;
+        bool overlay = false;
         vector<string> rest;
         size_t i = 1;
         std::optional<double> scale;
@@ -2085,6 +2134,7 @@ int main(int argc, char **argv) {
                 }
                 framegen = (int)v; i += 2;
             }
+            else if (args[i] == "--overlay") { overlay = true; i += 1; }
             else if (args[i] == "--") { rest.assign(args.begin() + i + 1, args.end()); break; }
             else { rest.assign(args.begin() + i, args.end()); break; }
         }
@@ -2096,7 +2146,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "spirit play: --framegen must be 2, 3 or 4\n");
             return 2;
         }
-        return play_cmd(probe(), rest, offload, scale, framegen);
+        return play_cmd(probe(), rest, offload, scale, framegen, overlay);
     }
 
     if (args.empty()) { print_help(); return 1; }

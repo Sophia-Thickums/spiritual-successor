@@ -723,6 +723,26 @@ def _start_encode(node):
         env={**os.environ, "LIBVA_DRIVER_NAME": "radeonsi"})
 
 
+def _is_wine_target(cmd):
+    """True if this is a Proton/Wine launch, where the mount-namespace wall MUST be skipped.
+
+    ★ MEASURED 2026-10-10: `unshare -r` maps our uid to 0 inside, and Wine/Proton REFUSE TO RUN AS
+    ROOT — the launch dies with `bin_steam.sh: Error: Cannot run as root user` before the game ever
+    starts. So on any Proton title (i.e. most Windows games, which is most of the audience) our
+    second wall breaks the launch outright. Detect it and fall back to the pin alone, which is the
+    load-bearing half anyway, and SAY SO rather than silently weakening the wall.
+    """
+    # ★ NO ENV LOOKUP HERE. An earlier version also checked STEAM_COMPAT_DATA_PATH, which meant a
+    # stray variable left in a shell silently disabled the wall for NATIVE games too — the same
+    # ambient-state trap that let SPIRIT_DEVICES poison a whole session. Decide on the ARGV, which
+    # is what actually describes the launch.
+    for a in cmd:
+        b = os.path.basename(str(a)).lower()
+        if b.endswith(".exe") or "proton" in b or b == "wine" or b.startswith("wine"):
+            return True
+    return False
+
+
 def _hidden_argv(cmd, main, db):
     """[build] the game argv with the OTHER cards' /dev/dri nodes hidden behind a mount namespace.
 
@@ -736,6 +756,8 @@ def _hidden_argv(cmd, main, db):
     Xwayland server". Measured 2026-10-10. gamescope goes OUTSIDE this function; only the game is
     inside. Build here, call from the caller.
     """
+    if _is_wine_target(cmd):
+        return list(cmd)
     hide = []
     for g in db["gpus"]:
         if g["card"] == main["card"]:
@@ -755,9 +777,9 @@ def _spawn_hidden(cmd, env, main, db):
     return subprocess.call(_hidden_argv(cmd, main, db), env=env)
 
 
-def play(db, cmd, do_offload=True, scale=None, framegen=None):
+def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False):
     if not cmd:
-        print("usage: spirit play [--no-offload] [--scale F] [--framegen N] -- <game command...>",
+        print("usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] -- <game command...>",
               file=sys.stderr)
         return 1
     main = _main_card(db)
@@ -803,13 +825,18 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None):
             prof, note = _ensure_lsfg_profile(framegen)
             if prof:
                 env["LSFGVK_PROFILE"] = prof
-                if scale:
+                if scale or overlay:
                     # ★ lsfg-vk's own troubleshooting: under gamescope with vsync pacing, set
-                    # ENABLE_GAMESCOPE_WSI=0 or frame generation does not engage at all.
+                    # ENABLE_GAMESCOPE_WSI=0 or frame generation does not engage at all. This applies
+                    # whenever gamescope is in play — including --overlay alone, with no upscaling.
                     env["ENABLE_GAMESCOPE_WSI"] = "0"
                 print("  framegen: %dx via lsfg-vk, profile %r — %s" % (framegen, prof, note))
             else:
                 print("  framegen: UNAVAILABLE — %s" % note)
+
+    if _is_wine_target(cmd):
+        print("  wall: Proton/Wine detected — skipping the mount namespace (Wine refuses to run as")
+        print("        root, and `unshare -r` makes us root); the exclusive pin still applies.")
 
     procs = []
     if do_offload and shutil.which("ffmpeg"):
@@ -823,11 +850,30 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None):
     sys.stdout.flush()
 
     inner = _hidden_argv(cmd, main, db)
-    if scale:
-        inner = (["gamescope", "-w", str(_native_res(db)[0]), "-h", str(_native_res(db)[1]),
-                  "-W", str(_render_res(_native_res(db), scale)[0]),
-                  "-H", str(_render_res(_native_res(db), scale)[1]),
-                  "-f", "-F", "fsr", "--fsr-sharpness", "2", "--"] + inner)
+    if overlay and not scale:
+        gs_state, gs_detail = _gamescope_state()
+        if gs_state != "READY" or not _native_res(db):
+            print("  overlay: REFUSED - gamescope not ready (%s)" % gs_detail)
+            return 1
+    if scale or overlay:
+        nat = _native_res(db)
+        rw, rh = _render_res(nat, scale) if scale else nat
+        # ★ -w/-h = the GAME's render size; -W/-H = the OUTPUT. These were SWAPPED, which made
+        # --scale a silent no-op: the game rendered at native resolution and gamescope downscaled
+        # the picture instead of upscaling it. Measured 2026-10-10 via lsfg-vk's own debug line
+        # ("Building pipeline for 256Op x 144Op") while --scale 0.7 was supposedly active.
+        gs = ["gamescope", "-w", str(rw), "-h", str(rh),
+              "-W", str(nat[0]), "-H", str(nat[1]), "-f"]
+        if scale:
+            gs += ["-F", "fsr", "--fsr-sharpness", "2"]
+        if overlay:
+            # THE PRESENT-COUNTER. mangoapp runs INSIDE gamescope as a transparent overlay, so its
+            # FPS readout is the COMPOSITOR's present rate - the only number frame generation moves.
+            # The game's own counter reports frames IT rendered, which frame gen does not change.
+            gs += ["--mangoapp"]
+            print("  overlay: mangoapp inside gamescope - on-screen FPS is the COMPOSITOR's present rate")
+            sys.stdout.flush()   # ★ else it is block-buffered when redirected and lands AFTER the child's output
+        inner = gs + ["--"] + inner
     try:
         rc = subprocess.call(inner, env=env)
     finally:
@@ -860,7 +906,7 @@ def main():
 
     # `play` also takes an arbitrary game command — parse by hand, same reason as `run`.
     if argv and argv[0] == "play":
-        offload, rest, i, scale, framegen = True, [], 1, None, None
+        offload, rest, i, scale, framegen, overlay = True, [], 1, None, None, False
         while i < len(argv):
             if argv[i] == "--no-offload":
                 offload = False; i += 1
@@ -878,6 +924,8 @@ def main():
                     print("spirit play: --framegen needs 2, 3 or 4", file=sys.stderr)
                     return 2
                 i += 2
+            elif argv[i] == "--overlay":
+                overlay = True; i += 1
             elif argv[i] == "--":
                 rest = argv[i + 1:]; break
             else:
@@ -888,7 +936,7 @@ def main():
         if framegen is not None and framegen not in (2, 3, 4):
             print("spirit play: --framegen must be 2, 3 or 4", file=sys.stderr)
             return 2
-        return play(probe(), rest, offload, scale, framegen)
+        return play(probe(), rest, offload, scale, framegen, overlay)
 
     ap = argparse.ArgumentParser(
         prog="spirit",
