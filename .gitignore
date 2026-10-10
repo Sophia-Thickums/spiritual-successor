@@ -4,6 +4,7 @@ __pycache__/
 cpp/spirit
 cpp/build/
 rust/target/
+present-counter/*.so
 # local backups
 *.bak-*
 *.bak-spirit

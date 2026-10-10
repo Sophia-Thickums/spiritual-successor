@@ -25,7 +25,7 @@ Commands:
 
 Copyright 2026 Sophia Marie DeClue. MIT.
 """
-import os, sys, json, glob, re, shutil, subprocess, argparse
+import os, sys, json, glob, re, shutil, subprocess, argparse, tempfile, time
 
 SPEED_GBPS = {2.5: 0.25, 5.0: 0.50, 8.0: 1.00, 16.0: 1.97, 32.0: 4.00}   # GB/s per lane, theoretical
 GEN_NAME = {2.5: "Gen1", 5.0: "Gen2", 8.0: "Gen3", 16.0: "Gen4", 32.0: "Gen5"}
@@ -567,6 +567,36 @@ LSFG_APPID = "993090"
 STEAM_MANIFEST = os.path.expanduser("~/.local/share/Steam/steamapps/appmanifest_%s.acf" % LSFG_APPID)
 LOSSLESS_DIR = os.path.expanduser("~/.local/share/Steam/steamapps/common/Lossless Scaling")
 
+# ★ THE WITNESS — the only instrument that can see an INSERTED frame.
+# Our own Vulkan layer, installed system-wide, INERT unless SPIRIT_PRESENT_COUNT names a file.
+# It counts vkQueuePresentKHR calls from BELOW lsfg-vk in the layer chain, so it sees the images
+# frame generation added. Nothing else can: the game's own counter counts frames IT rendered
+# (measured: 23 with frame gen on, 23 with it off, identical, twice); an overlay sits above the
+# layer for the same reason; and the compositor's scan-out counter reports the display refresh,
+# which never changes. Source and rationale: present-counter/spirit_present_counter.c.
+COUNTER_LAYER = "/usr/share/vulkan/implicit_layer.d/VkLayer_SPIRIT_present_counter.json"
+COUNTER_LIB = "/usr/local/lib/libspirit_present_counter.so"
+
+
+def _counter_state():
+    """(state, detail) for the present counter. READY / PARTIAL / ABSENT — never a silent pass."""
+    if not os.path.exists(COUNTER_LAYER):
+        return "ABSENT", ("the present counter layer is not installed, so frame-gen output can only "
+                          "be ASSERTED, not measured")
+    if not os.path.exists(COUNTER_LIB):
+        return "PARTIAL", "manifest is present but %s is missing" % COUNTER_LIB
+    return "READY", "present counter installed — frame-gen output is measurable"
+
+
+def _read_counter(path):
+    """The counter file is a fixed-width decimal the layer rewrites on every present."""
+    try:
+        with open(path) as fh:
+            raw = fh.read().strip()
+        return int(raw) if raw else 0
+    except (OSError, ValueError):
+        return 0
+
 
 def _gamescope_state():
     """(state, detail). READY / ABSENT / PARTIAL / UNKNOWN — never a silent pass."""
@@ -690,6 +720,11 @@ def boost(db):
     print("  FRAME GENERATION — interpolated frames. The big multiplier, and the one that needs")
     print("  software we do not ship: lsfg-vk, which requires owning Lossless Scaling.")
     print("    lsfg-vk   : %-11s %s" % (ls_state, ls_detail))
+    c_state, c_detail = _counter_state()
+    print("    witness   : %-11s %s" % (c_state, c_detail))
+    print("                (our own present counter, below the frame-gen layer — the only")
+    print("                 instrument that can see an INSERTED frame; without it a frame-gen")
+    print("                 claim is an assertion, not a measurement)")
     print()
     if gs_state == "READY":
         print("  ⇒ Upscaling is available NOW:   spirit play --scale 0.7 -- <your game>")
@@ -834,6 +869,22 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False):
             else:
                 print("  framegen: UNAVAILABLE — %s" % note)
 
+    # ★ ARM THE WITNESS. Only meaningful with frame gen on; harmless otherwise, and we say so
+    # plainly if it is missing rather than reporting a frame-gen claim we could not measure.
+    fg_count_path = None
+    if framegen:
+        cst, cdet = _counter_state()
+        if cst == "READY":
+            fg_count_path = os.path.join(tempfile.gettempdir(), "spirit-presents-%d.txt" % os.getpid())
+            try:
+                os.unlink(fg_count_path)
+            except OSError:
+                pass
+            env["SPIRIT_PRESENT_COUNT"] = fg_count_path
+            print("  witness: counting images presented to the compositor (summary at exit)")
+        else:
+            print("  witness: UNAVAILABLE — %s" % cdet)
+
     if _is_wine_target(cmd):
         print("  wall: Proton/Wine detected — skipping the mount namespace (Wine refuses to run as")
         print("        root, and `unshare -r` makes us root); the exclusive pin still applies.")
@@ -867,19 +918,35 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False):
         if scale:
             gs += ["-F", "fsr", "--fsr-sharpness", "2"]
         if overlay:
-            # THE PRESENT-COUNTER. mangoapp runs INSIDE gamescope as a transparent overlay, so its
-            # FPS readout is the COMPOSITOR's present rate - the only number frame generation moves.
-            # The game's own counter reports frames IT rendered, which frame gen does not change.
+            # mangoapp inside gamescope — an on-screen FPS for the human to watch.
+            # ★ It is NOT a witness. mangoapp reads the compositor's SCAN-OUT, which is the display
+            # refresh and never changes when frame gen engages. The witness is the present counter
+            # armed below (SPIRIT_PRESENT_COUNT); do not quote mangoapp's figure as proof of frames.
             gs += ["--mangoapp"]
-            print("  overlay: mangoapp inside gamescope - on-screen FPS is the COMPOSITOR's present rate")
+            print("  overlay: mangoapp inside gamescope — for the eye, not the evidence")
             sys.stdout.flush()   # ★ else it is block-buffered when redirected and lands AFTER the child's output
         inner = gs + ["--"] + inner
+    t0 = time.time()
     try:
         rc = subprocess.call(inner, env=env)
     finally:
         for p in procs:
             p.terminate()
+    elapsed = max(time.time() - t0, 1e-6)
     print("\n  game exited (rc=%s) — offload stopped" % rc)
+
+    if fg_count_path:
+        n = _read_counter(fg_count_path)
+        print("\n  ── WITNESS ─────────────────────────────────────────────────────────")
+        print("  images presented to the compositor : %d" % n)
+        print("  wall time                          : %.1f s" % elapsed)
+        print("  presented rate                     : %.1f /s" % (n / elapsed))
+        print("  ★ This is the number frame generation moves, and the ONLY number it moves.")
+        print("    The game's own FPS counter cannot see it — that counts frames the GAME")
+        print("    rendered, which frame gen does not change. Expect the game's figure to be")
+        print("    LOWER with frame gen on: it is now paying for the interpolation.")
+        print("    Honest limit: an image handed to the compositor is not proof it was scanned")
+        print("    out, and no counter can tell you whether the interpolated frames look right.")
     return 0 if rc == 0 else rc
 
 

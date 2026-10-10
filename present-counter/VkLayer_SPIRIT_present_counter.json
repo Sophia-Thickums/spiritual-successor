@@ -1,0 +1,14 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_SPIRIT_present_counter",
+    "description": "Spiritual Successor frame-gen witness: counts images actually presented to the compositor. Inert unless SPIRIT_PRESENT_COUNT is set.",
+    "type": "GLOBAL",
+    "library_path": "/usr/local/lib/libspirit_present_counter.so",
+    "api_version": "1.3.290",
+    "implementation_version": "1",
+    "disable_environment": {
+      "SPIRIT_PRESENT_COUNTER_DISABLE": "1"
+    }
+  }
+}
