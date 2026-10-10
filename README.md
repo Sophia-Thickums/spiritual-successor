@@ -19,7 +19,10 @@ Linux. No root. No dependencies.
   does not do that.
 - **Lossless Scaling is not included, in any form.** We do not ship it and we do not copy it. If you
   happen to own it, this tool can drive it — see "More frames" below.
-- **It does not raise your frame rate.** Not yet. The spare cards do not add frames to your game.
+- **The spare cards do not add frames to your game.** Moving pixels across cards per frame is dead by
+  arithmetic — a 1440p frame is 14.7 MB and an `x1` card needs 17 ms to move one. What *can* raise your
+  presented frame rate is frame generation, if you own Lossless Scaling; the tool drives it and then
+  **measures** the result rather than claiming one. See "More frames" below.
 - **It does not turn a mid-range card into a 5090.** Nothing does.
 - **Not Nvidia.** This is Linux, and the pinning uses Mesa, so AMD and Intel work today. Nvidia's driver
   does not give us the same control.
@@ -92,6 +95,31 @@ wrong on fast movement; that is the technology, not this tool. If it looks off, 
 
 Combined: `spirit play --scale 0.7 --framegen 2 -- ./yourgame`
 
+### How you can tell it actually happened
+
+Frame generation inserts frames *below* your game, so your game's own FPS counter cannot see them — it
+counts the frames the game rendered, and that number goes **down**, because the game is now paying for
+the interpolation. An overlay cannot see them either: it sits above the frame-gen layer.
+
+So this tool carries its own witness. `present-counter/` is a small Vulkan layer (MIT, about 230 lines of
+C) that counts the images actually handed to the compositor, from *below* the frame-gen layer. Build it
+once with `present-counter/build.sh`. It is completely inert until `spirit play --framegen` arms it, and
+then a run ends like this:
+
+```
+  ── WITNESS ──────────────────────────────────────────
+  images presented to the compositor : 1200
+  wall time                          : 7.3 s
+  presented rate                     : 165.0 /s
+```
+
+On our test machine the same 300 frames of work produced **300** presented images with frame generation
+off, and **1200** with it on at 4x — a ratio of exactly 1.000 and exactly 4.000.
+
+**What that proves:** the frame-gen layer multiplied the presented rate, measured downstream of it, by a
+counter the game cannot influence. **What it does not prove:** that every image was then scanned out, or
+that the interpolated frames look right. No counter can tell you that last part. That one you look at.
+
 ## Questions from the group post
 
 **Do the cards have to match?** No. An RX 580 next to a Vega 7, a new card next to the one built into
@@ -114,7 +142,9 @@ nothing measurable in another. In a full open-world session the player reported 
 
 Everything here was measured on our own machine. Where we could not measure it, we say so.
 
-- **Your frame rate does not improve today.** The win is the work the spare cards do, not extra frames.
+- **The spare cards do not add frames.** The win there is the work they do alongside your game. Extra
+  *presented* frames come from upscaling and from frame generation — and the tool measures those instead
+  of asserting them.
 - **Frame generation is available — but it is not ours and we do not ship it.** It comes from `lsfg-vk`,
   which requires you to own Lossless Scaling. `spirit boost` tells you whether it is available on your
   machine. We do not bundle it, and we do not reimplement it.
