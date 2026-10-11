@@ -1,33 +1,45 @@
 # Spiritual Successor
 
-**Your game gets one card. Your other cards get a job.**
+**Your game gets one card. Your other cards get a job — when you give them one.**
 
-Your game runs on the card your monitor is plugged into. Every other card in the machine can be doing
-real work at the same time — encoding video, on its own chip:
+Your game runs on the card your monitor is plugged into. Your other cards can be doing real work at the
+same time — encoding video, on their own hardware encoders:
 
 ```
-spirit play --work lecture.mp4 -- ./yourgame
+spirit play --work video.mp4 --split -- ./yourgame
 ```
 
-That is a real job with a real file at the end of it. Measured on the test machine: **four mismatched
-cards — two of them from 2017 — each took a different real video file at once.** 318 seconds of source
-footage came back as four valid files in 18 seconds, every output checked on disk for size and duration.
+That cuts the video into pieces and encodes one piece on each card it will use. When the game exits, it
+checks on disk that the pieces add back up to the full length of the original.
 
-The per-second telemetry for that window ships as `evidence/multigpu_4card.jsonl`, and it is worth
-reading rather than this summary: across it the display card is **busy for much of the sample**, because
-it was one of the four doing a job. What is being demonstrated is that four cards can work at once, not
-that any of them sat idle.
+**By default it uses only cards on a wide host link.** A card behind a narrow slot or an external dock is
+named and left out unless you ask for it:
 
-Different makers, different ages, different speeds. Two cards, four cards, or the graphics built into
-your processor sitting next to a real card. That is the normal case, not a complication.
+```
+  job: NOT using renderD129 (Vega 10) — the host link is narrower than the card reports (x4)
+       Add --spare renderD129 to include it anyway.
+```
 
-Linux. No root. No packages to install — it is one Python file. It drives tools your machine may already
-have: ffmpeg for the jobs, gamescope for upscaling, `unshare` for the second wall. It says so when one is
-missing rather than failing quietly. The optional frame-gen witness is the only piece that wants root,
-and you do not have to install it.
+Verified on AMD cards only. Intel is written but has not been run. An Nvidia card can be the card your
+game runs on, but it cannot take the job.
 
-Three builds of the same tool: Python, C++, Rust. All three produce identical output — tested, not
-claimed.
+**Give no `--work` and your other cards stay idle.** No work is run on them. If you want to see them
+driven first, `spirit play --test-load 30 -- ./yourgame` starts a bounded test on each one and stops on
+its own. `spirit doctor` only tests the machine; it starts no load.
+
+Cards of different makers and ages sitting in one machine is the normal case. The tool reads what each
+card is — its driver, its link, whether it can encode at all — and gives it work it can take. It does not
+interrogate the card's encoder capabilities; that is honest scope, not a claim. What is *verified* so far is narrower than what is written: the
+encoder path has only ever been run on AMD hardware.
+
+Linux. No root. No packages to install — it is two Python files (`spirit.py` and the local page). It
+drives tools your machine may already have: ffmpeg for the jobs, gamescope for upscaling, `unshare` for
+the second wall, and `vulkaninfo` if you want `doctor` to be able to test device routing. It says so when
+one is missing rather than failing quietly, where it can. The optional frame-gen witness is the only piece that wants
+root, and you do not have to install it.
+
+Three builds of the same tool: Python, C++, Rust. All three are held to byte-identical output by two
+differential test suites that compare each against the reference, on a fake fleet and on the live box.
 
 ---
 
@@ -59,40 +71,41 @@ spirit play --work lecture.mp4 -- ./yourgame     # plus a real job on the others
 
 1. Finds the card your monitor is plugged into.
 2. Launches the game so that it can only see that card.
-3. Runs a job on every other card — a real transcode on that card's own encoder, written to a real file.
+3. Runs a job on your other cards — a real transcode on each card's own encoder, written to real files.
 
-Without `--work`, the other cards run a test load instead. That proves they can be driven. It produces
-nothing, and the tool says so rather than letting you assume otherwise.
+**Give no `--work` and nothing is run on them.** They are left alone, and the tool says so both before
+launching and when the game exits. A card the tool cannot drive is named rather than silently passed over.
 
 ## How you can see it happened
 
-When your game exits, the tool prints what each other card actually did. A divided job, three cards,
-300 seconds each:
+When your game exits, the tool prints what each card actually did. Run on the test machine with a
+12-second clip and two usable spare cards:
 
 ```
+  job: NOT using renderD130 (Vega 10 XTX) — x1 link at the host — too narrow to use unasked
+       Add --spare renderD130 to include it anyway.
   ── JOB OUTPUT ────────────────────────────────────────────────────────
-  renderD131     lecture.renderD131_part1.mp4  (286.0 MB, 300.0s)
-  renderD129     lecture.renderD129_part2.mp4  (279.0 MB, 300.0s)
-  renderD130     lecture.renderD130_part3.mp4  (279.0 MB, 300.0s)
+  renderD131     clip.renderD131_part1.mp4  (5.4 MB, 6.0s)
+  renderD129     clip.renderD129_part2.mp4  (5.4 MB, 6.0s)
   ── SPLIT CHECK ───────────────────────────────────────────────────────
-  slices written      : 3 of 3
-  slice durations sum : 900.0s
-  original duration   : 900.0s
+  slices written      : 2 of 2
+  slice durations sum : 12.0s
+  original duration   : 12.0s
   ⇒ COMPLETE — the pieces reconstruct the whole input (within 1%).
   ── THE TAIL — what the other cards did ───────────────────────────────
-  renderD131   Granite Ridge          REAL JOB  .../lecture.renderD131_part1.mp4
-  renderD129   Vega 10                REAL JOB  .../lecture.renderD129_part2.mp4
-  renderD130   Vega 10 XTX            REAL JOB  .../lecture.renderD130_part3.mp4
+  renderD131   Granite Ridge          REAL JOB  …/clip.renderD131_part1.mp4
+  renderD129   Vega 10                REAL JOB  …/clip.renderD129_part2.mp4
 ```
 
-(Card names are whatever `lspci` calls them, shortened — the two 2017 cards here print as `Vega 10` and
-`Vega 10 XTX`, not as their market names.)
+Every job output is checked on disk afterwards — it exists, it was written by *this* run, and under
+`--split` its duration is added up against the input to within a second or one percent, whichever is
+larger. A file that did not get written says `MISSING` and the split says `INCOMPLETE`. Nothing here
+takes a process's exit code for an answer. Without `--split` each card transcodes the whole input, so a
+shortened file will still report as present; the `--split` check is the one that proves the pieces
+reconstruct.
 
-Every job output is checked on disk afterwards — it exists, and under `--split` its duration is added
-up against the input to within a second or one percent, whichever is larger. A file that did not get
-written says `MISSING` and the split says `INCOMPLETE`. Nothing here takes a process's exit code for an
-answer. Without `--split` each card transcodes the whole input, so a shortened file will still report
-as present; the `--split` check is the one that proves the pieces reconstruct.
+(Card names are whatever `lspci` calls them, shortened — the 2017 cards here print as `Vega 10` and
+`Vega 10 XTX`, not as their market names.)
 
 A card the tool cannot drive is named rather than quietly left out, in this shape:
 
@@ -139,10 +152,10 @@ and a box to launch your game from. It listens on your own machine only.
 spirit doctor        test that it really works on your machine — run this first
 spirit --version     print the version and exit
 spirit probe         list your cards and how each one is actually wired (the GB/s column is an estimate)
-spirit roles         give every card a job — or say plainly why it cannot have one
-spirit play -- CMD   run a game, with your other cards working underneath
+spirit roles         describe what each card is and what it could take
+spirit play -- CMD   run a game on the right card; add --work FILE for a job on the others
 spirit boost         what extra frames this machine can give you, right now
-spirit ui            the same thing as a local page, if you would rather click than type
+spirit ui            a local page showing your cards and what is available here
 ```
 
 ## More frames — two things people mix up
@@ -189,21 +202,21 @@ actually happened. A wall of detail beats a one-line report.
 - **Links, not specs.** `lspci` and friends report the link between a GPU and the chip it sits behind,
   not the link to the CPU. A card on a dock or a chipset slot can read `x16` while its real host link is
   `x1`. `spirit probe` reports the **minimum negotiated width along the sysfs chain**, which is the
-  truth. The `GB/s` column beside it is an *estimate* — theoretical per-lane rate times width times a
+  minimum link *width* the chain will allow — capability, not the rate it has currently negotiated; the
+  negotiated one is shown separately when a card is sitting idle. The `GB/s` column beside it is an *estimate* — theoretical per-lane rate times width times a
   fixed efficiency — not a measurement; treat it as a ranking, not a speed. On the dev box `probe`
   prints: RX 9070 XT `x16 Gen5` 54.4, Instinct MI25 `x4 Gen3` 3.4, Vega FE `x1 Gen3` 0.85, integrated
-  `x16 Gen4` 26.8.
+  `x16 Gen4` 26.79.
 - **Never split the frame.** A 1440p frame is 14.7 MB; at 60 fps an `x1` card needs 17 ms to move one,
   which is more than the whole frame budget. Per-pixel, per-frame work across these links is dead by
   arithmetic. Cross the wire once per job, or at frame rate — never per pixel.
 - **The pin is load-bearing.** `MESA_VK_DEVICE_SELECT=<vid:did>!` — the trailing `!` is the exclusive
   flag. Without it the loader only *reorders* and a child still sees every GPU; with it, a child sees
   exactly one. Measured: an unpinned UE5 game rendered on the docked card while the main card sat at 0%.
-- **Two walls, and `doctor` tests one of them.** The exclusive pin, plus a mount namespace that hides
-  the other cards' `/dev/dri` nodes from the game. `spirit doctor` proves the **pin**, per card, on your
-  machine — it does **not** test the namespace. If your kernel or distribution denies unprivileged user
-  namespaces, that second wall is simply absent, and this build does not currently say so. Proton titles
-  skip the namespace entirely, because Wine refuses to run as root.
+- **Two walls.** The exclusive pin, plus a mount namespace that hides the other cards' `/dev/dri` nodes
+  from the game. `spirit doctor` reports both: it tests the pin per card, and it says plainly whether
+  unprivileged namespaces are available on your system. Where they are not, only the pin separates the
+  game from the other cards. Proton titles skip the namespace entirely, because Wine refuses to run as root.
 - **No 2-card or 4-card assumptions.** `spirit roles` placed 9 of 10 cards on a made-up 10-card machine;
   the tenth had nowhere to plug a monitor, and the tool said so.
 - **Intel is untested here.** The code selects Intel's VAAPI driver from the card's own kernel driver,

@@ -25,7 +25,18 @@ Commands:
 
 Copyright 2026 Sophia Marie DeClue. MIT.
 """
-import os, sys, json, glob, re, shutil, subprocess, argparse, tempfile, time
+import os, sys, json, glob, re, shutil, subprocess, argparse, tempfile, time, threading
+
+# ★ FORCE UTF-8 ON OUR OWN STREAMS (outside review). Python encodes `— ★ ─ … ⇒ └` with the LOCALE's
+# codec, so under a non-UTF-8 locale (e.g. LC_ALL=en_US.ISO-8859-1) every banner raises
+# UnicodeEncodeError while the C++ and Rust builds write raw UTF-8. Forcing UTF-8 here is what makes
+# the three builds produce the same bytes. reconfigure() is 3.7+; the guard keeps 3.8-compatibility
+# honest if a stream has no such method (e.g. a replaced stdout in a test harness).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 SPEED_GBPS = {2.5: 0.25, 5.0: 0.50, 8.0: 1.00, 16.0: 1.97, 32.0: 4.00}   # GB/s per lane, theoretical
 GEN_NAME = {2.5: "Gen1", 5.0: "Gen2", 8.0: "Gen3", 16.0: "Gen4", 32.0: "Gen5"}
@@ -63,6 +74,20 @@ def _speed(p):
         return float(v.split()[0])
     except (IndexError, ValueError):
         return None
+
+
+def _fmt_float(x):
+    """THE FLOAT-OUTPUT RULE for all three builds (outside review).
+
+    Shortest round-trip decimal, always with a `.0` on integral values: 54.4 -> "54.4", 1.0 -> "1.0".
+    Python's `repr(float)` already IS shortest round-trip and already prints `1.0`, so this is the
+    Python side of a rule the ports must reproduce by hand — Rust's `{}` would print `1` and C++'s
+    `%g` would print six significant digits. Every float this tool prints goes through here, so the
+    rule is explicit rather than an accident of one language's formatter.
+    """
+    if x is None:
+        return "None"
+    return repr(float(x))
 
 
 # ── the true host link: minimum negotiated width/speed along the sysfs chain ──────────
@@ -107,7 +132,8 @@ def _lspci_name(bdf):
     if not shutil.which("lspci"):
         return None
     try:
-        out = subprocess.run(["lspci", "-mm", "-s", bdf], capture_output=True, text=True, timeout=5).stdout
+        out = subprocess.run(["lspci", "-mm", "-s", bdf], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=5).stdout
         if '"' in out:
             parts = out.split('"')
             if len(parts) >= 8:
@@ -315,7 +341,8 @@ def print_roles(db, profile="game"):
     print("-" * 104)
     for r in db_roles:
         print("%-6s %-26s %-9s %-8s %s" % (
-            r["card"], r["name"][:26], r["link_gbps_max"] or "-",
+            r["card"], r["name"][:26],
+            _fmt_float(r["link_gbps_max"]) if r["link_gbps_max"] is not None else "-",
             ("%sM" % r["vram_total_mib"]) if r["vram_total_mib"] else "-",
             ", ".join(r["roles"])))
         for w in r["why"]:
@@ -351,8 +378,13 @@ def plan(db, workload, vram_mib=None):
     print("  payload: %.2f MB %s" % (S / 1e6, "per frame" if "res" in w else "per token"))
     print("  sustained one-way: %.2f GB/s\n" % (per_sec / 1e9))
     if vram_mib:
-        print("  VRAM asked: %d MiB (measured on this box: a light load costs ~800 MiB, a GPU-bound"
-              " 4K load ~8,200 MiB — ~10x)\n" % vram_mib)
+        # ★ THESE ARE FIGURES WE ACTUALLY MEASURED (fix 2026-10-11, final review). The previous line
+        # quoted ~800 MiB and ~8,200 MiB, and neither appears anywhere in this project's log — the 8,200
+        # in particular was quoted to a reader as if it were a measurement of theirs. What the log does
+        # have is below, each from a named run.
+        print("  VRAM asked: %d MiB — for scale, measured here: a 4K benchmark peaks at 1,514 MiB,"
+              % vram_mib)
+        print("  an 8K benchmark at 6,898 MiB, and a real open-world game at 10,692 MiB.\n")
     print("  %-8s %-11s %-10s %-9s %-8s %s" % ("card", "link GB/s", "capacity", "verdict", "VRAM", "arithmetic"))
     print("  " + "-" * 104)
     for g in db["gpus"]:
@@ -383,7 +415,7 @@ def plan(db, workload, vram_mib=None):
                 arith = "needs %d MiB VRAM; this card has %d MiB" % (vram_mib, vram)
             else:
                 vcol = "%dM ok" % vram
-        print("  %-8s %-11s %-10s %-9s %-8s %s" % (g["card"], B, "%.2f GB/s" % cap, verdict, vcol, arith))
+        print("  %-8s %-11s %-10s %-9s %-8s %s" % (g["card"], _fmt_float(B), "%.2f GB/s" % cap, verdict, vcol, arith))
     return 0
 
 
@@ -400,7 +432,7 @@ def run(db, role, card, cmd):
     env["MESA_VK_DEVICE_SELECT"] = "%s:%s!" % (g["vendor"][2:], g["device"][2:])
     if role == "compute":
         env["GGML_VK_VISIBLE_DEVICES"] = g["bdf"]
-    print("# routing role=%s to %s (%s, link %s GB/s)" % (role, g["card"], g["name"][:34], g["link"]["gbps_max"]))
+    print("# routing role=%s to %s (%s, link %s GB/s)" % (role, g["card"], g["name"][:34], _fmt_float(g["link"]["gbps_max"])))
     print("# env: DRI_PRIME=%s  MESA_VK_DEVICE_SELECT=%s" % (pci, env["MESA_VK_DEVICE_SELECT"]))
     if role == "encode" and g.get("render_node"):
         env["SPIRIT_VAAPI_DEVICE"] = "/dev/dri/%s" % g["render_node"]
@@ -433,102 +465,328 @@ def print_table(db):
         print("%-6s %-13s %-30s %-9s %-9s %-8s %-6s %s" % (
             g["card"], g["bdf"], g["name"][:30],
             ("x%s %s" % (L["max_width"], L["max_gen"])) if L["max_width"] else "-",
-            L["gbps_max"] or "-", vr, "yes" if g["has_output"] else "no", note))
+            (_fmt_float(L["gbps_max"]) if L["gbps_max"] is not None else "-"),
+            vr, "yes" if g["has_output"] else "no", note))
     print("\nPlanning law: a secondary may take work only if it crosses the link ONCE or at")
     print("FRAME rate toward the display. Per-frame PIXEL offload is dead on links < ~25 GB/s.")
 
 
 # ── doctor: verify THIS machine's readiness by testing the tool's own claims ──────────
-def _isolation_count(vid, did):
-    """How many GPUs a child process sees with the exclusive device-select applied. None = untestable."""
+def _pinned_isolation(vid, did):
+    """What a child sees with the exclusive device-select applied to ONE card.
+
+    Returns None if the child could not be run at all, else a dict:
+        {"rc": int, "count": int, "ids": [(vendor, device), ...]}
+
+    ★ THE ID LIST IS THE POINT (outside review). A count proves the pin CHANGED something, not that it
+    SELECTED the right card — two identical cards share a vendor:device id, so a correct pin to either
+    still counts 1. `vulkaninfo --summary` prints vendorID/deviceID per device, so the surviving device
+    can be matched to the vid:did that was pinned, which turns "changed something" into "selected that
+    model". The return code is kept separate too: a nonzero rc is a LOADER failure, not "sees more than
+    one device" (outside review), and a count of 0 gets its own verdict as well.
+    """
     if not shutil.which("vulkaninfo"):
         return None
     env = dict(os.environ)
     env["MESA_VK_DEVICE_SELECT"] = "%s:%s!" % (vid, did)
     try:
-        out = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, text=True,
-                             env=env, timeout=30).stdout
-        return out.count("deviceName")
+        r = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", env=env, timeout=30)
     except Exception:
+        return None
+    out = r.stdout or ""
+    vids = [int(x, 16) for x in re.findall(r"vendorID\s*=\s*(0x[0-9a-fA-F]+)", out)]
+    dids = [int(x, 16) for x in re.findall(r"deviceID\s*=\s*(0x[0-9a-fA-F]+)", out)]
+    return {"rc": r.returncode, "count": out.count("deviceName"), "ids": list(zip(vids, dids))}
+
+
+def _card_ids(g):
+    """(vendor, device) as ints from a probe record, or None if it cannot be parsed."""
+    try:
+        return (int(g["vendor"], 16), int(g["device"], 16))
+    except (TypeError, ValueError, KeyError):
         return None
 
 
+def _connector_names(card):
+    """The connector names belonging to one DRM card, e.g. ['DP-1', 'HDMI-A-1'].
+
+    ★ READ INDEPENDENTLY OF THE ROLE ENGINE. `doctor`'s display-card check has to be able to DISAGREE
+    with what the role engine decided, or it is a mirror rather than a check — so it reads sysfs itself
+    and never consults the engine's own answer.
+    """
+    names = []
+    for entry in glob.glob("/sys/class/drm/%s-*" % card):
+        base = os.path.basename(entry)
+        name = base[len(card) + 1:]
+        if name and _read(os.path.join(entry, "status")) is not None:
+            names.append(name)
+    return names
+
+
+def _enabled_connectors(card):
+    """Connector names on this card that have an ACTIVE CRTC (`enabled` == "enabled").
+
+    ★ `status` says what is PLUGGED IN; `enabled` says what is DRIVING a display. The old display-card
+    check read `status`, the same predicate the role engine used to pick the main card, so it could
+    never disagree (outside review). `enabled` can: a second card with an enabled output is a cross-GPU
+    present, which is the real risk.
+    """
+    out = []
+    for name in _connector_names(card):
+        if _read("/sys/class/drm/%s-%s/enabled" % (card, name)) == "enabled":
+            out.append(name)
+    return out
+
+
 def doctor(db, as_json=False):
-    """Run the tool's own claims against the live machine. PASS / FAIL / UNKNOWN, never a silent pass."""
+    """Run the tool's own claims against the live machine.
+
+    ★ FOUR VERDICTS, NOT THREE (redesigned 2026-10-11 from outside design review). The old rule was
+    "any non-PASS is suspicious", which made a working mixed-vendor machine report PROBLEMS FOUND: the
+    telemetry check read a sysfs file only one vendor exposes, and an integrated GPU has no such file to
+    read. The states are now defined by what the tool actually depends on:
+
+        PASS     observed directly, by something that could have come out the other way
+        FAIL     observed to be wrong, or something the tool relies on is broken
+        N/A      this check does not apply to this card by design, and nothing depends on it
+        UNKNOWN  the tool does depend on it, and doctor could not determine it
+
+    Any FAIL -> PROBLEMS FOUND (exit 1). No FAIL but a CORE UNKNOWN (the device pin, or the main
+    card's link) -> NOT VERIFIED (exit 3) — "WORKS" is a conclusion doctor did not reach, so it is never
+    printed over a core unknown. Only non-core UNKNOWNs left -> WORKS, NOT FULLY VERIFIED (exit 3).
+    Only PASS and N/A -> ALL CHECKS PASSED (exit 0), with the N/A count printed so nobody reads N/A as a
+    pass. A bare green verdict is never printed over an UNKNOWN.
+
+    ★ EXIT 3, NOT 2. argparse usage errors and the SPIRIT_DEVICES refusals both exit 2, so 2 could not
+    distinguish "not fully verified" from "you typed it wrong" (outside review).
+    """
     checks = []
+    gpus = db["gpus"]
+    main = _main_card(db)          # None when this machine has no GPUs at all (outside review)
 
-    # A. the probe reads a link for every card
-    miss = [g["card"] for g in db["gpus"] if g["link"]["gbps_max"] is None]
-    checks.append({"check": "probe-links", "verdict": "FAIL" if miss else "PASS",
-                   "detail": ("missing links: " + ",".join(miss)) if miss else "a host link for every card"})
-
-    # B. routing ISOLATES on every card (the claim that was once false)
-    if not shutil.which("vulkaninfo"):
-        checks.append({"check": "routing-isolation", "verdict": "UNKNOWN",
-                       "detail": "vulkaninfo not installed — cannot test"})
+    if not gpus:
+        # ★ NO CARDS IS NOT A CRASH (outside review). `_main_card` used to be `max([])`, which raised
+        # ValueError with a traceback before a single check ran — and `boost` crashed the same way.
+        # With nothing to test, the honest verdict is a FAIL: this tool needs a GPU and found none.
+        checks.append({"check": "gpus", "verdict": "FAIL", "core": True,
+                       "detail": "no GPUs were found on this machine — there is nothing to render on "
+                                 "and nothing to test"})
     else:
-        for g in db["gpus"]:
-            n = _isolation_count(g["vendor"][2:], g["device"][2:])
-            if n is None:
-                v, d = "UNKNOWN", "could not run a test child"
-            elif n == 1:
-                v, d = "PASS", "a child sees exactly 1 device"
+        # A. LINKS. The tool does not branch on vendor here — current_link_width/speed come from the PCI
+        #    core, so Intel and Nvidia discrete cards have them too. What lacks them is a device sitting
+        #    on the root bus with nothing upstream to describe. The MAIN card's link is CORE (1d.22):
+        #    the tool cannot vouch for the launch if it cannot even read the card it will render on.
+        for g in gpus:
+            link = g.get("link") or {}
+            core = (g["card"] == main["card"])
+            if link.get("gbps_max") is not None:
+                checks.append({"check": "link", "card": g["card"], "verdict": "PASS", "core": core,
+                               "detail": "x%s %s — the minimum negotiated width along the chain"
+                                         % (link.get("max_width"), link.get("max_gen"))})
+            elif g.get("integrated"):
+                checks.append({"check": "link", "card": g["card"], "verdict": "N/A", "core": core,
+                               "detail": "integrated; there is no card link to measure"})
             else:
-                v, d = "FAIL", "a child sees %d devices (expected 1)" % n
-            checks.append({"check": "routing-isolation", "card": g["card"], "verdict": v, "detail": d})
+                checks.append({"check": "link", "card": g["card"], "verdict": "UNKNOWN", "core": core,
+                               "detail": "no PCIe link attributes were readable along the chain"})
 
-    # C. telemetry is readable (the monitor depends on it)
-    n_ok = sum(1 for g in db["gpus"]
-               if _int("/sys/class/drm/%s/device/mem_info_vram_used" % g["card"]) is not None)
-    checks.append({"check": "telemetry", "verdict": "PASS" if n_ok == len(db["gpus"]) else "FAIL",
-                   "detail": "VRAM counters readable on %d/%d cards" % (n_ok, len(db["gpus"]))})
+        # B. ROUTING ISOLATION. This is the load-bearing pin, so the check is CORE and it MATCHES THE
+        #    PINNED ID (1a.10, 1b.18): a count alone proves the pin CHANGED something, not
+        #    that it selected the right card. A nonzero return code (a loader failure), a count of 0 (the
+        #    pin matched nothing) and a count above 1 (still sees more than one) are kept as SEPARATE
+        #    states — none of them is "sees more than one device" except the last.
+        if not shutil.which("vulkaninfo"):
+            checks.append({"check": "routing-isolation", "verdict": "UNKNOWN", "core": True,
+                           "detail": "vulkaninfo (vulkan-tools) is not installed — the device pin, "
+                                     "which the whole launch depends on, cannot be tested at all"})
+        else:
+            res = {g["card"]: _pinned_isolation(g["vendor"][2:], g["device"][2:]) for g in gpus}
+            untestable = [c for c in res if res[c] is None]
+            rcbad = [c for c in res if res[c] is not None and res[c]["rc"] != 0]
+            zero = [c for c in res if res[c] and res[c]["rc"] == 0 and res[c]["count"] == 0]
+            multi = [c for c in res if res[c] and res[c]["rc"] == 0 and res[c]["count"] > 1]
+            mism = []
+            for g in gpus:
+                v = res[g["card"]]
+                if v and v["rc"] == 0 and v["count"] == 1:
+                    want = _card_ids(g)
+                    if want is None or v["ids"] != [want]:
+                        mism.append(g["card"])
+            if untestable:
+                checks.append({"check": "routing-isolation", "verdict": "UNKNOWN", "core": True,
+                               "detail": "a test child could not be run for: " + ", ".join(untestable)})
+            elif rcbad:
+                checks.append({"check": "routing-isolation", "verdict": "UNKNOWN", "core": True,
+                               "detail": "vulkaninfo returned nonzero (a loader failure, not 'sees more "
+                                         "than one device') for: " + ", ".join(rcbad)})
+            elif zero:
+                checks.append({"check": "routing-isolation", "verdict": "FAIL", "core": True,
+                               "detail": "the pin matched nothing — a child saw 0 devices for: "
+                                         + ", ".join(zero)})
+            elif multi:
+                checks.append({"check": "routing-isolation", "verdict": "FAIL", "core": True,
+                               "detail": "a child still sees more than one device for: " + ", ".join(multi)})
+            elif mism:
+                checks.append({"check": "routing-isolation", "verdict": "FAIL", "core": True,
+                               "detail": "a child saw exactly 1 device, but it is not the card pinned for: "
+                                         + ", ".join(mism)})
+            elif len(gpus) == 1:
+                checks.append({"check": "routing-isolation", "verdict": "UNKNOWN", "core": True,
+                               "detail": "only one GPU is present, so a child sees 1 device with or "
+                                         "without the pin — the count cannot show the pin selected anything"})
+            else:
+                checks.append({"check": "routing-isolation", "verdict": "PASS", "core": True,
+                               "detail": "a child saw exactly 1 device AND its vendor:device id matches the "
+                                         "card pinned — per card. (A count alone would prove only that the pin "
+                                         "CHANGED something, not which card; the id match is what ties the "
+                                         "surviving device to the pinned one.)"})
 
-    # D. the role plan places at least one card, and says why for the rest
-    rp = assign_roles(db, "game")
-    placed = sum(1 for r in rp if r["roles"] != ["idle"])
-    unexplained = [r["card"] for r in rp if r["roles"] == ["idle"] and not r["why"]]
-    checks.append({"check": "role-plan", "verdict": "PASS" if placed and not unexplained else "FAIL",
-                   "detail": "places %d/%d cards%s" % (placed, len(rp),
-                             ("" if not unexplained else "; unexplained idle: " + ",".join(unexplained)))})
+        # B2. IDENTICAL CARDS. Not a gap in doctor — a design defect worth failing loudly, because the pin
+        #     genuinely cannot separate them and the user would never guess.
+        seen = {}
+        for g in gpus:
+            seen.setdefault((g["vendor"], g["device"]), []).append(g["card"])
+        dupes = {k: v for k, v in seen.items() if len(v) > 1}
+        if dupes:
+            first = next(iter(dupes.items()))
+            checks.append({"check": "individual-pin", "verdict": "FAIL",
+                           "detail": "%s share %s:%s — the pin selects the model, not the card, so it cannot "
+                                     "tell them apart" % (", ".join(first[1]), first[0][0][2:], first[0][1][2:])})
+        else:
+            checks.append({"check": "individual-pin", "verdict": "PASS",
+                           "detail": "every card has its own vendor:device id, so a pin can name one"})
 
-    # E. UPSCALING — the path the tool advertises actually exists on this machine.
-    gs_state, gs_detail = _gamescope_state()
-    checks.append({"check": "upscaling",
-                   "verdict": "PASS" if gs_state == "READY" else "UNKNOWN",
-                   "detail": "%s — %s" % (gs_state, gs_detail)})
+        # C. TELEMETRY. ★ NOTHING IN THIS TOOL READS A CARD'S LIVE LOAD (blocking item 4).
+        #    `mem_info_vram_used` feeds only `vram_used_mib` in `probe --json`; THE TAIL, `play` and
+        #    `roles` never read it. By the four verdicts' own definition that makes it N/A for EVERY kind
+        #    of card — a check on a dependency that does not exist, which also produced a spurious FAIL on
+        #    a readable-but-different vendor. Kept as N/A, per card, so it is printed and counted and
+        #    nobody reads its absence as a pass.
+        for g in gpus:
+            checks.append({"check": "telemetry", "card": g["card"], "verdict": "N/A",
+                           "detail": "this tool reads a card's TOTAL VRAM (probe) but never its live load, "
+                                     "so no memory counter is required here"})
 
-    # F. FRAME GENERATION — reported honestly; UNKNOWN is never green, and absent is not a failure
-    #    of THIS machine (it needs software the user must own). Only a broken install is a FAIL.
-    #
-    # ★ THE VERDICT MUST BE DERIVED FROM THE STATES THIS FUNCTION ACTUALLY RETURNS (fix 2026-10-11,
-    # outside review). This mapped only "READY" and "NOT-WORKING" — and _lsfg_state() returns NEITHER,
-    # so the check printed UNKNOWN on every machine that ever ran it, including a working one. A check
-    # that can never reach a verdict is not a cautious check; it is a dead one wearing one's clothes.
-    ls_state, ls_detail = _lsfg_state()
-    ls_verdict = {
-        "INSTALLED": "PASS",        # layer present AND the shaders are actually there
-        "NEEDS-BRANCH": "FAIL",     # installed but the shaders are absent — it will die at startup
-        "PARTIAL": "FAIL",          # layer present without its helper
-        "STANDS-DOWN": "UNKNOWN",   # installed but disabled at the loader; not this machine's fault
-        "ABSENT": "UNKNOWN",        # not installed — it requires software we do not ship
-        "NEEDS-GAME": "UNKNOWN",    # the game that carries the shaders is not in the library
-    }.get(ls_state, "UNKNOWN")
-    checks.append({"check": "frame-generation", "verdict": ls_verdict,
-                   "detail": "%s — %s" % (ls_state, ls_detail)})
+        # D. DISPLAY CARD. ★ READS `enabled`, NOT `status` (blocking item 1). `status` is
+        #    what is PLUGGED IN — the very predicate the role engine uses to choose the main card, so the
+        #    old check could only PASS or N/A. `enabled` is what is DRIVING a display, so this check can
+        #    genuinely disagree: a second card with an enabled output is a cross-GPU present, the real
+        #    risk. Read independently of the engine, as before.
+        enabled_cards = {g["card"]: _enabled_connectors(g["card"]) for g in gpus}
+        enabled_cards = {c: v for c, v in enabled_cards.items() if v}
+        if not enabled_cards:
+            checks.append({"check": "display-card", "verdict": "N/A",
+                           "detail": "no connector has an active CRTC — no display is being driven"})
+        elif main["card"] not in enabled_cards:
+            checks.append({"check": "display-card", "verdict": "FAIL",
+                           "detail": "rendering was assigned to %s, but %s is driving a display"
+                                     % (main["card"], ", ".join(sorted(enabled_cards)))})
+        elif len(enabled_cards) > 1:
+            others = ", ".join(sorted(c for c in enabled_cards if c != main["card"]))
+            checks.append({"check": "display-card", "verdict": "FAIL",
+                           "detail": "more than one card is driving a display (%s): the game window can "
+                                     "land on %s's monitor, a cross-GPU present"
+                                     % (", ".join(sorted(enabled_cards)), others)})
+        else:
+            checks.append({"check": "display-card", "verdict": "PASS",
+                           "detail": "the card picked to render (%s) is the one driving a display"
+                                     % main["card"]})
 
-    bad = any(c["verdict"] == "FAIL" for c in checks)
-    overall = "READY" if not bad else "PROBLEMS FOUND"
+        # E. THE SECOND WALL. The README used to confess that doctor did not test it. Now doctor says what
+        #    it found, which is the least it can do.
+        wall = None
+        if shutil.which("unshare"):
+            try:
+                wall = subprocess.run(["unshare", "-Urm", "true"], capture_output=True, timeout=10).returncode == 0
+            except Exception:
+                wall = None
+        if wall is True:
+            checks.append({"check": "namespace-wall", "verdict": "PASS",
+                           "detail": "unprivileged user namespaces are available; the game can be separated "
+                                     "from the other cards' device nodes"})
+        elif wall is False:
+            checks.append({"check": "namespace-wall", "verdict": "UNKNOWN",
+                           "detail": "unprivileged user namespaces are NOT available here, so only the pin "
+                                     "separates the game from the other cards"})
+        else:
+            checks.append({"check": "namespace-wall", "verdict": "UNKNOWN",
+                           "detail": "unshare is not installed, so only the pin separates the game from the "
+                                     "other cards"})
+
+        # F. UPSCALING — the tool advertises a path that needs OPTIONAL software. ABSENT (and present but
+        #    without FSR) is DETERMINED, and nothing depends on it unless the user asks for --scale, so it
+        #    belongs in N/A, not UNKNOWN (blocking item 3). A machine without gamescope must
+        #    not sit in "not fully verified" forever for a feature it never asked for.
+        gs_state, gs_detail = _gamescope_state()
+        gs_verdict = {"READY": "PASS", "ABSENT": "N/A", "PARTIAL": "N/A"}.get(gs_state, "UNKNOWN")
+        checks.append({"check": "upscaling", "verdict": gs_verdict,
+                       "detail": "%s — %s" % (gs_state, gs_detail)})
+
+        # G. FRAME GENERATION — same rule (blocking item 3): ABSENT / disabled / game-not-in-library are
+        #    DETERMINED and optional, so N/A. Only a broken install (the shaders absent) is a FAIL. And
+        #    PARTIAL now AGREES with `play` (blocking item 5, ): the missing piece is
+        #    `lsfg-vk-cli`, which this tool never calls — it sets LSFGVK_PROFILE and lets the layer read
+        #    it — so `play --framegen` accepts PARTIAL and doctor reports it PASS, not UNKNOWN.
+        ls_state, ls_detail = _lsfg_state()
+        ls_verdict = {
+            "INSTALLED": "PASS",        # layer present AND the shaders are actually there
+            "PARTIAL": "PASS",          # layer + shaders present; only the unused lsfg-vk-cli is absent
+            "NEEDS-BRANCH": "FAIL",     # installed but the shaders are absent — it will die at startup
+            "STOOD-DOWN": "N/A",        # DETERMINED: disabled at the loader; optional software
+            "ABSENT": "N/A",            # DETERMINED: not installed; optional software we do not ship
+            "NEEDS-GAME": "N/A",        # DETERMINED: the game that carries the shaders is not in the library
+        }.get(ls_state, "UNKNOWN")
+        checks.append({"check": "frame-generation", "verdict": ls_verdict,
+                       "detail": "%s — %s" % (ls_state, ls_detail)})
+
+    # ── the verdict rules, stated once ──────────────────────────────────────────────────────────────
+    fails = [c for c in checks if c["verdict"] == "FAIL"]
+    unknowns = [c for c in checks if c["verdict"] == "UNKNOWN"]
+    core_unknowns = [c for c in unknowns if c.get("core")]
+    nas = [c for c in checks if c["verdict"] == "N/A"]
+    if fails:
+        overall = "PROBLEMS FOUND"
+        code = 1
+    elif core_unknowns:
+        # ★ A CORE CHECK THAT IS UNKNOWN IS NOT "WORKS" (blocking item 8). With no
+        #    vulkaninfo the pin is untested, and "WORKS" would be a conclusion doctor never reached.
+        #    ★ EXIT 3, NOT 2 (blocking item 6): argparse usage errors and the SPIRIT_DEVICES
+        #    refusals already exit 2, so a script could not tell "not fully verified" from "you typed it
+        #    wrong". 3 is distinct from both.
+        overall = "NOT VERIFIED — a core check could not be determined (%d)" % len(core_unknowns)
+        code = 3
+    elif unknowns:
+        overall = "WORKS, NOT FULLY VERIFIED (%d item%s)" % (len(unknowns), "" if len(unknowns) == 1 else "s")
+        code = 3
+    else:
+        overall = "ALL CHECKS PASSED"
+        code = 0
 
     if as_json:
-        print(json.dumps({"spirit": "doctor/1.0.0", "overall": overall, "checks": checks}, indent=2))
-        return 1 if bad else 0
+        print(json.dumps({"spirit": "doctor/1.0.0", "overall": overall,
+                          "fails": len(fails), "unknown": len(unknowns), "core_unknown": len(core_unknowns),
+                          "not_applicable": len(nas), "checks": checks}, indent=2))
+        return code
 
     print("spirit doctor — verifying this machine's multi-GPU readiness\n")
     for c in checks:
         card = ("%-6s " % c["card"]) if c.get("card") else ""
         print("  [%-7s] %s%s" % (c["verdict"], card, c["detail"]))
-    print("\n  OVERALL: %s%s" % (overall, "" if not bad else " — see FAIL lines above"))
-    return 1 if bad else 0
+    print("\n  OVERALL: %s" % overall)
+    if nas:
+        print("  (%d check%s did not apply here and %s not counted as passes.)"
+              % (len(nas), "" if len(nas) == 1 else "s", "was" if len(nas) == 1 else "were"))
+    if unknowns:
+        print("  An item above could not be determined. That is not a failure, and it is not a pass —")
+        print("  it means the tool cannot vouch for that part on this machine.")
+        if core_unknowns:
+            print("  ★ %d of them %s CORE (the device pin, or the main card's link): without those, this" %
+                  (len(core_unknowns), "is" if len(core_unknowns) == 1 else "are"))
+            print("    build does not claim the launch works — hence NOT VERIFIED above, not WORKS.")
+    if fails:
+        print("  See the FAIL lines above.")
+    return code
 
 
 # ── fg: can THIS card actually carry frame-gen / upscale for a game? ────────────────────
@@ -562,14 +820,22 @@ def fg(db, res="1440p60", mode="present-on-secondary"):
 
     print("spirit fg — can a card carry the frame-gen/upscale pass for %s@%d?\n" % (res, hz))
     print("  frame payload: %.2f MiB    frame budget: %.2f ms\n" % (payload, budget))
-    print("  %-8s %-12s %-14s %-12s %s" % ("card", "handoff", "one-way ms", "round-trip ms", "verdict"))
+    print("  %-8s %-12s %-14s %-12s %s" % ("card", "link bound", "one-way ms", "round-trip ms", "verdict"))
     print("  " + "-" * 84)
     for g in db["gpus"]:
         c = g["card"]
-        rate = HANDOFF_GBPS.get(c)
-        if rate is None:
-            print("  %-8s %-12s %-14s %-12s %s" % (c, "n/a", "-", "-", "not a card pair here / not measured"))
+        # ★ THIS TOOL CANNOT KNOW YOUR MACHINE'S HANDOFF RATE (fix 2026-10-11, found by the final
+        # outside read). This table used to be keyed by card NAME — card0/card2/card3 — and those names
+        # are not portable: a stranger's card0 inherited the MI25's measured rate and was handed a
+        # FEASIBLE/INFEASIBLE verdict about hardware we have never seen. The rate is a property of the
+        # LINK and the driver, so what is computed here is an UPPER BOUND from the card's OWN measured
+        # host link — and the gap between that bound and reality is stated below, not hidden.
+        link = (g.get("link") or {}).get("gbps_max")
+        if not link:
+            print("  %-8s %-12s %-14s %-12s %s" % (c, "n/a", "-", "-",
+                                                    "no host link could be read for this card"))
             continue
+        rate = float(link)
         ow = payload / 1024.0 / rate * 1000.0
         rt = ow * 2
         if one_way:
@@ -580,12 +846,14 @@ def fg(db, res="1440p60", mode="present-on-secondary"):
             ok = rt <= budget
             verdict = "FEASIBLE round-trip" if ok else "INFEASIBLE round-trip"
             arith = "%.1f ms vs %.1f ms budget" % (rt, budget)
-        print("  %-8s %-12s %-14.2f %-12.2f %s (%s)" % (c, "%.2f GB/s" % rate, ow, rt, verdict, arith))
+        print("  %-8s %-12s %-14.2f %-12.2f %s (%s)" % (c, "<=%.2f GB/s" % rate, ow, rt, verdict, arith))
     print("\n  ★ ARCHITECTURE RULE, from measurement: put the DISPLAY on the card doing the frame-gen, so a")
     print("    frame crosses ONE WAY. A round trip doubles the cost and is the first thing to fail.")
-    print("  ★ The handoff table above is MEASURED ON THE DEV BOX and is a property of its links — on any")
-    print("    other machine re-measure it before trusting a verdict. RADV lands the import in a")
-    print("    HOST-VISIBLE aperture heap, so these are aperture rates, not peer-VRAM rates.")
+    print("  ★ THE VERDICT ABOVE IS AN UPPER BOUND, NOT A MEASUREMENT. It assumes a frame crosses at the")
+    print("    link's own rate. It does not: on the dev box the real handoff ran at roughly a tenth to a")
+    print("    third of the link rate, because RADV lands the import in a HOST-VISIBLE aperture heap. So a")
+    print("    card marked INFEASIBLE is definitely out, and a card marked FEASIBLE may still be out —")
+    print("    measure it on your own machine before trusting the last column.")
     return 0
 
 
@@ -639,7 +907,8 @@ def _gamescope_state():
     if not shutil.which("gamescope"):
         return "ABSENT", "gamescope is not installed"
     try:
-        r = subprocess.run(["gamescope", "--help"], capture_output=True, text=True, timeout=15)
+        r = subprocess.run(["gamescope", "--help"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=15)
     except Exception as exc:
         return "UNKNOWN", "gamescope --help failed (%s)" % exc
     # ★ gamescope prints its ENTIRE help to STDERR, not stdout (measured: 0 lines on stdout,
@@ -689,6 +958,8 @@ def _lsfg_state():
 def _native_res(db):
     """The preferred mode of a connected output on the monitor card, or None. Rootless sysfs read."""
     main = _main_card(db)
+    if not main:
+        return None
     best = None
     for path in sorted(glob.glob("/sys/class/drm/%s-*/modes" % main["card"])):
         try:
@@ -746,6 +1017,12 @@ def _ensure_lsfg_profile(multiplier):
 
 
 def boost(db):
+    # ★ NO CARDS IS NOT A CRASH (blocking item 7). `_native_res` -> `_main_card` used to
+    # reach `max([])` here and raise ValueError with a traceback. A machine with no GPU has nothing to
+    # boost, and it is told so.
+    if not (db.get("gpus") or []):
+        print("spirit boost — no GPUs were found on this machine, so there is nothing to boost.")
+        return 1
     gs_state, gs_detail = _gamescope_state()
     ls_state, ls_detail = _lsfg_state()
     native = _native_res(db)
@@ -797,9 +1074,17 @@ def _gpu_name(g):
 
 
 def _main_card(db):
-    """The card that feeds the monitor MUST render (the monitor law). Fallback: the top scorer."""
-    panel = [g for g in db["gpus"] if g.get("has_output")]
-    return max(panel or db["gpus"], key=score)
+    """The card that feeds the monitor MUST render (the monitor law). Fallback: the top scorer.
+
+    ★ RETURNS None ON A MACHINE WITH NO GPUs (blocking item 7). It used to be `max([])`,
+    which raised ValueError with a traceback in both `doctor` and `boost`. Every caller must handle
+    None — a machine with no cards is a real (if rare) shape, not a crash.
+    """
+    gpus = db.get("gpus") or []
+    if not gpus:
+        return None
+    panel = [g for g in gpus if g.get("has_output")]
+    return max(panel or gpus, key=score)
 
 
 # ★ THE ENCODER DRIVER IS NOT ALWAYS radeonsi (fix 2026-10-11, found by the outside review).
@@ -824,20 +1109,43 @@ def _va_driver(g):
     return None, ("no VAAPI encoder this tool knows of (kernel driver: %s)" % (d or "unknown"))
 
 
-def _start_test_load(node, va):
+def _marginal(g):
+    """Why this card's link is marginal, or None if it is fine.
+
+    ★ A REAL JOB DOES NOT REACH A MARGINAL CARD UNLESS THE USER NAMES IT (from outside design review,
+    2026-10-11). The incident this rule exists for is specific and already in the log: a benchmark that
+    enumerated every display device reached a card sitting on an external dock, the card latched its own
+    thermal alarm, and the machine went down. A user typing `spirit play --work film.mp4 -- game` did not
+    ask for that. A card on a narrow link is usable — it is just not a default we assume on their behalf.
+    `--spare <node>` includes it, and this is SAID, not done quietly.
+
+    ★ `capped_by_topology` IS NOT A PROXY FOR "BEHIND AN EXTERNAL BRIDGE" (blocking item 12).
+    It fires whenever the card's OWN bridge reports wider than the host gives — which is the NORMAL case
+    for every modern AMD card, because Vega, Navi and RDNA all contain an internal PCIe switch. An x8 or
+    x4 slot then read as "marginal" and was excluded by default, which is most of the "old card in a
+    drawer" audience this tool addresses: on the dev box it cut `spirit play --work film.mp4 --split --
+    game` down to ONE encoder (the integrated card) instead of the sample. A wide-but-capped card is not
+    the dock shape. A genuinely NARROW link (below x4) is, and that is the only rule left here.
+    """
+    link = g.get("link") or {}
+    w = link.get("max_width")
+    if w is not None and w < 4:
+        return "x%s link at the host — too narrow to use unasked" % w
+    return None
+
+
+def _start_test_load(node, va, cap=60):
     """A SYNTHETIC load on a spare card: ffmpeg's OWN generated test pattern, piped to /dev/null.
 
-    ★ WHY THIS IS NAMED A LOAD AND NOT A JOB (2026-10-10 — the owner asked whether we were offloading real jobs
-    onto the other GPUs?", and the honest answer was no). This function used to be called
-    `_start_encode`, and the README said the spare cards "get a job" and "do real work". The encoder
-    silicon genuinely runs — that is why the busy counters move — but the input is `testsrc2`, a test
-    card ffmpeg synthesises, and the output goes to `-f null`. Nothing anyone cares about is faster
-    or finished because of it. **A load proves a card can be DRIVEN. A job produces something.**
-    `--work FILE` is the job. Never describe this as one, in code, in output, or in the README.
+    ★ BOUNDED IN TIME, PACED TO REAL TIME (fix 2026-10-11, from the final outside read). The old load
+    ran until the game exited — an uninvited, unbounded workload on every spare card, which is the shape
+    of the incident where a card on an external dock latched its thermal alarm and took the machine down.
+    It now runs for `cap` seconds of REAL time and stops: `-re` paces the generated input to native frame
+    rate (without it ffmpeg would encode the whole clip in a few seconds and exit), and `-t` bounds it.
     """
     return subprocess.Popen(
         ["ffmpeg", "-hide_banner", "-loglevel", "error",
-         "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=60",
+         "-re", "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=60", "-t", str(int(cap)),
          "-vaapi_device", "/dev/dri/%s" % node,
          "-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-f", "null", "-"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -850,7 +1158,8 @@ def _media_duration(src):
     try:
         out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
                               "-of", "default=nw=1:nk=1", src],
-                             capture_output=True, text=True, timeout=30).stdout.strip()
+                             capture_output=True, text=True, encoding="utf-8", errors="replace",
+                             timeout=30).stdout.strip()
         return float(out)
     except (ValueError, OSError, subprocess.SubprocessError):
         return None
@@ -862,7 +1171,10 @@ def _start_work(node, src, outdir, seg=None, va="radeonsi"):
     The honest version of the offload. The input is a file that exists, the output is a file the user
     can open, and the card doing the work is NOT the card their game is on. This is the shape the
     e-waste mission actually needs: an old, mismatched, lesser card doing useful work while you play,
-    at no cost to the game.
+    ★ WHAT IT COSTS THE GAME, STATED PLAINLY: this repository's own measurements found a real job on the
+    spare cards costs the game a few percent in one title and nothing measurable in another — each of
+    those comparisons was only two runs per side, so the honest reading is "small or none", not a
+    percentage. Do not promise a free ride; measure it on the machine in front of you.
 
     ★ `seg=(start, dur, index)` SPLITS one job across cards. Without it every card transcodes the same
     whole file — which is REPLICATION, a different claim, and the one that was already true. Splitting
@@ -874,6 +1186,16 @@ def _start_work(node, src, outdir, seg=None, va="radeonsi"):
     stem = os.path.splitext(os.path.basename(src))[0] or "job"
     tag = os.path.basename(node) + ("" if not seg else "_part%d" % (seg[2] + 1))
     out = os.path.join(outdir, "%s.%s.mp4" % (stem, tag))
+    # ★ DELETE THE TARGET BEFORE STARTING (blocking item 11). `ffmpeg -y` plus "nothing
+    # takes a process's exit code for an answer" means: if ffmpeg dies before it opens its output (a
+    # VAAPI init failure, say), the file from a PREVIOUS identical run is still on disk — and it was
+    # then reported as a REAL JOB with the old size and duration, and under --split a stale part could
+    # pass the SPLIT CHECK. Removing the target first makes "the file exists" mean THIS run wrote it.
+    # (The output check below also treats a nonzero exit code as a hard failure, not just a missing file.)
+    try:
+        os.unlink(out)
+    except OSError:
+        pass
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
     if seg:
         # -ss BEFORE -i is a fast input seek; the segment is [start, start+dur).
@@ -941,7 +1263,13 @@ def origin(check_only=False):
         print("  ★★ THIS IS A MODIFIED COPY. The origin mark does not verify.")
         print("     This is a copy of, or derived from: %s" % ORIGIN_TRUE)
         print("     Expected mark %s, found %s." % (ORIGIN_SEAL[:16], actual[:16]))
-        print("     Removing this notice is the one thing the licence forbids. Put it back.")
+        # ★ THIS LINE USED TO OVERSTATE THE LICENCE (corrected 2026-10-11, outside review). It said
+        # removing the notice was "the one thing the licence forbids". MIT forbids nothing of the sort:
+        # it permits modification freely, and requires only that the copyright notice travel with copies.
+        # A legitimate fork that changes the repository URL was being labelled as if it had done
+        # something wrong.
+        print("     This banner is not the licence. MIT lets anyone modify this freely — it asks that")
+        print("     the copyright notice travel with copies, not that this line be kept.")
         print("")
     return 0
 
@@ -1152,6 +1480,8 @@ options:
   --scale F             render at F of native and let gamescope upscale it (0.3-1.0)
   --framegen N          frame generation at Nx, via lsfg-vk (2, 3 or 4)
   --overlay             show MangoHud over the game, via mangoapp
+  --test-load [SECS]    run a bounded synthetic load on the spare cards (default 60s, max 600) — it
+                        proves they can be driven and writes no file; nothing runs without this
   --work FILE           transcode FILE on the spare cards while you play (a real job)
   --work-outdir DIR     where a job's output goes (default: beside FILE)
   --split               divide ONE job across the spare cards instead of one job each
@@ -1161,8 +1491,28 @@ options:
   half-finished transcode reported as done is the failure this tool exists not to make."""
 
 
+def _terminate_live(procs):
+    """SIGTERM every still-running process in `procs`. Used by the parent-side wall-clock timer that
+    bounds a test load in WALL time, not just media time (blocking item 10)."""
+    for p in procs:
+        if p.poll() is None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+
 def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
-         work=None, work_outdir=None, split=False, only_spares=None):
+         work=None, work_outdir=None, split=False, only_spares=None, test_load=None):
+    """Play the game pinned to the display card, and — only if asked — give the other cards work.
+
+    ★ NOTHING RUNS ON THE OTHER CARDS UNLESS IT WAS ASKED FOR (fix 2026-10-11, from the final outside
+    read). The old default put a synthetic encode on every encodable spare card for the whole session.
+    That contradicts this file's own --spare comment ("the human's risk to take, not a default we assume
+    for them"), it spends heat and power producing nothing, and it is exactly the shape of the incident
+    where an uninvited workload reached a card on an external dock and took the machine down. A user who
+    types `spirit play -- ./game` asked for one thing: their game, on the right card.
+    """
     if not cmd:
         print("usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] "
               "[--work FILE [--work-outdir DIR] [--split]] [--spare NODE,...] -- <game command...>", file=sys.stderr)
@@ -1195,7 +1545,7 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
     print("spirit play — the game on the strongest card, every other card working the tail\n")
     L = main["link"]
     print("  MAIN  (renders)  %-6s %-30s x%s %s  %s GB/s" %
-          (main["card"], main["name"][:30], L["max_width"], L["max_gen"], L["gbps_max"]))
+          (main["card"], main["name"][:30], L["max_width"], L["max_gen"], _fmt_float(L["gbps_max"])))
     for g in spares:
         print("  SPARE (offload)  %-6s %-30s node /dev/dri/%s" %
               (g["card"], g["name"][:30], g.get("render_node") or "?"))
@@ -1225,7 +1575,11 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
         st, detail = _lsfg_state()
         # ★ "READY" was renamed to "INSTALLED" when this check moved to the Steam manifest.
         # A rename that misses one caller is exactly how a working feature reports itself broken.
-        if st != "INSTALLED":
+        # ★ PARTIAL IS ACCEPTED, MATCHING `doctor` (blocking item 5, ). PARTIAL means the
+        # layer and the shaders are present and only `lsfg-vk-cli` is missing — a helper this tool never
+        # calls, because it selects a profile by setting LSFGVK_PROFILE and lets the layer read it. doctor
+        # now reports PARTIAL as PASS; `play` must not contradict it by refusing. The two disagreed before.
+        if st not in ("INSTALLED", "PARTIAL"):
             print("  framegen: UNAVAILABLE — %s" % detail)
             print("            (launching without it; spirit boost explains the state)")
         else:
@@ -1268,9 +1622,13 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
     procs = []
     proc_nodes = []          # parallel to procs — which card each test load went to (see THE TAIL)
     died_early = {}          # render node -> rc, for loads that were already gone at game exit
-    job_outputs = []
+    job_outputs = []         # (node, out_path, Popen) — the process is kept for its exit code
     job_expect = None
     no_job_reason = None     # set when --work was asked for but nothing could be started
+    no_load_reason = None    # set when --test-load was asked for but nothing could be started
+    load_started = False     # True once at least one bounded test load is actually running
+    load_timer = None        # parent-side WALL-CLOCK termination for the test loads (blocking item 10)
+    job_start_time = None    # when the jobs were spawned — a target older than this is STALE (item 11)
 
     # ★ REFUSE --overlay BEFORE ANYTHING IS SPAWNED (fix 2026-10-11, outside review). This check used
     # to run AFTER the spare cards had already been put to work, so refusing the overlay left the
@@ -1286,17 +1644,29 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
     # dies instantly with its output going to /dev/null, which looks exactly like a card doing work.
     encoders = []            # [(render_node, va_driver)]
     skipped = []             # [(render_node_or_card, name, reason)]
+    marginal = []            # [(render_node, name, why)] — usable only if the user names them
     for g in spares:
         node = g.get("render_node")
         va, why = _va_driver(g)
-        if va and node:
-            encoders.append((os.path.basename(node), va))
-        else:
+        if not (va and node):
             skipped.append((os.path.basename(node) if node else g.get("card", "?"),
                             _gpu_name(g), why or "no render node"))
-    if do_offload and shutil.which("ffmpeg"):
+            continue
+        if not only_spares:
+            mw = _marginal(g)
+            if mw:
+                marginal.append((os.path.basename(node), _gpu_name(g), mw))
+                continue
+        encoders.append((os.path.basename(node), va))
+    want_work = bool(work)
+    want_load = test_load is not None
+    if do_offload and (want_work or want_load) and shutil.which("ffmpeg"):
         for node, nm, why in skipped:
             print("  spare: SKIPPED %s (%s) — %s" % (node, nm, why))
+        _what = "job" if work else "load"
+        for node, nm, why in marginal:
+            print("  %s: NOT using %s (%s) — %s" % (_what, node, nm, why))
+            print("       Add --spare %s to include it anyway." % node)
         if work and not encoders:
             no_job_reason = "no spare card on this machine can encode (see the SKIPPED lines above)"
             print("  work: no job started — %s" % no_job_reason)
@@ -1326,6 +1696,7 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                 print("          (the job needs a directory it can write to; check the path)")
                 return 1
             targets = list(encoders)
+            job_start_time = time.time()   # anything older than this is a STALE output (blocking item 11)
             if split and len(targets) > 1:
                 # ★ SPLIT, NOT REPLICATE. Each card gets a slice of the ONE input, and the pieces have
                 # to add back up to the original. This is the only shape that shows a job being
@@ -1345,36 +1716,61 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                     out, p = _start_work(node, work, outdir, seg=seg, va=va)
                     procs.append(p)
                     proc_nodes.append(node)
-                    job_outputs.append((os.path.basename(node), out))
+                    job_outputs.append((os.path.basename(node), out, p))
                     print("      %-12s slice %d  [%6.1fs .. %6.1fs] -> %s"
                           % (os.path.basename(node), i + 1, seg[0], seg[0] + seg[1],
                              os.path.basename(out)))
                 job_expect = total
             else:
                 if split:
-                    print("  split: only one spare card has a render node — replicating instead, and "
-                          "saying so rather than calling it a split.")
+                    # ★ NOT ABOUT "RENDER NODES" (blocking item 12). A single eligible card
+                    # here means the OTHER spares were excluded — marginal (a narrow host link) or not
+                    # encodable — and the lines above already name which and why. Replication is a
+                    # different claim from division, and it is named as such.
+                    print("  split: only one spare card is eligible to work — replicating instead "
+                          "(the others were skipped or are marginal; see the lines above), and saying so "
+                          "rather than calling it a split.")
                 for node, va in targets:
                     out, p = _start_work(node, work, outdir, va=va)
                     procs.append(p)
                     proc_nodes.append(node)
-                    job_outputs.append((os.path.basename(node), out))
+                    job_outputs.append((os.path.basename(node), out, p))
                 job_expect = None
                 if procs:
                     print("  ★ JOB: transcoding %s on %d spare card(s) — real input, real output. "
                           "(WHOLE file on each card = REPLICATION, not a split; add --split to divide "
                           "one job between them.)" % (os.path.basename(work), len(procs)))
-                    for node, out in job_outputs:
+                    for node, out, _p in job_outputs:
                         print("      %s -> %s" % (node, out))
-        else:
+        elif want_load:
             for node, va in encoders:
-                procs.append(_start_test_load(node, va))
+                procs.append(_start_test_load(node, va, cap=test_load))
                 proc_nodes.append(node)
             if procs:
-                print("  cards: %d spare card(s) running a SYNTHETIC TEST LOAD" % len(procs))
-                print("         (ffmpeg's own testsrc2 test pattern -> /dev/null). This proves the")
-                print("         cards can be DRIVEN; it is not a job and produces nothing.")
-                print("         For real work: spirit play --work <file> [--work-outdir DIR] -- <game>")
+                load_started = True
+                # ★ A PARENT-SIDE WALL CLOCK, NOT JUST `-t` (blocking item 10). `-t` after
+                # `-i` bounds MEDIA time and `-re` paces the INPUT; a spare that cannot encode 1080p60
+                # in real time (an old card) falls behind, and wall time then runs past the cap without
+                # bound. This timer terminates the loads at `cap` seconds of WALL time, and `-t` stays
+                # as the backstop. daemon=True so it can never hold the process open.
+                load_timer = threading.Timer(float(test_load), lambda: _terminate_live(procs))
+                load_timer.daemon = True
+                load_timer.start()
+                print("  TEST LOAD on %d card(s) for %ss wall time, then it stops." % (len(procs), test_load))
+                print("         It writes no file. It only shows these cards can be driven.")
+                print("         For real work: spirit play --work <file> [--split] -- <game>")
+            else:
+                # ★ NO ENCODABLE SPARE IS SAID, NOT SILENT (blocking item 9). This used to
+                # fall straight to the exit message with nothing but SKIPPED lines before it.
+                no_load_reason = "no spare card on this machine can be driven (see the SKIPPED lines above)"
+                print("  test-load: no load started — %s" % no_load_reason)
+    elif not work and not want_load:
+        # ★ THE DEFAULT, SAID OUT LOUD (from the final outside read). Doing nothing silently would read
+        # as the tool being broken; saying nothing runs on the other cards is what makes the default
+        # honest rather than surprising.
+        print("  no job given — your other cards will stay idle.")
+        print("          give them a real job:      spirit play --work FILE -- CMD")
+        print("          check they can be driven:  spirit doctor")
     elif work and do_offload:
         # ★ An absent tool must be SAID, not silently skipped (the README promises exactly this, and
         # the promise was false for ffmpeg). Found 2026-10-11 by an outside review.
@@ -1383,6 +1779,15 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
     elif work:
         no_job_reason = "--no-offload was given, so no card was asked to do anything"
         print("  work: no job started — %s" % no_job_reason)
+    elif want_load and not do_offload:
+        # ★ THE THREE SILENT / FALSE TEST-LOAD CASES (blocking item 9). Before this, a
+        # --test-load that started nothing printed nothing before launch and then "test load stopped"
+        # at exit, which asserted a load had run. Each case now names why no load started.
+        no_load_reason = "--no-offload was given, so no card was asked to do anything"
+        print("  test-load: no load started — %s" % no_load_reason)
+    elif want_load:
+        no_load_reason = "ffmpeg is not installed, so no card can be driven here"
+        print("  test-load: no load started — %s" % no_load_reason)
 
     print("\n  launching…\n")
     sys.stdout.flush()
@@ -1419,6 +1824,11 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
         print("  Nothing was launched. The cards listed above did no work and have been stopped.")
         sys.stdout.flush()
     finally:
+        # ★ DISARM THE WALL-CLOCK TIMER FIRST (blocking item 10). It terminates the test loads at `cap`
+        # seconds; once we are tearing down there is nothing left for it to do, and leaving it armed
+        # could fire on a later, unrelated run in the same process.
+        if load_timer:
+            load_timer.cancel()
         # ★ A TEST LOAD IS A LOAD AND DIES WITH THE GAME. A JOB IS NOT: terminating a half-finished
         # transcode leaves a truncated file and calls it done, which is the corrupt-quietly failure
         # this whole project has a law about. So jobs are WAITED FOR, then each output is checked for
@@ -1458,27 +1868,43 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
     if work and procs:
         print("\n  game exited (rc=%s) — the job ran to completion (not stopped with the game)" % rc)
         print("  ── JOB OUTPUT " + "─" * 56)
+        # ★ A FILE IS EVIDENCE ONLY IF THIS RUN WROTE IT (blocking item 11). `-y` overwrites,
+        # so a stale output from an identical earlier run, or a partial file left by an ffmpeg that died
+        # before opening its output, would otherwise be reported as a REAL JOB. Two independent
+        # conditions now have to hold: the file was written after the job started, AND the child exited 0.
+        # The mtime check is a second line of defence behind the delete-before-start in _start_work.
+        results = []     # (node, out, ok, duration)
         got = []
-        for node, out in job_outputs:
-            if os.path.isfile(out):
+        for node, out, p in job_outputs:
+            rcode = p.returncode
+            fresh = os.path.isfile(out) and (job_start_time is None
+                                             or os.path.getmtime(out) >= job_start_time - 1.0)
+            if fresh and rcode == 0:
                 d = _media_duration(out)
+                results.append((node, out, True, d or 0.0))
                 got.append(d or 0.0)
-                print("  %-14s %s  (%.1f MB, %.1fs)"
-                      % (node, os.path.basename(out), os.path.getsize(out) / 1048576.0, d or 0.0))
             else:
-                print("  %-14s MISSING — %s was not written. The job failed; do not report it as done."
-                      % (node, out))
+                results.append((node, out, False, 0.0))
+                got.append(0.0)
+        for node, out, ok, d in results:
+            if ok:
+                print("  %-14s %s  (%.1f MB, %.1fs)"
+                      % (node, os.path.basename(out), os.path.getsize(out) / 1048576.0, d))
+            else:
+                print("  %-14s MISSING/FAILED — %s was not written by THIS run (or the job exited "
+                      "nonzero). Do not report it as done." % (node, out))
         if job_expect is not None:
-            # ★ THE SPLIT HAS TO ADD BACK UP. Each slice is checked for existence AND duration, and
-            # the sum is compared to the original — a missing or truncated slice is a job that
-            # silently lost the middle, which is the corrupt-quietly failure. Verified on the
-            # artifacts, never on the child process's exit code.
+            # ★ THE SPLIT HAS TO ADD BACK UP. Each slice is checked for existence AND duration AND a
+            # clean exit, and the sum is compared to the original — a missing or truncated slice is a
+            # job that silently lost the middle, which is the corrupt-quietly failure. Verified on the
+            # artifacts, never on the child process's word alone.
             total = sum(got)
+            written = sum(1 for (_n, _o, ok, _d) in results if ok)
             print("  ── SPLIT CHECK " + "─" * 55)
-            print("  slices written      : %d of %d" % (sum(1 for g in got if g), len(job_outputs)))
+            print("  slices written      : %d of %d" % (written, len(job_outputs)))
             print("  slice durations sum : %.1fs" % total)
             print("  original duration   : %.1fs" % job_expect)
-            if abs(total - job_expect) <= max(1.0, job_expect * 0.01):
+            if written == len(job_outputs) and abs(total - job_expect) <= max(1.0, job_expect * 0.01):
                 print("  ⇒ COMPLETE — the pieces reconstruct the whole input (within 1%).")
             else:
                 print("  ⇒ INCOMPLETE — %.1fs of %.1fs. The split LOST footage; do not report it as ok."
@@ -1493,19 +1919,57 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
             print("  ── JOB OUTPUT " + "─" * 56)
             print("  NO JOB WAS STARTED — %s" % (no_job_reason or "nothing was given the work"))
             print("  Nothing was transcoded, so there is no output to check. The game ran normally.")
+        elif want_load:
+            if load_started:
+                print("\n  game exited (rc=%s) — the bounded test load ended with the session" % rc)
+            else:
+                # ★ DO NOT SAY "test load stopped" WHEN NONE STARTED (blocking item 9).
+                print("\n  game exited (rc=%s) — NO TEST LOAD WAS STARTED (%s). The game ran normally."
+                      % (rc, no_load_reason or "nothing was given the load"))
         else:
-            print("\n  game exited (rc=%s) — test load stopped" % rc)
+            print("\n  game exited (rc=%s) — no work was running on the other cards" % rc)
 
     # ★ THE TAIL — what the OTHER cards actually did. A feature you cannot see is indistinguishable
     # from one that is broken, and the loads are silent by design (ffmpeg's output goes to /dev/null).
     # So say it plainly, per card, and say "alive for" rather than claiming work was done.
-    if procs or job_outputs:
+    if procs or job_outputs or want_load or (not work and not want_load):
         names = {os.path.basename(g.get("render_node") or ""): _gpu_name(g) for g in spares}
         print("\n  ── THE TAIL — what the other cards did ───────────────────────────────")
-        if job_outputs:
-            for node, out in job_outputs:
-                ok = os.path.isfile(out)
-                print("  %-12s %-22s REAL JOB  %s" % (node, names.get(node, "?"), out if ok else "FAILED — no file"))
+        if not work and not want_load:
+            # ★ SAY IDLE, DON'T SAY NOTHING (from the final outside read). With the default now doing
+            # nothing, an empty tail would read as a broken tool. An explicit IDLE per card also shows
+            # the skipped ones are still being accounted for.
+            for g in spares:
+                node = os.path.basename(g.get("render_node") or "")
+                if not node:
+                    continue
+                nm = names.get(node, "?")
+                if node in [n for n, _nm, _w in skipped]:
+                    print("  %-12s %-22s SKIPPED — %s"
+                          % (node, nm, next((w for n2, _nm2, w in skipped if n2 == node), "not used")))
+                else:
+                    # With no job given, a marginal card is not "excluded" — nothing is running at all.
+                    print("  %-12s %-22s IDLE  (no job given)" % (node, nm))
+        elif job_outputs:
+            for node, out, p in job_outputs:
+                ok = (os.path.isfile(out) and p.returncode == 0
+                      and (job_start_time is None or os.path.getmtime(out) >= job_start_time - 1.0))
+                print("  %-12s %-22s REAL JOB  %s"
+                      % (node, names.get(node, "?"), out if ok else "FAILED — no file from this run"))
+        elif want_load and not load_started:
+            # ★ NOTHING RAN, AND WE SAY SO (blocking item 9). The old tail had no branch for
+            # "a load was asked for and none started", so it printed nothing at all here.
+            for g in spares:
+                node = os.path.basename(g.get("render_node") or "")
+                if not node:
+                    continue
+                nm = names.get(node, "?")
+                if node in [n for n, _v in encoders]:
+                    print("  %-12s %-22s NOT DRIVEN — %s"
+                          % (node, nm, no_load_reason or "no load was started"))
+                else:
+                    print("  %-12s %-22s SKIPPED — %s"
+                          % (node, nm, next((w for n2, _nm, w in skipped if n2 == node), "not used")))
         else:
             for g in spares:
                 node = os.path.basename(g.get("render_node") or "")
@@ -1515,14 +1979,19 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                 if node in [n for n, _v in encoders]:
                     rc_early = died_early.get(node)
                     if rc_early is None:
-                        print("  %-12s %-22s SYNTHETIC TEST LOAD — ran for the whole session (%.0f s),"
-                              % (node, nm, elapsed))
+                        print("  %-12s %-22s SYNTHETIC TEST LOAD — still running when the game exited"
+                              % (node, nm))
+                        print("  %-12s %-22s   (%.0f s of session; bounded to %ss by the wall clock)"
+                              % ("", "", elapsed, test_load))
+                    elif rc_early == 0:
+                        # ★ NORMAL COMPLETION IS NOT A FAULT (blocking item 9). The load is
+                        # DESIGNED to run for `cap` seconds and then stop; a clean rc 0 means it did
+                        # exactly that. It used to be reported as "EXITED EARLY ... it did NOT run".
+                        print("  %-12s %-22s SYNTHETIC TEST LOAD — COMPLETED its %ss bounded run, as designed"
+                              % (node, nm, test_load))
                     else:
-                        # ★ Say what was SEEN, not what was hoped: this one was already gone before the
-                        # game exited, so it did not run the session however long the game lasted.
-                        print("  %-12s %-22s SYNTHETIC TEST LOAD — EXITED EARLY (rc=%s, before the game"
-                              % (node, nm, rc_early))
-                        print("  %-12s %-22s   exited): it did NOT run for the session." % ("", ""))
+                        print("  %-12s %-22s SYNTHETIC TEST LOAD — DIED (rc=%s) before its %ss run finished"
+                              % (node, nm, rc_early, test_load))
                     print("  %-12s %-22s produced nothing (a job needs --work FILE)" % ("", ""))
                 else:
                     print("  %-12s %-22s SKIPPED — %s"
@@ -1547,14 +2016,20 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
 
 def main():
     argv = sys.argv[1:]
-    # ★ THE MARK, ON EVERY RUN. Skipped only for --json, where a machine is reading and a
-    # stray line would break it, and for --version, which must print exactly one line. A tampered
-    # build cannot silence the warning below.
-    if "--json" not in argv and "origin" not in argv and "--version" not in argv:
+    # ★ ONLY OUR OWN FLAGS COUNT, NOT THE GAME'S (fix 2026-10-11, found by the final outside read).
+    # These checks used to scan the WHOLE argv, so `spirit play -- ./game --version` printed the version
+    # and never launched the game, and any game invoked with a `--json` flag silently lost the banner.
+    # A flag only means something to us if it is the first token, or if it appears before the `--` that
+    # separates our arguments from the game's.
+    ours = argv[:argv.index("--")] if "--" in argv else argv
+    suppress_mark = (("origin" in ours)
+                     or (bool(argv) and argv[0] == "--version")
+                     or (bool(argv) and argv[0] in ("probe", "roles") and "--json" in ours))
+    if not suppress_mark:
         origin()
     # ★ --version prints THE one version string and nothing else: a single line, exit 0, no origin
     # mark and no argparse footer. Handled here (before argparse) so the ports can match it exactly.
-    if "--version" in argv:
+    if argv and argv[0] == "--version":
         print("spirit %s" % VERSION)
         return 0
     if argv and argv[0] == "ui":
@@ -1583,6 +2058,7 @@ def main():
     if argv and argv[0] == "play":
         offload, rest, i, scale, framegen, overlay = True, [], 1, None, None, False
         work, work_outdir, split, only_spares = None, None, False, None
+        test_load = None
         while i < len(argv):
             if argv[i] == "--no-offload":
                 offload = False; i += 1
@@ -1622,6 +2098,21 @@ def main():
                 i += 2
             elif argv[i] == "--overlay":
                 overlay = True; i += 1
+            elif argv[i] == "--test-load" or argv[i].startswith("--test-load="):
+                # ★ OPT-IN, AND BOUNDED (from the final outside read). The synthetic load used to be the
+                # default and ran until the game exited; it is now something you ask for, for a stated
+                # number of seconds, and it stops.
+                if argv[i].startswith("--test-load="):
+                    raw = argv[i].split("=", 1)[1]; i += 1
+                elif i + 1 < len(argv) and argv[i + 1].isdigit():
+                    raw = argv[i + 1]; i += 2
+                else:
+                    raw = "60"; i += 1
+                try:
+                    test_load = max(1, min(int(raw), 600))
+                except ValueError:
+                    print("spirit play: --test-load needs seconds, e.g. --test-load 30", file=sys.stderr)
+                    return 2
             elif argv[i] in ("-h", "--help"):
                 # ★ Without this, `play --help` fell through to `rest` and was executed as the game.
                 print(PLAY_USAGE)
@@ -1637,7 +2128,7 @@ def main():
             print("spirit play: --framegen must be 2, 3 or 4", file=sys.stderr)
             return 2
         return play(probe(), rest, offload, scale, framegen, overlay, work, work_outdir, split,
-                    only_spares)
+                    only_spares, test_load)
 
     ap = argparse.ArgumentParser(
         prog="spirit",
