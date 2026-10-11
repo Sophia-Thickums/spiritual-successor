@@ -195,28 +195,41 @@ spirit boost         what extra frames this machine can give you, right now
 spirit ui            a local page showing your cards and what is available here
 ```
 
-## More frames — two things people mix up
+## More frames — three things people mix up
 
-**Upscaling** renders fewer pixels and scales the picture back up. Free frames, on any card, in any
-Vulkan game.
+**The upscaler matters more than the frame count.** On RDNA 4, AMD's FSR 4 is an ML upscaler built for
+that silicon, and it costs on the order of 1–2 ms for a large drop in render cost. In a Proton game it is
+one flag:
+
+```
+PROTON_FSR4_UPGRADE=1 %command%
+```
+
+(`spirit enable` sets it for the whole session.) A silent fallback to FSR 3.1 looks identical, so turn on
+`PROTON_FSR4_INDICATOR=1` if you want to see which one is live. A game that already ships FSR 4 or DLSS
+needs none of this.
+
+**Upscaling through gamescope is FSR 1.0** — spatial, no motion vectors. Free frames, any card, any Vulkan
+game, but the picture falls apart well before FSR 4 does. Use it for titles with no in-game upscaler:
 
 ```
 spirit play --scale 0.7 -- ./yourgame
 ```
 
-On a 2560x1440 screen that renders 1792x1008 — 49% of the pixels. It runs through gamescope, which you
-need installed. It costs you the resolution you chose to give up — nothing else measured.
+On a 2560x1440 screen that renders 1792x1008 — 49% of the pixels. It costs you the resolution you gave up.
 
 **Frame generation** invents frames between the real ones. It needs `lsfg-vk`, which needs you to own
-Lossless Scaling. If you have both, the tool drives it:
+Lossless Scaling. It multiplies whatever the upscaler bought you:
 
 ```
 spirit play --framegen 2 -- ./yourgame
 ```
 
-Run `spirit boost` first: it tells you what is and is not available on your machine, and says what is
-missing when something is. Frame generation can look wrong on fast movement — that is the technology,
-not this tool.
+Measured on this project's machine at 2560x1440: **2x costs 0.71 ms, 3x 1.18, 4x 1.66** — the tax is small,
+so the multiplier should be sized so base × N lands near your panel's refresh (2x from ~80, 3x from ~55,
+4x from ~41). Beyond that you are paying for frames you will never see. Run `spirit boost` first: it says
+what is and is not available here. Frame generation can look wrong on fast movement — that is the
+technology, not this tool.
 
 ## Who this is for
 

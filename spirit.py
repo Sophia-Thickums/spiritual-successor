@@ -2142,6 +2142,7 @@ _ENV_D_DIR = os.path.join(os.path.expanduser("~"), ".config", "environment.d")
 _ENV_D_FILE = os.path.join(_ENV_D_DIR, "90-spirit.conf")
 _WSEL = "MESA_VK_DEVICE_SELECT"
 _WPCI = "DRI_PRIME"
+_WFSR = "PROTON_FSR4_UPGRADE"
 
 
 def _pin_values(g):
@@ -2205,6 +2206,7 @@ def enable(db, persist=False):
     print("  pin the launch to      : %s (%s)" % (_gpu_name(mc), mc["card"]))
     print("  pin                    : %s=%s   %s=%s" % (_WSEL, sel, _WPCI, pci))
     print("  this session           : %s" % _apply_session(sel, pci))
+    print("  fps lever              : %s=1 (FSR 4 in-game — raises the BASE rate)" % _WFSR)
     if persist:
         try:
             os.makedirs(_ENV_D_DIR)
@@ -2216,7 +2218,7 @@ def enable(db, persist=False):
                 f.write("# Spiritual Successor — session-wide GPU pin, written by `spirit enable --persist`.\n"
                         "# Every app started after your next login inherits this, Steam included.\n"
                         "# Remove it with:  spirit disable\n"
-                        "%s=%s\n%s=%s\n" % (_WSEL, sel, _WPCI, pci))
+                        "%s=%s\n%s=%s\n%s=1\n" % (_WSEL, sel, _WPCI, pci, _WFSR))
             os.replace(tmp, _ENV_D_FILE)      # atomic: a full disk never leaves a half-written pin
         except OSError:
             print("spirit enable: could not write %s" % _ENV_D_FILE, file=sys.stderr)
@@ -2231,6 +2233,9 @@ def enable(db, persist=False):
     print("  — its environment was fixed when it started, so restart Steam, or pin one game with the")
     print("  launch-options recipe. Nothing here survives a reboot unless you pass --persist; that is")
     print("  the default on purpose, so pulling the power always lands you back in a safe state.")
+    print("  For frames rather than looks: FSR 4 raises the base rate and frame generation multiplies")
+    print("  it — size the lsfg multiplier so base x N sits near your panel's refresh (2x from ~80,")
+    print("  3x from ~55). Measured here at 1440p: 2x costs 0.71 ms, 3x 1.18, 4x 1.66 — never the binder.")
     return 0
 
 
@@ -2257,15 +2262,18 @@ def disable(db):
 
 
 def _apply_session(sel, pci):
-    """Arm the running session through the systemd user manager. Apps started from now on inherit it;
-    a process that is ALREADY running — Steam included — does not. No manager: said plainly, never
-    pretended."""
+    """Arm the running session through the systemd user manager: the device pin, AND the frame-rate
+    lever that actually moves frames on an RDNA 4 card — `PROTON_FSR4_UPGRADE=1`, which upgrades a
+    Proton game's own upscaling to FSR 4 (AMD's ML upscaler, built for this silicon; ~1-2 ms, against
+    7-10 ms for the neural pass). Apps started from now on inherit it; a process that is ALREADY
+    running — Steam included — does not. No manager: said plainly, never pretended."""
     sc = shutil.which("systemctl")
     if not sc:
         return "no systemd user manager here — this machine cannot be armed live"
     try:
         r = subprocess.run([sc, "--user", "set-environment",
-                            "%s=%s" % (_WSEL, sel), "%s=%s" % (_WPCI, pci)],
+                            "%s=%s" % (_WSEL, sel), "%s=%s" % (_WPCI, pci),
+                            "%s=1" % _WFSR],
                            capture_output=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return "could not reach the session manager — NOT armed"
@@ -2283,7 +2291,7 @@ def _unapply_session(sel, pci):
     if not sc:
         return "no systemd user manager here — nothing to disarm"
     env = _manager_env() or {}
-    ours = [k for k, v in ((_WSEL, sel), (_WPCI, pci)) if env.get(k) == v]
+    ours = [k for k, v in ((_WSEL, sel), (_WPCI, pci), (_WFSR, "1")) if env.get(k) == v]
     if not ours:
         return "the session carries no pin this tool set — left everything alone"
     try:
