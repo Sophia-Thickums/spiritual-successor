@@ -102,7 +102,14 @@ while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done
 [ "${1:-}" = "--" ] && shift
 exec "$@"
 EOF
-chmod +x "$STUB/unshare" "$STUB/ffmpeg" "$STUB/ffprobe" "$STUB/vulkaninfo" "$STUB/gamescope"
+# steam: exits 0 at once, standing in for a running Steam client that accepts a hand-off and returns.
+# (`steam://...` is NOT stubbed — a real `steam://` URL is not a program, so both builds must report
+#  the exec failure identically; that is the OTHER steam case below.)
+cat > "$STUB/steam" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$STUB/unshare" "$STUB/ffmpeg" "$STUB/ffprobe" "$STUB/vulkaninfo" "$STUB/gamescope" "$STUB/steam"
 
 # ── auxiliary stub sets (★ new coverage) ──────────────────────────────────────
 # FASTB: same stubs but ffmpeg writes a REAL output file and exits at once, so a --work job finishes the
@@ -499,6 +506,40 @@ if diff -q "$WORK/py.out" "$WORK/cpp.out" >/dev/null && diff -q "$WORK/py.ffs" "
 else echo "FAIL  play --test-load 30 (py=$pyrc cpp=$crc)"; fail=$((fail+1)); diff "$WORK/py.out" "$WORK/cpp.out"|head -20; cat "$WORK/cpp.ff"; fi
 pkill -f "$STUB/unshare" 2>/dev/null; pkill -f "$STUB/ffmpeg" 2>/dev/null; pkill -f "$STUB/gamescope" 2>/dev/null
 FAKE="$FLEET"
+
+echo "--- play: the Steam path (blocking item 2 — said, not silent) ---"
+# ★ A STEAM LAUNCH CANNOT BE PINNED FROM HERE, AND BOTH BUILDS MUST SAY SO. Two claims, two cases:
+#   (1) `steam://rungameid/N` is not a program: both must print the launch-options RECIPE and then the
+#       same exec-failure line (rc 127).
+#   (2) a launcher that RETURNS AT ONCE (`steam`, stubbed to exit 0) must be named as having routed
+#       NOTHING — the old code printed `game exited (rc=0)` as if the session had worked.
+# The recipe line carries each build's OWN absolute path, and the fast-return line carries a measured
+# time; normalize both, because the CLAIM is the message, not the path or the clock.
+_steam_norm() {
+    sed -e 's#".*" play -- %command%#"<SELF>" play -- %command%#' \
+        -e 's/after [0-9][0-9.]*s/after N.Ns/'
+}
+cmp_steam() { # label args...
+    label=$1; shift
+    run_py  "$@" > "$WORK/py.raw" 2>/dev/null; pyrc=$?
+    run_cpp "$@" > "$WORK/cpp.raw" 2>/dev/null; crc=$?
+    _steam_norm < "$WORK/py.raw" > "$WORK/py.out"
+    _steam_norm < "$WORK/cpp.raw" > "$WORK/cpp.out"
+    if [ "$pyrc" != "$crc" ]; then
+        echo "FAIL  $label   (exit py=$pyrc cpp=$crc)"; fail=$((fail+1)); return
+    fi
+    if diff -q "$WORK/py.out" "$WORK/cpp.out" >/dev/null; then
+        echo "PASS  $label"; pass=$((pass+1))
+    else echo "FAIL  $label"; fail=$((fail+1)); diff "$WORK/py.out" "$WORK/cpp.out" | head -20; fi
+}
+cmp_steam "play -- steam:// (says it cannot be pinned; prints the recipe)" \
+        play --no-offload -- steam://rungameid/123
+cmp_steam "play -- steam (fast clean exit -> session did NOT route the game)" \
+        play --no-offload -- steam
+# the recipe and the not-routed line must ACTUALLY be on the page, not merely identical between builds.
+if grep -q 'play -- %command%' "$WORK/cpp.out" && grep -q 'did NOT route the game' "$WORK/cpp.out"; then
+    echo "PASS  steam message present (recipe + not-routed)"; pass=$((pass+1))
+else echo "FAIL  steam message missing from the output"; fail=$((fail+1)); cat "$WORK/cpp.out"; fi
 
 echo "--- play --scale / --framegen: stdout + exact gamescope argv (gamescope stubbed) ---"
 # ★ ISOLATE HOME FOR EVERY --framegen CASE (spec B4): _ensure_lsfg_profile appends to
