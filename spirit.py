@@ -825,6 +825,11 @@ ORIGIN_AUTHOR = "Sophia Marie DeClue"
 ORIGIN_REPO = "github.com/Sophia-Thickums/spiritual-successor"
 ORIGIN_NOTICE = ("%s by %s — %s" % (ORIGIN_NAME, ORIGIN_AUTHOR, ORIGIN_REPO))
 ORIGIN_SEAL = "4f411c5017ff15a5cca565be2d4e8b18e7e267f9ab146f0364a093658c771bf5"
+# ★ THE TRUE NOTICE, kept separately from the one that prints. If the printed notice is rewritten,
+# the warning below still names the ORIGINAL — a tampered build must not get to choose what it is
+# accused of being derived from.
+ORIGIN_TRUE = ("Spiritual Successor by Sophia Marie DeClue — "
+               "github.com/Sophia-Thickums/spiritual-successor")
 
 
 def _origin_seal(text=None):
@@ -847,7 +852,7 @@ def origin(check_only=False):
         # mark was removed on purpose.
         print("")
         print("  ★★ THIS IS A MODIFIED COPY. The origin mark does not verify.")
-        print("     It claims to be, or is derived from, %s" % ORIGIN_NOTICE)
+        print("     This is a copy of, or derived from: %s" % ORIGIN_TRUE)
         print("     Expected mark %s, found %s." % (ORIGIN_SEAL[:16], actual[:16]))
         print("     Removing this notice is the one thing the licence forbids. Put it back.")
         print("")
