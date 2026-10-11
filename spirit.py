@@ -741,6 +741,16 @@ def boost(db):
 
 
 # ── play: the game path — the strongest card renders, every other card works the tail ──
+def _gpu_name(g):
+    """The card's short name, as the role table prints it."""
+    n = (g.get("name") or g.get("card") or "?").strip()
+    for cut in ("[", "(", "  "):
+        i = n.find(cut)
+        if i > 0:
+            n = n[:i]
+    return n.strip()[:22]
+
+
 def _main_card(db):
     """The card that feeds the monitor MUST render (the monitor law). Fallback: the top scorer."""
     panel = [g for g in db["gpus"] if g.get("has_output")]
@@ -1240,6 +1250,24 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                       % (job_expect - total, job_expect))
     else:
         print("\n  game exited (rc=%s) — test load stopped" % rc)
+
+    # ★ THE TAIL — what the OTHER cards actually did. A feature you cannot see is indistinguishable
+    # from one that is broken, and the loads are silent by design (ffmpeg's output goes to /dev/null).
+    # So say it plainly, per card, and say "alive for" rather than claiming work was done.
+    if procs or job_outputs:
+        names = {os.path.basename(g.get("render_node") or ""): _gpu_name(g) for g in spares}
+        print("\n  ── THE TAIL — what the other cards did ───────────────────────────────")
+        if job_outputs:
+            for node, out in job_outputs:
+                ok = os.path.isfile(out)
+                print("  %-12s %-22s REAL JOB  %s" % (node, names.get(node, "?"), out if ok else "FAILED — no file"))
+        else:
+            for g in spares:
+                node = os.path.basename(g.get("render_node") or "")
+                if node:
+                    print("  %-12s %-22s SYNTHETIC TEST LOAD — alive for %.0f s of the session,"
+                          % (node, names.get(node, "?"), elapsed))
+                    print("  %-12s %-22s produced nothing (a job needs --work FILE)" % ("", ""))
 
     if fg_count_path:
         n = _read_counter(fg_count_path)
