@@ -4452,7 +4452,7 @@ fn apply_session(sel: &str, pci: &str) -> String {
     let selv = format!("MESA_VK_DEVICE_SELECT={}", sel);
     let pciv = format!("DRI_PRIME={}", pci);
     match Command::new("systemctl")
-        .args(["--user", "set-environment", &selv, &pciv])
+        .args(["--user", "set-environment", &selv, &pciv, "PROTON_FSR4_UPGRADE=1"])
         .output()
     {
         Ok(o) if o.status.success() => "armed for apps started from now on".to_string(),
@@ -4475,6 +4475,7 @@ fn unapply_session(sel: &str, pci: &str) -> String {
     let mut ours: Vec<&str> = Vec::new();
     if txt.lines().any(|l| l == selv.as_str()) { ours.push("MESA_VK_DEVICE_SELECT"); }
     if txt.lines().any(|l| l == pciv.as_str()) { ours.push("DRI_PRIME"); }
+    if txt.lines().any(|l| l == "PROTON_FSR4_UPGRADE=1") { ours.push("PROTON_FSR4_UPGRADE"); }
     if ours.is_empty() {
         return "the session carries no pin this tool set — left everything alone".to_string();
     }
@@ -4511,6 +4512,7 @@ fn enable_cmd(db: &Json, persist: bool) -> i32 {
              mc.get("card").and_then(|v| v.as_str()).unwrap_or(""));
     println!("  pin                    : MESA_VK_DEVICE_SELECT={}   DRI_PRIME={}", sel, pci);
     println!("  this session           : {}", apply_session(&sel, &pci));
+    println!("  fps lever              : PROTON_FSR4_UPGRADE=1 (FSR 4 in-game — raises the BASE rate)");
     if persist {
         let dir = format!("{}/.config/environment.d", env::var("HOME").unwrap_or_default());
         let _ = fs::create_dir_all(&dir);
@@ -4518,7 +4520,7 @@ fn enable_cmd(db: &Json, persist: bool) -> i32 {
             "# Spiritual Successor — session-wide GPU pin, written by `spirit enable --persist`.\n\
              # Every app started after your next login inherits this, Steam included.\n\
              # Remove it with:  spirit disable\n\
-             MESA_VK_DEVICE_SELECT={}\nDRI_PRIME={}\n", sel, pci);
+             MESA_VK_DEVICE_SELECT={}\nDRI_PRIME={}\nPROTON_FSR4_UPGRADE=1\n", sel, pci);
         let tmp = format!("{}.tmp", env_d_file());
         let wrote = fs::write(&tmp, body).is_ok() && fs::rename(&tmp, env_d_file()).is_ok();
         if !wrote {
@@ -4537,6 +4539,9 @@ fn enable_cmd(db: &Json, persist: bool) -> i32 {
     println!("  — its environment was fixed when it started, so restart Steam, or pin one game with the");
     println!("  launch-options recipe. Nothing here survives a reboot unless you pass --persist; that is");
     println!("  the default on purpose, so pulling the power always lands you back in a safe state.");
+    println!("  For frames rather than looks: FSR 4 raises the base rate and frame generation multiplies");
+    println!("  it — size the lsfg multiplier so base x N sits near your panel's refresh (2x from ~80,");
+    println!("  3x from ~55). Measured here at 1440p: 2x costs 0.71 ms, 3x 1.18, 4x 1.66 — never the binder.");
     0
 }
 

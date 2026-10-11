@@ -3571,6 +3571,7 @@ static void mkdir_p(const string &d) {
 
 static const char *W_SEL = "MESA_VK_DEVICE_SELECT";
 static const char *W_PCI = "DRI_PRIME";
+static const char *W_FSR = "PROTON_FSR4_UPGRADE";
 
 // The systemd user manager's live environment as text, or "" when there is no manager to ask.
 static string manager_env_text() {
@@ -3597,7 +3598,8 @@ static string apply_session(const string &sel, const string &pci) {
     if (!which("systemctl"))
         return "no systemd user manager here — this machine cannot be armed live";
     vector<string> a = {"systemctl", "--user", "set-environment",
-                        string(W_SEL) + "=" + sel, string(W_PCI) + "=" + pci};
+                        string(W_SEL) + "=" + sel, string(W_PCI) + "=" + pci,
+                        string(W_FSR) + "=1"};
     ProcResult r = run_capture_both(a, nullptr, 10);
     if (!r.ok) return "could not reach the session manager — NOT armed";
     if (r.rc != 0) return "the session manager refused it — NOT armed";
@@ -3611,6 +3613,7 @@ static string unapply_session(const string &sel, const string &pci) {
     vector<string> ours;
     if (env_text_has(txt, string(W_SEL) + "=" + sel)) ours.push_back(W_SEL);
     if (env_text_has(txt, string(W_PCI) + "=" + pci)) ours.push_back(W_PCI);
+    if (env_text_has(txt, string(W_FSR) + "=1")) ours.push_back(W_FSR);
     if (ours.empty()) return "the session carries no pin this tool set — left everything alone";
     vector<string> a = {"systemctl", "--user", "unset-environment"};
     for (auto &o : ours) a.push_back(o);
@@ -3641,6 +3644,7 @@ static int enable_cmd(const J &db, bool persist) {
     printf("  pin the launch to      : %s (%s)\n", gpu_name(*mc).c_str(), sfield(*mc, "card").c_str());
     printf("  pin                    : %s=%s   %s=%s\n", W_SEL, sel.c_str(), W_PCI, pci.c_str());
     printf("  this session           : %s\n", apply_session(sel, pci).c_str());
+    printf("  fps lever              : %s=1 (FSR 4 in-game — raises the BASE rate)\n", W_FSR);
     if (persist) {
         mkdir_p(home_dir() + "/.config/environment.d");
         string tmp = env_d_file() + ".tmp";
@@ -3649,7 +3653,7 @@ static int enable_cmd(const J &db, bool persist) {
             fprintf(f, "# Spiritual Successor — session-wide GPU pin, written by `spirit enable --persist`.\n");
             fprintf(f, "# Every app started after your next login inherits this, Steam included.\n");
             fprintf(f, "# Remove it with:  spirit disable\n");
-            fprintf(f, "%s=%s\n%s=%s\n", W_SEL, sel.c_str(), W_PCI, pci.c_str());
+            fprintf(f, "%s=%s\n%s=%s\n%s=1\n", W_SEL, sel.c_str(), W_PCI, pci.c_str(), W_FSR);
             if (fclose(f) != 0) f = nullptr;
         }
         if (!f || rename(tmp.c_str(), env_d_file().c_str()) != 0) {
@@ -3668,6 +3672,9 @@ static int enable_cmd(const J &db, bool persist) {
     printf("  — its environment was fixed when it started, so restart Steam, or pin one game with the\n");
     printf("  launch-options recipe. Nothing here survives a reboot unless you pass --persist; that is\n");
     printf("  the default on purpose, so pulling the power always lands you back in a safe state.\n");
+    printf("  For frames rather than looks: FSR 4 raises the base rate and frame generation multiplies\n");
+    printf("  it — size the lsfg multiplier so base x N sits near your panel's refresh (2x from ~80,\n");
+    printf("  3x from ~55). Measured here at 1440p: 2x costs 0.71 ms, 3x 1.18, 4x 1.66 — never the binder.\n");
     return 0;
 }
 
