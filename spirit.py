@@ -1000,13 +1000,30 @@ def _spawn_hidden(cmd, env, main, db):
 
 
 def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
-         work=None, work_outdir=None, split=False):
+         work=None, work_outdir=None, split=False, only_spares=None):
     if not cmd:
         print("usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] "
-              "[--work FILE [--work-outdir DIR] [--split]] -- <game command...>", file=sys.stderr)
+              "[--work FILE [--work-outdir DIR] [--split]] [--spare NODE,...] -- <game command...>", file=sys.stderr)
         return 1
     main = _main_card(db)
     spares = [g for g in db["gpus"] if g["card"] != main["card"]]
+    if only_spares:
+        # ★ --spare NODE[,NODE...] — the human names the cards that work. Everything else is left
+        # alone entirely, not merely idle. A real session runs for hours unattended, and an old card
+        # on a marginal link is the human's risk to take, not a default we assume for them.
+        want = {n.strip() for n in only_spares.replace(",", " ").split() if n.strip()}
+        kept = [g for g in spares if os.path.basename(g.get("render_node") or "") in want]
+        missing = want - {os.path.basename(g.get("render_node") or "") for g in spares}
+        if missing:
+            print("  spare: ignoring unknown render node(s): %s" % ", ".join(sorted(missing)))
+        if not kept:
+            print("  spare: REFUSED — none of %s is a spare card here. The game would run with no"
+                  " cards working beside it." % sorted(want))
+            return 1
+        print("  spare: %d of %d card(s) allowed to work: %s"
+              % (len(kept), len(spares), ", ".join(os.path.basename(g.get("render_node") or "?")
+                                                   for g in kept)))
+        spares = kept
 
     print("spirit play — the game on the strongest card, every other card working the tail\n")
     L = main["link"]
@@ -1267,10 +1284,16 @@ def main():
     # `play` also takes an arbitrary game command — parse by hand, same reason as `run`.
     if argv and argv[0] == "play":
         offload, rest, i, scale, framegen, overlay = True, [], 1, None, None, False
-        work, work_outdir, split = None, None, False
+        work, work_outdir, split, only_spares = None, None, False, None
         while i < len(argv):
             if argv[i] == "--no-offload":
                 offload = False; i += 1
+            elif argv[i] == "--spare":
+                if i + 1 >= len(argv):
+                    print("spirit play: --spare needs render nodes, e.g. --spare renderD130,renderD131",
+                          file=sys.stderr)
+                    return 2
+                only_spares = argv[i + 1]; i += 2
             elif argv[i] == "--split":
                 split = True; i += 1
             elif argv[i] == "--work":
@@ -1311,7 +1334,8 @@ def main():
         if framegen is not None and framegen not in (2, 3, 4):
             print("spirit play: --framegen must be 2, 3 or 4", file=sys.stderr)
             return 2
-        return play(probe(), rest, offload, scale, framegen, overlay, work, work_outdir, split)
+        return play(probe(), rest, offload, scale, framegen, overlay, work, work_outdir, split,
+                    only_spares)
 
     ap = argparse.ArgumentParser(
         prog="spirit",

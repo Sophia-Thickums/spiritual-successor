@@ -2380,10 +2380,10 @@ fn spawn_argv(argv: &[String], env_pins: &[(OsString, OsString)]) -> i32 {
 }
 
 fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framegen: Option<i64>,
-        overlay: bool, work: &str, work_outdir: &str, split: bool) -> i32 {
+        overlay: bool, work: &str, work_outdir: &str, split: bool, only_spares: &str) -> i32 {
     if cmd.is_empty() {
         eprintln!("usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] \
-[--work FILE [--work-outdir DIR] [--split]] -- <game command...>");
+[--work FILE [--work-outdir DIR] [--split]] [--spare NODE,...] -- <game command...>");
         return 1;
     }
     let cmd: Vec<String> = cmd.to_vec();
@@ -2391,10 +2391,42 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
         Some(m) => m,
         None => return 1,
     };
-    let spares: Vec<Json> = gpus_of(db)
+    let mut spares: Vec<Json> = gpus_of(db)
         .into_iter()
         .filter(|g| card_of(g) != card_of(&main))
         .collect();
+    if !only_spares.is_empty() {
+        // ★ --spare NODE[,NODE...] — the human names the cards that work. Everything else is left
+        // alone entirely, not merely idle. A real session runs for hours unattended, and an old card
+        // on a marginal link is the human's risk to take, not a default we assume for them.
+        let want: Vec<&str> = only_spares
+            .split([',', ' '])
+            .filter(|w| !w.is_empty())
+            .collect();
+        let kept: Vec<Json> = spares
+            .iter()
+            .filter(|g| {
+                let n = g.get("render_node").and_then(|v| v.as_str()).unwrap_or("");
+                want.iter().any(|w| n.rsplit('/').next().unwrap_or(n) == *w)
+            })
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            println!("  spare: REFUSED — none of {} is a spare card here. The game would run with no",
+                     only_spares);
+            println!("         cards working beside it.");
+            return 1;
+        }
+        let kepts: Vec<String> = kept
+            .iter()
+            .map(|g| {
+                let n = g.get("render_node").and_then(|v| v.as_str()).unwrap_or("");
+                n.rsplit('/').next().unwrap_or(n).to_string()
+            })
+            .collect();
+        println!("  spare: {} of {} card(s) allowed to work: {}", kept.len(), spares.len(), kepts.join(", "));
+        spares = kept;
+    }
 
     println!("spirit play — the game on the strongest card, every other card working the tail");
     println!();
@@ -2859,6 +2891,7 @@ fn dispatch(argv: &[String]) -> i32 {
         let mut framegen: Option<i64> = None;
         let mut overlay = false;
         let mut work = String::new();
+        let mut only_spares = String::new();
         let mut work_outdir = String::new();
         let mut split = false;
         let mut i = 1;
@@ -2866,6 +2899,15 @@ fn dispatch(argv: &[String]) -> i32 {
             if argv[i] == "--no-offload" {
                 offload = false;
                 i += 1;
+            } else if argv[i] == "--spare" {
+                match argv.get(i + 1) {
+                    Some(v) => { only_spares = v.clone(); }
+                    None => {
+                        eprintln!("spirit play: --spare needs render nodes, e.g. --spare renderD130,renderD131");
+                        return 2;
+                    }
+                }
+                i += 2;
             } else if argv[i] == "--split" {
                 split = true;
                 i += 1;
@@ -2929,7 +2971,8 @@ fn dispatch(argv: &[String]) -> i32 {
                 return 2;
             }
         }
-        return play(&probe(), &rest, offload, scale, framegen, overlay, &work, &work_outdir, split);
+        return play(&probe(), &rest, offload, scale, framegen, overlay, &work, &work_outdir, split,
+                    &only_spares);
     }
 
     let cmd = argv[0].as_str();
