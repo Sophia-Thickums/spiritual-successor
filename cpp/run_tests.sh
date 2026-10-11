@@ -121,7 +121,10 @@ for a in "$@"; do
 done
 out=""
 for a in "$@"; do out="$a"; done
-[ -n "$out" ] && printf '%s\n' "$dur" > "$out" 2>/dev/null
+# ★ DO NOT WRITE A FILE NAMED `-` (harness hygiene). For a test load the last argv is `-` (ffmpeg's
+# `-f null -`), so the old stub dropped a bare file named `-` in the CURRENT DIRECTORY — which
+# contradicts "nothing is written outside $TMPDIR". Only write when the target is a real path.
+[ -n "$out" ] && [ "$out" != "-" ] && printf '%s\n' "$dur" > "$out" 2>/dev/null
 exit 0
 EOF
 chmod +x "$FASTB"/*
@@ -158,10 +161,24 @@ cp "$STUB/unshare" "$STUB/ffprobe" "$STUB/gamescope" "$BADSUB/"
 cat > "$BADSUB/ffmpeg" <<'EOF'
 #!/bin/sh
 out=""; for a in "$@"; do out="$a"; done
-[ -n "$out" ] && printf '5\n' > "$out" 2>/dev/null
+[ -n "$out" ] && [ "$out" != "-" ] && printf '5\n' > "$out" 2>/dev/null
 exit 0
 EOF
 chmod +x "$BADSUB"/*
+
+# ★ LAUNCHER TOOLS FOR THE SPECIAL PATH SETS (fix 2026-10-11). cmp_cmd_path REPLACES the child's PATH
+# wholesale, but every case that uses one is launched as `env PATH=$SPECIAL timeout 60 python3|./spirit …`.
+# FASTB/BADSUB/NOPROBE/EARLY/DEADB were built from the STUB set alone, so they never contained `timeout`
+# or `python3`: the child died at exec with `env: 'timeout': No such file or directory` (rc 127) on BOTH
+# sides, before spirit was ever reached. Every case using them therefore passed on identical error text
+# and could not fail — a suite that tested nothing while looking green. Give them the launcher, and `sh`
+# (the unshare hide-wrapper runs `sh -c`), while leaving each set's DELIBERATE omissions intact
+# (NOPROBE's ffprobe, MINB's unshare/gamescope/vulkaninfo). MINB already carries the launcher.
+for d in "$FASTB" "$BADSUB" "$EARLY" "$DEADB"; do
+    for t in timeout python3 sh; do
+        [ -e "$d/$t" ] || { p=$(command -v "$t") && ln -sf "$p" "$d/$t"; }
+    done
+done
 
 # ── fixtures, all inside $WORK (deleted at the end — we keep no test media) ────
 printf 'clip\n' > "$WORK/clip.mkv"
@@ -535,6 +552,9 @@ cmp_cmd_path "$BADSUB" "play --split INCOMPLETE (B3: arithmetic really checked)"
 # split with an unreadable duration -> split: REFUSED, BASENAME (C8). No ffprobe stub here, so the
 # live ffprobe fails on a text file and _media_duration returns None.
 NOPROBE="$WORK/noprobe"; mkdir -p "$NOPROBE"; cp "$FASTB/unshare" "$FASTB/gamescope" "$FASTB/ffmpeg" "$NOPROBE/"
+# ★ the same launcher fix as the other special sets (ffprobe stays absent on purpose, so the duration
+# read fails and the split refusal path is genuinely exercised).
+for t in timeout python3 sh; do p=$(command -v "$t") && ln -sf "$p" "$NOPROBE/$t"; done
 cmp_cmd_path "$NOPROBE" "play --split unreadable duration (C8 basename)" \
         play --split --work "$WORK/clip.mkv" -- /bin/echo HI
 FAKE="$FLEET"
@@ -624,6 +644,7 @@ else echo "FAIL  probe --json (real)"; fail=$((fail+1)); diff "$WORK/py.out" "$W
 
 pkill -f "$STUB/unshare" 2>/dev/null; pkill -f "$STUB/ffmpeg" 2>/dev/null; pkill -f "$STUB/gamescope" 2>/dev/null
 rm -rf "$WORK"
+rm -f "$HERE/-"          # a stray `-` cannot be left behind even if a stub ever writes one
 echo
 echo "================  $pass passed, $fail failed  ================"
 [ "$fail" = 0 ]

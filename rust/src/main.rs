@@ -490,6 +490,30 @@ fn which(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// True if unprivileged user namespaces WORK here, false if they are denied, None if no `unshare`.
+///
+/// ★ THE ONE PROBE FOR THE SECOND WALL, RUN THE SAME WAY EVERYWHERE (blocking item 1). `unshare`
+/// being on PATH says nothing about whether an unprivileged user namespace can be CREATED: Ubuntu
+/// 24.04's default AppArmor policy and Debian's `unprivileged_userns_clone=0` both deny it, and there
+/// `unshare -r` fails. `doctor` already ran this exact test; `play` now consults the SAME answer
+/// before it wraps a launch, so the two can never disagree about whether the wall exists. Cached —
+/// the answer cannot change within one run, and re-probing would fork a process per call.
+static USERNS_CACHE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+
+fn userns_available() -> Option<bool> {
+    *USERNS_CACHE.get_or_init(|| {
+        if which("unshare").is_none() {
+            return None;
+        }
+        let mut cmd = Command::new("unshare");
+        cmd.args(["-Urm", "true"]);
+        match cap_timeout(&mut cmd, 10) {
+            Ok(o) => Some(o.status.code().map(|c| c == 0).unwrap_or(false)),
+            Err(_) => Some(false),
+        }
+    })
+}
+
 // ── the true host link: minimum negotiated width/speed along the sysfs chain ──────────
 fn chain_for(bdf: &str) -> Vec<String> {
     let real = fs::canonicalize(format!("{}/{}", PCI, bdf))
@@ -3132,6 +3156,15 @@ fn marginal(g: &Json) -> Option<String> {
 /// exited — an uninvited, unbounded workload on every spare card. It now runs for `cap` seconds of
 /// REAL time and stops: `-re` paces the generated input to native frame rate (without it ffmpeg
 /// would encode the whole clip in a few seconds and exit), and `-t` bounds it.
+/// ★ GRACE MARGIN ON THE WALL-CLOCK BACKSTOP (blocking item 3). The parent timer used to fire at
+/// EXACTLY `cap` seconds while `ffmpeg -re -t cap` reaches `cap` of MEDIA slightly LATER (startup
+/// latency), so in the ordinary case the timer SIGTERMed ffmpeg first and the tail printed
+/// `DIED (rc=…) before its Ns run finished` over a run that had done exactly what it was asked. The
+/// load's own `-t` is the real bound; the parent timer exists only as a backstop for a card that
+/// cannot keep up. The grace margin lets a normal load END ITSELF, cleanly, with rc 0 — which the tail
+/// already reports as COMPLETED, as designed.
+const LOAD_TIMER_GRACE: u64 = 5;
+
 fn start_test_load(node: &str, va: &str, cap: i64) -> std::io::Result<Child> {
     Command::new("ffmpeg")
         .args([
@@ -3391,8 +3424,28 @@ fn ensure_compatdata(cmd: &[String]) {
     }
 }
 
+/// True if this launches the STEAM CLIENT itself (or a `steam://` URL) rather than the game.
+///
+/// ★ THE STEAM PATH WAS BYPASSED, AND SILENTLY (blocking item 2). `steam` is not a Wine target, so
+/// the old code wrapped it in the fake-root namespace — and Steam's own `bin_steam.sh` refuses to run
+/// as root, so the launch died with Steam's error. Worse, when the client is ALREADY running,
+/// `steam -applaunch` / `steam://` hands the request to it and returns at once: the game then starts
+/// with none of our environment (no MESA_VK_DEVICE_SELECT), i.e. UNPINNED.
+fn is_steam_launcher(cmd: &[String]) -> bool {
+    for a in cmd {
+        let s = a.as_str();
+        if s.starts_with("steam://") || base_of(s).to_lowercase() == "steam" {
+            return true;
+        }
+    }
+    false
+}
+
 fn hidden_argv(cmd: &[String], main: &Json, db: &Json) -> Vec<String> {
-    if is_wine_target(cmd) {
+    if is_wine_target(cmd) || is_steam_launcher(cmd) {
+        // ★ BOTH REFUSE TO RUN AS ROOT. Wine/Proton die with `Cannot run as root user`, and the Steam
+        // client refuses the same way; `unshare -r` makes us root inside. So the second wall would
+        // break these launches outright — skip it, and the exclusive pin is the load-bearing half.
         return cmd.to_vec();
     }
     let mut hide: Vec<String> = Vec::new();
@@ -3410,23 +3463,46 @@ fn hidden_argv(cmd: &[String], main: &Json, db: &Json) -> Vec<String> {
             }
         }
     }
-    if !hide.is_empty() && which("unshare").is_some() {
-        // ★ A WALL THAT FAILS SILENTLY IS NOT A WALL. This used to end every bind with `|| true`, so a
-        // failed hide said nothing at all and the game could still see the other cards while the run
-        // looked identical to a good one. It now says so, on stderr, at the moment it happens.
-        // (Found by the outside review, 2026-10-11.)
-        let script = "hide=\"$1\"; shift; for n in $hide; do if [ -e \"/dev/dri/$n\" ]; then mount --bind /dev/null \"/dev/dri/$n\" 2>/dev/null || echo \"  wall: could NOT hide /dev/dri/$n - the game can still see this card\" >&2; fi; done; exec \"$@\"";
-        let mut v: Vec<String> = vec![
-            "unshare".into(),
-            "-rm".into(),
-            "sh".into(),
-            "-c".into(),
-            script.into(),
-            "sh".into(),
-            hide.join(" "),
-        ];
-        v.extend(cmd.iter().cloned());
-        return v;
+    if !hide.is_empty() {
+        match userns_available() {
+            None => {
+                // ★ A MISSING `unshare` IS NOT SILENT ANY MORE (blocking item 1 / §2 item 13). It
+                // used to just return the command, so a machine without the binary got no wall and
+                // no message.
+                println!("  wall: unshare is not installed — only the pin separates the game from the other cards' device nodes.");
+                let _ = std::io::stdout().flush();
+                return cmd.to_vec();
+            }
+            Some(false) => {
+                // ★ THE FALLBACK THAT KEEPS THE GAME LAUNCHING (blocking item 1). On Ubuntu 24.04 or
+                // a Debian with `unprivileged_userns_clone=0`, `unshare -r` FAILS. The old code
+                // wrapped the launch in it anyway, so the game never started — and the tool reported
+                // the session as normal. A wall that cannot be built must never stop a launch: fall
+                // back to the pin alone, and SAY SO rather than weakening the wall in silence.
+                println!("  wall: the second wall is unavailable here — unprivileged user namespaces are denied on this machine, so the game");
+                println!("        launches WITHOUT the namespace; only the pin separates it from the other cards' device nodes.");
+                let _ = std::io::stdout().flush();
+                return cmd.to_vec();
+            }
+            Some(true) => {
+                // ★ A WALL THAT FAILS SILENTLY IS NOT A WALL. This used to end every bind with
+                // `|| true`, so a failed hide said nothing at all and the game could still see the
+                // other cards while the run looked identical to a good one. It now says so, on
+                // stderr, at the moment it happens. (Found by the outside review, 2026-10-11.)
+                let script = "hide=\"$1\"; shift; for n in $hide; do if [ -e \"/dev/dri/$n\" ]; then mount --bind /dev/null \"/dev/dri/$n\" 2>/dev/null || echo \"  wall: could NOT hide /dev/dri/$n - the game can still see this card\" >&2; fi; done; exec \"$@\"";
+                let mut v: Vec<String> = vec![
+                    "unshare".into(),
+                    "-rm".into(),
+                    "sh".into(),
+                    "-c".into(),
+                    script.into(),
+                    "sh".into(),
+                    hide.join(" "),
+                ];
+                v.extend(cmd.iter().cloned());
+                return v;
+            }
+        }
     }
     cmd.to_vec()
 }
@@ -3514,8 +3590,7 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
         spares = kept;
     }
 
-    println!("spirit play — the game on the strongest card, every other card working the tail");
-    println!();
+    println!("spirit play — the game on your monitor card; the other cards stay idle unless you give them work\n");
     let l = main.get("link").unwrap();
     println!(
         "{}",
@@ -3532,7 +3607,7 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
         println!(
             "{}",
             format!(
-                "  SPARE (offload)  {} {} node /dev/dri/{}",
+                "  SPARE (idle unless asked)  {} {} node /dev/dri/{}",
                 ljust(&card_of(g), 6),
                 ljust(&head(g.get("name").and_then(|v| v.as_str()).unwrap_or(""), 30), 30),
                 g.get("render_node").and_then(|v| v.as_str()).unwrap_or("?")
@@ -3627,6 +3702,21 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
         }
     }
 
+    let steam_launch = is_steam_launcher(&cmd);
+    if steam_launch {
+        // ★ THE STEAM PATH IS SAID, NOT SILENT (blocking item 2). `steam`/`steam://` is not the game
+        // — it is a REQUEST to the Steam client, which starts the game itself, in its own environment.
+        // This tool cannot put the pin there, so it says so and gives the recipe that CAN pin it.
+        println!("  steam: this is a Steam launch — it cannot be pinned from here.");
+        println!("         `steam`/`steam://` hands the request to the running Steam client and returns");
+        println!("         at once, so the game would start WITHOUT this tool's pin. The pin only reaches");
+        println!("         a process THIS tool launches. To pin a Steam game, set its launch options to:");
+        let selfp = std::fs::read_link("/proc/self/exe")
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "spirit".to_string());
+        println!("             \"{}\" play -- %command%", selfp);
+        println!("         (note the `--` before %command%), then launch the game from Steam.");
+    }
     if is_wine_target(&cmd) {
         println!("  wall: Proton/Wine detected — skipping the mount namespace (Wine refuses to run as");
         println!("        root, and `unshare -r` makes us root); the exclusive pin still applies.");
@@ -3824,7 +3914,7 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
                 let pids: Vec<i32> = procs.iter().map(|p| p.id() as i32).collect();
                 let cancel = load_cancel.clone();
                 std::thread::spawn(move || {
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(cap);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(cap + LOAD_TIMER_GRACE);
                     while std::time::Instant::now() < deadline {
                         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
                             return;
@@ -3861,7 +3951,7 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
         // honest rather than surprising.
         println!("  no job given — your other cards will stay idle.");
         println!("          give them a real job:      spirit play --work FILE -- CMD");
-        println!("          check they can be driven:  spirit doctor");
+        println!("          check they can be driven:  spirit play --test-load 60 -- CMD");
     } else if want_work && do_offload {
         // ★ An absent tool must be SAID, not silently skipped (the README promises exactly this, and
         // the promise was false for ffmpeg). Found 2026-10-11 by an outside review. (Item A6.)
@@ -4063,6 +4153,17 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
     }
     let elapsed = f64::max(t_game.elapsed().as_secs_f64(), 1e-6);
 
+    // ★ A LAUNCHER THAT RETURNS AT ONCE IS SAID, NOT REPORTED AS A NORMAL SESSION (blocking item 2).
+    // With the Steam client already running, `steam`/`steam://` hands off and exits in about a second:
+    // the game starts unpinned, and the old code printed `game exited (rc=0)` as if the session had
+    // been routed. It had not. Detect the fast clean exit and say plainly that the game went its own way.
+    if steam_launch && rc == 0 && elapsed < 3.0 {
+        println!("\n  ★ steam returned after {:.1}s (rc=0): it handed the launch to the already-running", elapsed);
+        println!("    Steam client, so the game is starting on its own — WITHOUT this tool's pin. This");
+        println!("    session did NOT route the game. Pin a Steam game with the launch-options recipe above.");
+        let _ = std::io::stdout().flush();
+    }
+
     // ★ THE TAIL — what the OTHER cards actually did. A feature you cannot see is indistinguishable
     // from one that is broken, and the loads are silent by design (ffmpeg's output goes to /dev/null).
     // So say it plainly, per card, and say "alive for" rather than claiming work was done.
@@ -4214,7 +4315,8 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
 // `rest` and be EXECUTED as the game. Printed here, byte-for-byte, so all three builds can share it.
 const PLAY_USAGE: &str = r#"usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] [--work FILE [--work-outdir DIR] [--split]] [--spare NODE,...] -- <game command...>
 
-Play a game on the strongest card, with every other card doing real work beside it.
+Play a game on the card your monitor is plugged into. The other cards do nothing unless you ask
+for it with --work (a real transcode) or --test-load (a bounded synthetic check).
 
 options:
   -h, --help            show this help message and exit

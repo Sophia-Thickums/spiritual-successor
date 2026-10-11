@@ -2325,14 +2325,17 @@ static std::pair<string, string> va_driver(const J &g) {
 // ★ A REAL JOB DOES NOT REACH A MARGINAL CARD UNLESS THE USER NAMES IT (from outside design review,
 // 2026-10-11). A benchmark that enumerated every display device reached a card sitting on an external
 // dock, the card latched its own thermal alarm, and the machine went down. A user typing `spirit play
-// --work film.mp4 -- game` did not ask for that. A card on a narrow link or behind an external bridge
-// is usable — it is just not a default we assume on their behalf. `--spare <node>` includes it.
+// --work film.mp4 -- game` did not ask for that. A card on a narrow link is usable — it is just not a
+// default we assume on their behalf. `--spare <node>` includes it.
+//
+// ★ `capped_by_topology` IS NOT A PROXY FOR "BEHIND AN EXTERNAL BRIDGE". It fires whenever the card's
+// OWN bridge reports wider than the host gives — the NORMAL case for every modern AMD card, because
+// Vega, Navi and RDNA all contain an internal PCIe switch. Only a genuinely NARROW link (below x4) is
+// marginal; that is the only rule. This matches Python's `_marginal` byte for byte.
 static std::optional<string> marginal_reason(const J &g) {
     const J *L = jget(g, "link");
     auto w = L ? ifield(*L, "max_width") : std::nullopt;
-    if (w && *w < 4) return "x" + std::to_string(*w) + " link at the host";
-    if (L && bfield(*L, "capped_by_topology"))
-        return "the host link is narrower than the card reports (x" + py_str_int(w) + ")";
+    if (w && *w < 4) return "x" + std::to_string(*w) + " link at the host — too narrow to use unasked";
     return std::nullopt;
 }
 
@@ -2495,6 +2498,37 @@ static bool is_wine_target(const vector<string> &cmd) {
     return false;
 }
 
+// True if this launches the STEAM CLIENT itself (or a `steam://` URL) rather than the game. `steam`
+// is not a Wine target, so the old code wrapped it in the fake-root namespace — and Steam's own
+// bin_steam.sh refuses as root. Worse, when the client is ALREADY running, `steam -applaunch` /
+// `steam://` hands the request to it and returns at once, so the game starts with none of our
+// environment (unpinned) while the tool prints a normal exit. This tool cannot pin a process the
+// Steam client starts, so the second wall is skipped for it, exactly as Python's `_is_steam_launcher`.
+static bool is_steam_launcher(const vector<string> &cmd) {
+    for (const string &a : cmd) {
+        if (a.rfind("steam://", 0) == 0) return true;
+        size_t sl = a.rfind('/');
+        string b = (sl == string::npos) ? a : a.substr(sl + 1);
+        for (char &c : b) c = (char)tolower((unsigned char)c);
+        if (b == "steam") return true;
+    }
+    return false;
+}
+
+// True if unprivileged user namespaces WORK here, false if they are denied, nullopt if no `unshare`.
+// Cached once per process like Python's _USERNS_CACHE. Mirrors spirit.py::_userns_available.
+static std::optional<bool> userns_available() {
+    static bool done = false;
+    static std::optional<bool> cache;
+    if (done) return cache;
+    done = true;
+    if (!which("unshare")) { cache = std::nullopt; return cache; }
+    vector<string> argv = {"unshare", "-Urm", "true"};
+    ProcResult r = run_capture_both(argv, nullptr, 10);
+    cache = r.ok ? std::optional<bool>(r.rc == 0) : std::optional<bool>(false);
+    return cache;
+}
+
 // The Steam install that has a `steamapps` directory, or nullopt. Never guessed from a path shape.
 static std::optional<string> steam_root() {
     for (const string &c : {home_dir() + "/.steam/steam", home_dir() + "/.local/share/Steam"}) {
@@ -2591,7 +2625,7 @@ static void ensure_compatdata(const vector<string> &cmd) {
 // at xwayland/sockets.c:83 "not owned by root or us". gamescope goes OUTSIDE this function; only
 // the game is inside. Build here, call from the caller.
 static vector<string> hidden_argv(const vector<string> &cmd, const J &main, const J &db) {
-    if (is_wine_target(cmd)) return cmd;
+    if (is_wine_target(cmd) || is_steam_launcher(cmd)) return cmd;
     vector<string> hide;
     const J *ga = gpus_arr(db);
     if (ga) for (auto &g : ga->arr) {
@@ -2599,7 +2633,29 @@ static vector<string> hidden_argv(const vector<string> &cmd, const J &main, cons
         for (const string &n : {sfield(g, "card"), sfield(g, "render_node")})
             if (!n.empty()) hide.push_back(n);
     }
-    if (!hide.empty() && which("unshare")) {
+    if (!hide.empty()) {
+        auto avail = userns_available();
+        if (!avail) {
+            // ★ A MISSING `unshare` IS NOT SILENT ANY MORE (§2 item 13). It used to just return the
+            // command, so a machine without the binary got no wall and no message.
+            printf("  wall: unshare is not installed — only the pin separates the game from the "
+                   "other cards' device nodes.\n");
+            fflush(stdout);
+            return cmd;
+        }
+        if (!*avail) {
+            // ★ THE FALLBACK THAT KEEPS THE GAME LAUNCHING (§1 item 1). On Ubuntu 24.04 or a Debian
+            // with `unprivileged_userns_clone=0`, `unshare -r` FAILS. The old code wrapped the launch
+            // in it anyway, so the game never started — and the tool reported the session as normal.
+            // A wall that cannot be built must never stop a launch: fall back to the pin alone, and
+            // SAY SO rather than weakening the wall in silence.
+            printf("  wall: the second wall is unavailable here — unprivileged user namespaces are "
+                   "denied on this machine, so the game\n");
+            printf("        launches WITHOUT the namespace; only the pin separates it from the other "
+                   "cards' device nodes.\n");
+            fflush(stdout);
+            return cmd;
+        }
         string script =
             "hide=\"$1\"; shift; for n in $hide; do "
             "if [ -e \"/dev/dri/$n\" ]; then "
@@ -2678,7 +2734,7 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
         spares = kept;
     }
 
-    printf("spirit play — the game on the strongest card, every other card working the tail\n\n");
+    printf("spirit play — the game on your monitor card; the other cards stay idle unless you give them work\n\n");
     const J *L = jget(*main, "link");
     auto xw = L ? ifield(*L, "max_width") : std::nullopt;
     string mgen = L ? s_or_none(*L, "max_gen") : "None";
@@ -2691,7 +2747,7 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
         string sn = utf8_cpslice(sfield(*g, "name"), 30);
         string rn = sfield(*g, "render_node");
         if (rn.empty()) rn = "?";
-        printf("  SPARE (offload)  %-6s %-30s node /dev/dri/%s\n", sfield(*g, "card").c_str(),
+        printf("  SPARE (idle unless asked)  %-6s %-30s node /dev/dri/%s\n", sfield(*g, "card").c_str(),
                pad_display(sn, 30).c_str(), rn.c_str());
     }
 
@@ -2931,7 +2987,7 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
         // as the tool being broken; saying nothing runs on the other cards makes the default honest.
         printf("  no job given — your other cards will stay idle.\n");
         printf("          give them a real job:      spirit play --work FILE -- CMD\n");
-        printf("          check they can be driven:  spirit doctor\n");
+        printf("          check they can be driven:  spirit play --test-load 60 -- CMD\n");
     } else if (!work.empty() && do_offload) {
         // ★ An absent tool must be SAID, not silently skipped (the README promises exactly this, and
         // the promise was false for ffmpeg). Found 2026-10-11 by an outside review.
@@ -3208,7 +3264,8 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
 // Printed here, byte-for-byte, so all three builds can share it.
 static const char *PLAY_USAGE = R"PLAY(usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] [--work FILE [--work-outdir DIR] [--split]] [--spare NODE,...] -- <game command...>
 
-Play a game on the strongest card, with every other card doing real work beside it.
+Play a game on the card your monitor is plugged into. The other cards do nothing unless you ask
+for it with --work (a real transcode) or --test-load (a bounded synthetic check).
 
 options:
   -h, --help            show this help message and exit
