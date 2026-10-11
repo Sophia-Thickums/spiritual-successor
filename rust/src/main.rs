@@ -49,6 +49,11 @@ fn lossless_dir() -> String {
     format!("{}/.local/share/Steam/steamapps/common/Lossless Scaling", home)
 }
 
+// ★ THE WITNESS — the only instrument that can see an INSERTED frame. Our own Vulkan layer,
+// installed system-wide, INERT unless SPIRIT_PRESENT_COUNT names a file.
+const COUNTER_LAYER: &str = "/usr/share/vulkan/implicit_layer.d/VkLayer_SPIRIT_present_counter.json";
+const COUNTER_LIB: &str = "/usr/local/lib/libspirit_present_counter.so";
+
 const DRM: &str = "/sys/class/drm";
 const PCI: &str = "/sys/bus/pci/devices";
 
@@ -1921,6 +1926,39 @@ fn run(db: &Json, role: &str, card: &str, cmd: &[String]) -> i32 {
 // scale up — gamescope FSR 1.0) and FRAME GEN (interpolate extra frames — lsfg-vk, which the
 // user must own; we detect it and drive it, we never ship it).
 
+/// (state, detail) for the present counter. READY / PARTIAL / ABSENT — never a silent pass.
+fn counter_state() -> (String, String) {
+    if !Path::new(COUNTER_LAYER).exists() {
+        return (
+            "ABSENT".into(),
+            "the present counter layer is not installed, so frame-gen output can only \
+be ASSERTED, not measured"
+                .into(),
+        );
+    }
+    if !Path::new(COUNTER_LIB).exists() {
+        return (
+            "PARTIAL".into(),
+            format!("manifest is present but {} is missing", COUNTER_LIB),
+        );
+    }
+    (
+        "READY".into(),
+        "present counter installed — frame-gen output is measurable".into(),
+    )
+}
+
+/// The counter file is a fixed-width decimal the layer rewrites on every present.
+fn read_counter(path: &str) -> i64 {
+    let raw = fs::read_to_string(path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if raw.is_empty() {
+        return 0;
+    }
+    py_int(&raw).unwrap_or(0)
+}
+
 /// (state, detail). READY / ABSENT / PARTIAL / UNKNOWN — never a silent pass.
 fn gamescope_state() -> (String, String) {
     if which("gamescope").is_none() {
@@ -2129,6 +2167,11 @@ fn boost(db: &Json) -> i32 {
     println!("  FRAME GENERATION — interpolated frames. The big multiplier, and the one that needs");
     println!("  software we do not ship: lsfg-vk, which requires owning Lossless Scaling.");
     println!("    lsfg-vk   : {} {}", ljust(&ls_state, 11), ls_detail);
+    let (c_state, c_detail) = counter_state();
+    println!("    witness   : {} {}", ljust(&c_state, 11), c_detail);
+    println!("                (our own present counter, below the frame-gen layer — the only");
+    println!("                 instrument that can see an INSERTED frame; without it a frame-gen");
+    println!("                 claim is an assertion, not a measurement)");
     println!();
     if gs_state == "READY" {
         println!("  ⇒ Upscaling is available NOW:   spirit play --scale 0.7 -- <your game>");
@@ -2342,6 +2385,132 @@ fn is_wine_target(cmd: &[String]) -> bool {
     false
 }
 
+/// The Steam install that has a `steamapps` directory, or None. Never guessed from a path shape.
+fn steam_root() -> Option<String> {
+    let home = env::var("HOME").unwrap_or_default();
+    for c in [
+        format!("{}/.steam/steam", home),
+        format!("{}/.local/share/Steam", home),
+    ] {
+        if Path::new(&format!("{}/steamapps", c)).is_dir() {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// Python `re.search(r"steamapps/common/([^/]+)/", s)` — the folder name after `steamapps/common/`.
+fn steamapps_common_folder(s: &str) -> Option<String> {
+    let needle = "steamapps/common/";
+    let mut from = 0;
+    while let Some(rel) = s[from..].find(needle) {
+        let start = from + rel + needle.len();
+        let rest = &s[start..];
+        if let Some(end) = rest.find('/') {
+            if end > 0 {
+                return Some(rest[..end].to_string());
+            }
+        }
+        from = start;
+    }
+    None
+}
+
+/// Python `re.search(r'"installdir"\s*"([^"]+)"', txt)` — the value of the `installdir` key.
+fn installdiry(txt: &str) -> Option<String> {
+    let needle = "\"installdir\"";
+    let i = txt.find(needle)?;
+    let rest = txt[i + needle.len()..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    if end == 0 {
+        return None;
+    }
+    Some(rest[..end].to_string())
+}
+
+/// The Steam appid that owns this launch, resolved through the manifest's `installdir`.
+///
+/// ★ NOT PARSED OFF THE PATH SPELLING. The manifest is the surface that owns the mapping; returns
+/// None rather than a guess — an appid invented here would create the wrong directory.
+fn appid_for_cmd(cmd: &[String]) -> Option<String> {
+    let steam = steam_root()?;
+    let apps = format!("{}/steamapps", steam);
+    let mut wanted: Vec<String> = Vec::new();
+    for a in cmd {
+        if let Some(f) = steamapps_common_folder(a) {
+            if !wanted.contains(&f) {
+                wanted.push(f);
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return None;
+    }
+    let mut manifests: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = fs::read_dir(&apps) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("appmanifest_") && name.ends_with(".acf") {
+                manifests.push(Path::new(&apps).join(&name));
+            }
+        }
+    }
+    manifests.sort();
+    for mf in manifests {
+        let txt = match fs::read_to_string(&mf) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if let Some(v) = installdiry(&txt) {
+            if wanted.contains(&v) {
+                let base = mf.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                let inner = base
+                    .strip_prefix("appmanifest_")
+                    .unwrap_or(&base)
+                    .strip_suffix(".acf")
+                    .unwrap_or(&base)
+                    .to_string();
+                return Some(inner);
+            }
+        }
+    }
+    None
+}
+
+/// Create `steamapps/compatdata/<appid>/` when it is absent, before a Proton launch.
+///
+/// ★ Proton's `setup_prefix()` locks a file INSIDE `compatdata/<appid>/`; if the DIRECTORY does not
+/// exist, Proton dies with a bare FileNotFoundError it cannot create its way out of. One
+/// `create_dir_all` is the whole fix; a no-op for a title that has run before.
+fn ensure_compatdata(cmd: &[String]) {
+    if !is_wine_target(cmd) {
+        return;
+    }
+    let appid = match appid_for_cmd(cmd) {
+        Some(a) => a,
+        None => return,
+    };
+    let steam = match steam_root() {
+        Some(s) => s,
+        None => return,
+    };
+    let d = Path::new(&steam).join("steamapps").join("compatdata").join(&appid);
+    if d.join("pfx").is_dir() {
+        return; // a real prefix is already there; touch nothing
+    }
+    let made = !d.is_dir();
+    if let Err(e) = fs::create_dir_all(&d) {
+        println!("  prefix: could not create {} ({})", d.to_string_lossy(), e);
+        return;
+    }
+    if made {
+        println!("  prefix: FIRST-EVER LAUNCH of appid {} — created {}", appid, d.to_string_lossy());
+        println!("          (Proton's own prefix setup crashes on a missing compatdata dir; it cannot");
+        println!("           create the directory it needs, because its lock file lives inside it)");
+    }
+}
+
 fn hidden_argv(cmd: &[String], main: &Json, db: &Json) -> Vec<String> {
     if is_wine_target(cmd) {
         return cmd.to_vec();
@@ -2536,9 +2705,30 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
         }
     }
 
+    // ★ ARM THE WITNESS. Only meaningful with frame gen on; harmless otherwise, and we say so
+    // plainly if it is missing rather than reporting a frame-gen claim we could not measure.
+    let mut fg_count_path: Option<String> = None;
+    if framegen.is_some() {
+        let (cst, cdet) = counter_state();
+        if cst == "READY" {
+            let path = std::env::temp_dir().join(format!("spirit-presents-{}.txt", std::process::id()));
+            let path_s = path.to_string_lossy().to_string();
+            let _ = fs::remove_file(&path);
+            env_pins.push(("SPIRIT_PRESENT_COUNT".into(), path_s.clone().into()));
+            fg_count_path = Some(path_s);
+            println!("  witness: counting images presented to the compositor (summary at exit)");
+        } else {
+            println!("  witness: UNAVAILABLE — {}", cdet);
+        }
+    }
+
     if is_wine_target(&cmd) {
         println!("  wall: Proton/Wine detected — skipping the mount namespace (Wine refuses to run as");
         println!("        root, and `unshare -r` makes us root); the exclusive pin still applies.");
+        // ★ Before the launch, make sure Proton has somewhere to put its prefix. A first-ever
+        // launch otherwise dies inside Proton with a bare FileNotFoundError on a lock file in a
+        // directory Proton cannot create. Cheap, idempotent, and it speaks only when it mattered.
+        ensure_compatdata(&cmd);
     }
 
     let mut procs: Vec<Child> = Vec::new();
@@ -2748,7 +2938,7 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
     } else {
         println!("  game exited (rc={}) — test load stopped", rc);
     }
-    let elapsed = t_game.elapsed().as_secs_f64();
+    let elapsed = f64::max(t_game.elapsed().as_secs_f64(), 1e-6);
 
     // ★ THE TAIL — what the OTHER cards actually did. A feature you cannot see is indistinguishable
     // from one that is broken, and the loads are silent by design (ffmpeg's output goes to /dev/null).
@@ -2781,6 +2971,20 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
             }
         }
     }
+    if let Some(ref fg_path) = fg_count_path {
+        let n = read_counter(fg_path);
+        println!();
+        println!("  ── WITNESS ─────────────────────────────────────────────────────────");
+        println!("  images presented to the compositor : {}", n);
+        println!("  wall time                          : {:.1} s", elapsed);
+        println!("  presented rate                     : {:.1} /s", n as f64 / elapsed);
+        println!("  ★ This is the number frame generation moves, and the ONLY number it moves.");
+        println!("    The game's own FPS counter cannot see it — that counts frames the GAME");
+        println!("    rendered, which frame gen does not change. Expect the game's figure to be");
+        println!("    LOWER with frame gen on: it is now paying for the interpolation.");
+        println!("    Honest limit: an image handed to the compositor is not proof it was scanned");
+        println!("    out, and no counter can tell you whether the interpolated frames look right.");
+    }
     if rc == 0 {
         0
     } else {
@@ -2789,13 +2993,99 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
 }
 
 // ── arg parsing / main ────────────────────────────────────────────────────────────────────
+// ★ `play` is hand-parsed (it has to pass an arbitrary game command through untouched), so
+// neither an argparse parser nor `play --help` exists for it — the flag used to fall through to
+// `rest` and be EXECUTED as the game. Printed here, byte-for-byte, so all three builds can share it.
+const PLAY_USAGE: &str = r#"usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] [--work FILE [--work-outdir DIR] [--split]] [--spare NODE,...] -- <game command...>
+
+Play a game on the strongest card, with every other card doing real work beside it.
+
+options:
+  -h, --help            show this help message and exit
+  --no-offload          run the game alone; no other card does work
+  --scale F             render at F of native and let gamescope upscale it (0.3-1.0)
+  --framegen N          frame generation at Nx, via lsfg-vk (2, 3 or 4)
+  --overlay             show MangoHud over the game, via mangoapp
+  --work FILE           transcode FILE on the spare cards while you play (a real job)
+  --work-outdir DIR     where a job's output goes (default: beside FILE)
+  --split               divide ONE job across the spare cards instead of one job each
+  --spare NODE,...      only use these render nodes, e.g. renderD130,renderD131
+
+  A job is not stopped with the game. Every output is checked on disk afterwards: a
+  half-finished transcode reported as done is the failure this tool exists not to make."#;
+
+// ★ `ui` — the local page. ONE Python file, shared by all three builds rather than three
+// reimplementations of an HTTP server; this build finds it and hands off. Same lookup order and the
+// same failure line in every build, so `spirit ui` behaves identically whoever compiled what.
+const UI_USAGE: &str = r#"usage: spirit ui [-h] [--port PORT] [--no-open] [--print-url]
+
+Open a local page for this tool: your cards and what each one is for, whether
+upscaling and frame generation are available here, and a box to launch your game.
+
+It listens on 127.0.0.1 only, so nothing outside this machine can reach it.
+
+options:
+  -h, --help        show this help message and exit
+  --port PORT       serve on this port instead of a free one
+  --no-open         do not open a browser
+  --print-url       print the URL and keep running"#;
+
+/// Beside the running program, then up to four directories above it (a C++ binary in `cpp/` or a
+/// Rust one in `rust/target/release/`), then where install.sh puts it. Mirrors spirit.py's `_ui_path`.
+fn ui_path() -> Option<PathBuf> {
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Ok(selfp) = std::fs::read_link("/proc/self/exe") {
+        let mut cur = selfp.parent().map(|p| p.to_path_buf());
+        for _ in 0..5 {
+            match cur {
+                Some(d) => {
+                    cands.push(d.join("spirit_ui.py"));
+                    cur = d.parent().map(|p| p.to_path_buf());
+                }
+                None => break,
+            }
+        }
+    }
+    if let Some(h) = env::var_os("HOME") {
+        cands.push(PathBuf::from(h).join(".local/share/spirit/spirit_ui.py"));
+    }
+    cands.into_iter().find(|p| p.is_file())
+}
+
+fn ui(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{}", UI_USAGE);
+        return 0;
+    }
+    match ui_path() {
+        Some(p) => {
+            let mut cmd = Command::new("python3");
+            cmd.arg(p);
+            for a in args {
+                cmd.arg(a);
+            }
+            match cmd.status() {
+                Ok(st) => st.code().unwrap_or(1),
+                Err(_) => 1,
+            }
+        }
+        None => {
+            eprintln!(
+                "spirit ui: spirit_ui.py was not found. Run install.sh, or put spirit_ui.py beside \
+                 spirit.py."
+            );
+            1
+        }
+    }
+}
+
 fn print_help(cmd: Option<&str>) {
     match cmd {
         None => {
-            println!("usage: spirit [-h] {{probe,roles,plan,doctor,boost,fg}} ...");
+            println!("usage: spirit [-h] {{probe,roles,plan,doctor,origin,boost,fg}} ...");
             println!();
             println!("Spiritual Successor — put every GPU to work");
-            println!("commands: probe · roles · plan · doctor · origin · fg · boost · run · play  (`run` and `play` take a command after `--`)");
+            println!("commands: probe · roles · plan · doctor · fg · boost · run · play · ui  (`run` and `play` take a command after `--`)");
             println!();
             println!("positional arguments:");
             println!("  {{probe,roles,plan,doctor,origin,boost,fg}}");
@@ -2860,12 +3150,12 @@ fn sub_usage(cmd: &str) -> &'static str {
         "origin" => "usage: spirit origin [-h] [--check]",
         "fg" => "usage: spirit fg [-h] [--res RES] [--mode {present-on-secondary,round-trip}]",
         "boost" => "usage: spirit boost [-h]",
-        _ => "usage: spirit [-h] {probe,roles,plan,doctor,boost,fg} ...",
+        _ => "usage: spirit [-h] {probe,roles,plan,doctor,origin,boost,fg} ...",
     }
 }
 
 fn err_top(msg: &str) -> i32 {
-    eprintln!("usage: spirit [-h] {{probe,roles,plan,doctor,boost,fg}} ...");
+    eprintln!("usage: spirit [-h] {{probe,roles,plan,doctor,origin,boost,fg}} ...");
     eprintln!("spirit: error: {}", msg);
     2
 }
@@ -2883,6 +3173,12 @@ fn main() {
 }
 
 fn dispatch(argv: &[String]) -> i32 {
+    // ★ THE MARK, ON EVERY RUN — printed first, exactly as the Python `main()` does before argparse
+    // ever sees the argv. Skipped only for --json (a machine is reading) and for `origin` itself.
+    if !argv.iter().any(|a| a == "--json") && !argv.iter().any(|a| a == "origin") {
+        origin_cmd(false);
+    }
+
     if argv.is_empty() {
         print_help(None);
         return 1;
@@ -2897,10 +3193,8 @@ fn dispatch(argv: &[String]) -> i32 {
         return origin_cmd(check);
     }
 
-    // ★ THE MARK, ON EVERY RUN. Skipped only for --json, where a machine is reading and a stray
-    // line would break it. A tampered build cannot silence the warning inside origin_cmd.
-    if !argv.iter().any(|a| a == "--json") {
-        origin_cmd(false);
+    if argv[0] == "ui" {
+        return ui(&argv[1..]);
     }
 
     // `run` — hand-parsed
@@ -2999,6 +3293,10 @@ fn dispatch(argv: &[String]) -> i32 {
             } else if argv[i] == "--overlay" {
                 overlay = true;
                 i += 1;
+            } else if argv[i] == "-h" || argv[i] == "--help" {
+                // ★ Without this, `play --help` fell through to `rest` and was executed as the game.
+                println!("{}", PLAY_USAGE);
+                return 0;
             } else if argv[i] == "--" {
                 rest = argv[i + 1..].to_vec();
                 break;

@@ -97,6 +97,10 @@ compare "no args"                       ""
 compare "empty subcommand arg"          ""          ""
 compare "top-level --help"              ""          --help
 for c in probe roles plan doctor fg boost; do compare "$c -h" "" "$c" -h; done
+compare "ui -h"                         ""          ui -h
+compare "ui --help"                     ""          ui --help
+compare "play --help"                    ""          play --help
+compare "play -h"                       ""          play -h
 compare "unknown subcommand"            ""          frobnicate
 compare "unrecognized arg (probe)"      ""          probe --bogus
 compare "unrecognized trailing"         ""          probe --json extra
