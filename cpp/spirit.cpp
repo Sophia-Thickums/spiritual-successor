@@ -1902,6 +1902,19 @@ static std::pair<string, pid_t> start_work(const string &node, const string &src
     return {out, spawn_detached(argv, env)};
 }
 
+// The card's short name, as the role table prints it.
+static string gpu_name(const J &g) {
+    string n = sfield(g, "name");
+    if (n.empty()) n = sfield(g, "card");
+    for (const char *cut : {"[", "(", "  "}) {
+        size_t i = n.find(cut);
+        if (i != string::npos && i > 0) n = n.substr(0, i);
+    }
+    while (!n.empty() && n.back() == ' ') n.pop_back();
+    if (n.size() > 22) n = n.substr(0, 22);
+    return n;
+}
+
 // True if this is a Proton/Wine launch, where the mount-namespace wall MUST be skipped.
 // MEASURED 2026-10-10: `unshare -r` maps our uid to 0 inside, and Wine/Proton REFUSE TO RUN AS
 // ROOT — the launch dies with `bin_steam.sh: Error: Cannot run as root user` before the game ever
@@ -2175,6 +2188,7 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
         for (auto &c : inner) gs.push_back(c);
         inner = gs;
     }
+    time_t t_game = time(nullptr);
     int rc = spawn_wait(inner, env, false);
     // A TEST LOAD IS A LOAD AND DIES WITH THE GAME. A JOB IS NOT: killing a half-finished transcode
     // leaves a truncated file and calls it done. Jobs are WAITED FOR, then each output is checked
@@ -2214,6 +2228,32 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
         }
     } else {
         printf("\n  game exited (rc=%d) — test load stopped\n", rc);
+    }
+    double elapsed = difftime(time(nullptr), t_game);
+
+    // ★ THE TAIL — what the OTHER cards actually did. A feature you cannot see is indistinguishable
+    // from one that is broken, and the loads are silent by design (ffmpeg's output goes to /dev/null).
+    // So say it plainly, per card, and say "alive for" rather than claiming work was done.
+    if (!procs.empty() || !job_outputs.empty()) {
+        printf("\n  ── THE TAIL — what the other cards did ───────────────────────────────\n");
+        if (!job_outputs.empty()) {
+            for (auto &jo : job_outputs) {
+                struct stat st;
+                bool ok = stat(jo.second.c_str(), &st) == 0;
+                string nm = "?";
+                for (auto *g : spares) if (base_of(sfield(*g, "render_node")) == jo.first) nm = gpu_name(*g);
+                printf("  %-12s %-22s REAL JOB  %s\n", jo.first.c_str(), nm.c_str(),
+                       ok ? jo.second.c_str() : "FAILED — no file");
+            }
+        } else {
+            for (auto *g : spares) {
+                string node = base_of(sfield(*g, "render_node"));
+                if (node.empty()) continue;
+                printf("  %-12s %-22s SYNTHETIC TEST LOAD — alive for %.0f s of the session,\n",
+                       node.c_str(), gpu_name(*g).c_str(), elapsed);
+                printf("  %-12s %-22s produced nothing (a job needs --work FILE)\n", "", "");
+            }
+        }
     }
     return rc == 0 ? 0 : rc;
 }

@@ -2315,6 +2315,20 @@ fn start_work(
     Ok((out, ch))
 }
 
+/// The card's short name, as the role table prints it.
+fn gpu_name(g: &Json) -> String {
+    let mut n = g.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if n.is_empty() {
+        n = g.get("card").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+    }
+    for cut in ["[", "(", "  "] {
+        if let Some(i) = n.find(cut) { if i > 0 { n = n[..i].to_string(); } }
+    }
+    n = n.trim_end().to_string();
+    if n.len() > 22 { n = n[..22].to_string(); }
+    n
+}
+
 fn is_wine_target(cmd: &[String]) -> bool {
     for a in cmd {
         let b = Path::new(a)
@@ -2672,6 +2686,7 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
         gs.extend(inner);
         inner = gs;
     }
+    let t_game = std::time::Instant::now();
     let rc = spawn_argv(&inner, &env_pins);
     // A TEST LOAD IS A LOAD AND DIES WITH THE GAME. A JOB IS NOT: killing a half-finished transcode
     // leaves a truncated file and calls it done. Jobs are WAITED FOR, then each output is checked
@@ -2732,6 +2747,39 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
         }
     } else {
         println!("  game exited (rc={}) — test load stopped", rc);
+    }
+    let elapsed = t_game.elapsed().as_secs_f64();
+
+    // ★ THE TAIL — what the OTHER cards actually did. A feature you cannot see is indistinguishable
+    // from one that is broken, and the loads are silent by design (ffmpeg's output goes to /dev/null).
+    // So say it plainly, per card, and say "alive for" rather than claiming work was done.
+    if !procs.is_empty() || !job_outputs.is_empty() {
+        println!();
+        println!("  ── THE TAIL — what the other cards did ───────────────────────────────");
+        if !job_outputs.is_empty() {
+            for (node, out) in &job_outputs {
+                let ok = std::path::Path::new(out).is_file();
+                let nm = spares
+                    .iter()
+                    .find(|g| {
+                        let r = g.get("render_node").and_then(|v| v.as_str()).unwrap_or("");
+                        r.rsplit('/').next().unwrap_or(r) == node
+                    })
+                    .map(gpu_name)
+                    .unwrap_or_else(|| "?".to_string());
+                println!("  {:<12} {:<22} REAL JOB  {}", node, nm,
+                         if ok { out.clone() } else { "FAILED — no file".to_string() });
+            }
+        } else {
+            for g in &spares {
+                let r = g.get("render_node").and_then(|v| v.as_str()).unwrap_or("");
+                let node = r.rsplit('/').next().unwrap_or(r);
+                if node.is_empty() { continue; }
+                println!("  {:<12} {:<22} SYNTHETIC TEST LOAD — alive for {:.0} s of the session,",
+                         node, gpu_name(g), elapsed);
+                println!("  {:<12} {:<22} produced nothing (a job needs --work FILE)", "", "");
+            }
+        }
     }
     if rc == 0 {
         0
