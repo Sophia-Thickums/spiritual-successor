@@ -896,3 +896,55 @@ cannot fake.
 **And the control is built in:** the SAME game with the SAME offload froze for several seconds when
 unpinned and chose the MI25; pinned to the XT it is clean through combat and traversal. **The variable
 was the pin, not the offload.**
+
+
+---
+
+## TEST P — SUPERPOSITION 8K OPTIMIZED, RE-RUN ON THE 250 W CAP (2026-10-10, 19:01:30–19:04:27)
+
+**Why this run happened and what it is:** the owner asked for Superposition. Its CLI is already falsified
+here (TEST H, TEST M part 4 — four variants, every one forced back to 1600x900), so the **GUI launcher
+is the only path and it cannot be driven headlessly**; the owner drove it by hand and saved the score to the
+desktop. **This is a CONTROL, not a frame-gen result** — Superposition's Linux build is OpenGL and lsfg-vk
+is a Vulkan layer, so frame generation cannot engage. What it measures is the cost of the power cap.
+
+### The pair (same preset, same resolution, same machine)
+
+| | 2026-10-09 8K Optimized (uncapped) | 2026-10-10 8K Optimized (250 W cap) |
+|---|---|---|
+| **Avg FPS** | **54.76** | **53.99**  (−1.4%) |
+| Min / Max FPS | 45.62 / 65.10 | 45.57 / 63.23 |
+| XT **peak power** | **417 W** | **288 W**  (−31%) |
+| XT **peak temp** | **89 °C** | **80 °C**  (−9 °C) |
+
+**⇒ THE HEADLINE: capping the 9070 XT from ~417 W to 250 W costs about 1.4% of an 8K score and buys 31%
+less peak power and 9 °C off the peak temperature.**
+
+### Our telemetry, computed from `tools/sp-8k-run-20261010.csv` (156 samples at >30% busy)
+```
+XT 9070   busy   mean 99.3 %  median 100   max 100
+          edge   mean 53.6 C  max 57.0
+          junction mean 76.5 C  median 77.0  max 80.0     <- the hot spot that throttles
+          mem    mean 71.6 C  max 76.0
+          power  mean 248.6 W  median 249   max 288       <- the 250 W cap, holding on the mean
+MI25 / Vega FE / iGPU: busy 0.0 % — this was a clean single-card run, no offload
+```
+The config in the engine log confirms it is a real 8K run: `Preset: 5 (8K Optimized)` and
+`render_virtual_resolution 7680 4320`, benchmark running 19:01:30 → 19:04:27 (177 s).
+
+### ★ THE BENCHMARK'S OWN TEMPERATURE IS NOW LOCATED, NOT JUST CALLED BROKEN
+It reports `GPU °C: Min 32.0, Max 57.0`. **Our edge max on the same run is 57.0 — to the decimal.** So its
+reading is a REAL sensor: it is the **edge** die temperature, reported as "GPU °C". The junction ran
+**76.5 °C mean / 80.0 peak**, so it understates the hot spot by ~23 °C. Refine the standing note: this
+build's GPU temperature is not fabricated, it is **the wrong channel** — quote edge or junction only when
+you say which, and never quote its figure as the card's temperature.
+
+### Honest limits
+- **n=1 on each side.** The two Avg figures differ by 0.77 fps (1.4%), which is inside plausible
+  run-to-run noise for this benchmark — so the defensible claim is **"the score did not meaningfully
+  move"**, not a precise 1.4% figure.
+- **Ambient differed and it favours the OLD number:** the 10-09 run had an a fan blowing into the
+  case at full blast (recorded then); today's did not. Lower power AND a 9 °C lower peak under worse
+  ambient makes the thermal half conservative, and the power/score comparison is unaffected.
+- Superposition's own "ASUS RX 9070/9070 XT **512 MB**" and "RAM 30GB" lines are still mis-detects; ignore
+  its hardware block. It does correctly enumerate all four cards by name (it calls the MI25 a "PRO V320").

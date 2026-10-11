@@ -747,13 +747,43 @@ def _main_card(db):
     return max(panel or db["gpus"], key=score)
 
 
-def _start_encode(node):
-    """A REAL encode on a spare card that needs NO input file, so it works out of the box."""
+def _start_test_load(node):
+    """A SYNTHETIC load on a spare card: ffmpeg's OWN generated test pattern, piped to /dev/null.
+
+    ★ WHY THIS IS NAMED A LOAD AND NOT A JOB (2026-10-10 — the owner asked "are we offloading REAL JOBS
+    onto the other GPUs?", and the honest answer was no). This function used to be called
+    `_start_encode`, and the README said the spare cards "get a job" and "do real work". The encoder
+    silicon genuinely runs — that is why the busy counters move — but the input is `testsrc2`, a test
+    card ffmpeg synthesises, and the output goes to `-f null`. Nothing anyone cares about is faster
+    or finished because of it. **A load proves a card can be DRIVEN. A job produces something.**
+    `--work FILE` is the job. Never describe this as one, in code, in output, or in the README.
+    """
     return subprocess.Popen(
         ["ffmpeg", "-hide_banner", "-loglevel", "error",
          "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=60",
          "-vaapi_device", "/dev/dri/%s" % node,
          "-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-f", "null", "-"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env={**os.environ, "LIBVA_DRIVER_NAME": "radeonsi"})
+
+
+def _start_work(node, src, outdir):
+    """A REAL job on a spare card: transcode `src` with THAT card's encoder, to a real file.
+
+    The honest version of the offload. The input is a file that exists, the output is a file the user
+    can open, and the card doing the work is NOT the card their game is on. This is the shape the
+    e-waste mission actually needs: an old, mismatched, lesser card doing useful work while you play,
+    at no cost to the game.
+
+    Returns `(out_path, Popen)`. Uses the card's VAAPI encoder (H.264); on this box every amdgpu
+    exposes one, including the 2017 Vega 10 parts.
+    """
+    stem = os.path.splitext(os.path.basename(src))[0] or "job"
+    out = os.path.join(outdir, "%s.%s.mp4" % (stem, os.path.basename(node)))
+    return out, subprocess.Popen(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", src,
+         "-vaapi_device", "/dev/dri/%s" % node,
+         "-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-b:v", "8M", out],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         env={**os.environ, "LIBVA_DRIVER_NAME": "radeonsi"})
 
@@ -776,6 +806,82 @@ def _is_wine_target(cmd):
         if b.endswith(".exe") or "proton" in b or b == "wine" or b.startswith("wine"):
             return True
     return False
+
+
+def _steam_root():
+    """The Steam install that has a `steamapps` directory, or None. Never guessed from a path shape."""
+    for c in (os.path.expanduser("~/.steam/steam"), os.path.expanduser("~/.local/share/Steam")):
+        if os.path.isdir(os.path.join(c, "steamapps")):
+            return c
+    return None
+
+
+def _appid_for_cmd(cmd):
+    """The Steam appid that owns this launch, resolved through the manifest's `installdir`.
+
+    ★ NOT PARSED OFF THE PATH SPELLING. A game folder can be called anything, and the number in a
+    launch line may be an argument to somebody else's script. The manifest is the surface that owns
+    the mapping: `appmanifest_<appid>.acf` carries `"installdir" "<folder>"`, and that is what is
+    matched. Returns None rather than a guess — an appid invented here would create the wrong
+    directory, which is worse than creating none.
+    """
+    steam = _steam_root()
+    if not steam:
+        return None
+    apps = os.path.join(steam, "steamapps")
+    wanted = set()
+    for a in cmd:
+        m = re.search(r"steamapps/common/([^/]+)/", str(a))
+        if m:
+            wanted.add(m.group(1))
+    if not wanted:
+        return None
+    for mf in sorted(glob.glob(os.path.join(apps, "appmanifest_*.acf"))):
+        try:
+            txt = open(mf, errors="replace").read()
+        except OSError:
+            continue
+        im = re.search(r'"installdir"\s*"([^"]+)"', txt)
+        if im and im.group(1) in wanted:
+            return os.path.basename(mf)[len("appmanifest_"):-len(".acf")]
+    return None
+
+
+def _ensure_compatdata(cmd):
+    """Create `steamapps/compatdata/<appid>/` when it is absent, before a Proton launch.
+
+    ★ WHY, AND WHY IT BELONGS IN THE TOOL (traced to Proton's own source, 2026-10-10). Proton's
+    `setup_prefix()` does `with self.prefix_lock:` — and that lock file lives INSIDE
+    `compatdata/<appid>/`. If the DIRECTORY does not exist, Proton dies with a bare
+    `FileNotFoundError: .../pfx.lock` and CANNOT create it, because creating it is the step it was
+    about to fail on. So the first-ever launch of any Proton title through this tool fails with a
+    Python traceback from inside Proton, which is a terrible first impression for a stranger and
+    looks like our bug.
+
+    One `os.makedirs` is the whole fix. It is a no-op for a title that has run before, so it is safe
+    to call unconditionally, and it says plainly when it just made a first-ever launch work.
+    """
+    if not _is_wine_target(cmd):
+        return
+    appid = _appid_for_cmd(cmd)
+    if not appid:
+        return
+    steam = _steam_root()
+    if not steam:
+        return
+    d = os.path.join(steam, "steamapps", "compatdata", appid)
+    if os.path.isdir(os.path.join(d, "pfx")):
+        return                      # a real prefix is already there; touch nothing
+    made = not os.path.isdir(d)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError as e:
+        print("  prefix: could not create %s (%s)" % (d, e))
+        return
+    if made:
+        print("  prefix: FIRST-EVER LAUNCH of appid %s — created %s" % (appid, d))
+        print("          (Proton's own prefix setup crashes on a missing compatdata dir; it cannot")
+        print("           create the directory it needs, because its lock file lives inside it)")
 
 
 def _hidden_argv(cmd, main, db):
@@ -812,10 +918,11 @@ def _spawn_hidden(cmd, env, main, db):
     return subprocess.call(_hidden_argv(cmd, main, db), env=env)
 
 
-def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False):
+def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
+         work=None, work_outdir=None):
     if not cmd:
-        print("usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] -- <game command...>",
-              file=sys.stderr)
+        print("usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] "
+              "[--work FILE [--work-outdir DIR]] -- <game command...>", file=sys.stderr)
         return 1
     main = _main_card(db)
     spares = [g for g in db["gpus"] if g["card"] != main["card"]]
@@ -888,15 +995,48 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False):
     if _is_wine_target(cmd):
         print("  wall: Proton/Wine detected — skipping the mount namespace (Wine refuses to run as")
         print("        root, and `unshare -r` makes us root); the exclusive pin still applies.")
+        # ★ Before the launch, make sure Proton has somewhere to put its prefix. A first-ever
+        # launch otherwise dies inside Proton with a bare FileNotFoundError on a lock file in a
+        # directory Proton cannot create. Cheap, idempotent, and it speaks only when it mattered.
+        _ensure_compatdata(cmd)
 
     procs = []
+    job_outputs = []
     if do_offload and shutil.which("ffmpeg"):
-        for g in spares:
-            n = g.get("render_node")
-            if n:
-                procs.append(_start_encode(n))
-        if procs:
-            print("  offload: %d real h264 VAAPI encode(s) running on the spare cards" % len(procs))
+        if work:
+            # ★ A REAL JOB. Real input, real output, on cards that are NOT the one running the game.
+            if not os.path.isfile(work):
+                print("  work: REFUSED — %r is not a file. A job needs a real input; the synthetic "
+                      "test load is what runs when you do not give one." % work)
+                return 1
+            outdir = os.path.abspath(work_outdir or ".")
+            try:
+                os.makedirs(outdir, exist_ok=True)
+            except OSError as e:
+                print("  work: REFUSED — cannot use %s (%s)" % (outdir, e))
+                return 1
+            for g in spares:
+                n = g.get("render_node")
+                if not n:
+                    continue
+                out, p = _start_work(n, work, outdir)
+                procs.append(p)
+                job_outputs.append((os.path.basename(n), out))
+            if procs:
+                print("  ★ JOB: transcoding %s on %d spare card(s) — real input, real output."
+                      % (os.path.basename(work), len(procs)))
+                for node, out in job_outputs:
+                    print("      %s -> %s" % (node, out))
+        else:
+            for g in spares:
+                n = g.get("render_node")
+                if n:
+                    procs.append(_start_test_load(n))
+            if procs:
+                print("  cards: %d spare card(s) running a SYNTHETIC TEST LOAD" % len(procs))
+                print("         (ffmpeg's own testsrc2 test pattern -> /dev/null). This proves the")
+                print("         cards can be DRIVEN; it is not a job and produces nothing.")
+                print("         For real work: spirit play --work <file> [--work-outdir DIR] -- <game>")
     print("\n  launching…\n")
     sys.stdout.flush()
 
@@ -930,10 +1070,31 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False):
     try:
         rc = subprocess.call(inner, env=env)
     finally:
-        for p in procs:
-            p.terminate()
+        # ★ A TEST LOAD IS A LOAD AND DIES WITH THE GAME. A JOB IS NOT: terminating a half-finished
+        # transcode leaves a truncated file and calls it done, which is the corrupt-quietly failure
+        # this whole project has a law about. So jobs are WAITED FOR, then each output is checked for
+        # existence and size on disk — the artifact, not the process's word for it.
+        if work:
+            for p in procs:
+                try:
+                    p.wait()
+                except Exception:
+                    pass
+        else:
+            for p in procs:
+                p.terminate()
     elapsed = max(time.time() - t0, 1e-6)
-    print("\n  game exited (rc=%s) — offload stopped" % rc)
+    if work:
+        print("\n  game exited (rc=%s) — the job ran to completion (not stopped with the game)" % rc)
+        print("  ── JOB OUTPUT " + "─" * 56)
+        for node, out in job_outputs:
+            if os.path.isfile(out):
+                print("  %-14s %s  (%.1f MB)" % (node, out, os.path.getsize(out) / 1048576.0))
+            else:
+                print("  %-14s MISSING — %s was not written. The job failed; do not report it as done."
+                      % (node, out))
+    else:
+        print("\n  game exited (rc=%s) — test load stopped" % rc)
 
     if fg_count_path:
         n = _read_counter(fg_count_path)
@@ -974,9 +1135,22 @@ def main():
     # `play` also takes an arbitrary game command — parse by hand, same reason as `run`.
     if argv and argv[0] == "play":
         offload, rest, i, scale, framegen, overlay = True, [], 1, None, None, False
+        work, work_outdir = None, None
         while i < len(argv):
             if argv[i] == "--no-offload":
                 offload = False; i += 1
+            elif argv[i] == "--work":
+                # ★ REAL WORK, not the synthetic test load. The input must exist; a job that
+                # cannot name what it is working on is not a job.
+                if i + 1 >= len(argv):
+                    print("spirit play: --work needs a file, e.g. --work capture.mkv", file=sys.stderr)
+                    return 2
+                work = argv[i + 1]; i += 2
+            elif argv[i] == "--work-outdir":
+                if i + 1 >= len(argv):
+                    print("spirit play: --work-outdir needs a directory", file=sys.stderr)
+                    return 2
+                work_outdir = argv[i + 1]; i += 2
             elif argv[i] == "--scale":
                 try:
                     scale = float(argv[i + 1])
@@ -1003,7 +1177,7 @@ def main():
         if framegen is not None and framegen not in (2, 3, 4):
             print("spirit play: --framegen must be 2, 3 or 4", file=sys.stderr)
             return 2
-        return play(probe(), rest, offload, scale, framegen, overlay)
+        return play(probe(), rest, offload, scale, framegen, overlay, work, work_outdir)
 
     ap = argparse.ArgumentParser(
         prog="spirit",
