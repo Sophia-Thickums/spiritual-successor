@@ -66,7 +66,9 @@ real display. In REAL mode the stubs are removed.
   `SPIRIT_VAAPI_DEVICE` for the right roles; then executes the command with that env.
 * **`play()`** — picks the monitor card, spawns `unshare -rm sh -c '<bind-mount wall>'`
   hiding the other cards' `/dev/dri` nodes, starts real h264 VAAPI encoders on the
-  spares, launches the game, and terminates the encoders on exit.
+  spares (the VAAPI driver is chosen per card from its own kernel driver; a card with no
+  known encoder is named as SKIPPED), launches the game, then polls the encoders before
+  terminating them — so the tail reports what each card actually did, not what we hoped.
 * **`fg()`** — the frame-gen handoff arithmetic, including the original's `--res`
   parsing quirk.
 * **`doctor()`** — probe-links / routing-isolation / telemetry / role-plan checks, then

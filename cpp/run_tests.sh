@@ -106,6 +106,23 @@ cmp_stdout() {
     else echo "FAIL  $label"; fail=$((fail+1)); diff "$WORK/py.out" "$WORK/cpp.out" | head -30; fi
 }
 
+# ★ THE LIVE PROBE FLAPS, AND IT MADE THIS SUITE FLAKY (fix 2026-10-11). One field — the
+# "[idle now: x16 GenN]" suffix — comes and goes with the card's own low-power link state between two
+# invocations milliseconds apart. It is a live measurement of the MACHINE, not a property of a build,
+# and the --json comparison below already strips the same field (idle_degraded) for exactly this
+# reason. Unstripped, this single case failed roughly one run in four — and a suite that fails at
+# random is not evidence of anything. Strip it here too.
+cmp_probe_real() {
+    label=$1; shift
+    run_py  "$@" 2>/dev/null | sed 's/ *\[idle now: [^]]*\]//' > "$WORK/py.out"
+    run_cpp "$@" 2>/dev/null | sed 's/ *\[idle now: [^]]*\]//' > "$WORK/cpp.out"
+    if diff -q "$WORK/py.out" "$WORK/cpp.out" >/dev/null; then
+        echo "PASS  $label (live link suffix normalized)"; pass=$((pass+1))
+    else
+        echo "FAIL  $label"; fail=$((fail+1)); diff "$WORK/py.out" "$WORK/cpp.out" | head -30
+    fi
+}
+
 # ── PHASE 1: deterministic fake fleet ─────────────────────────────────────────
 echo "=== PHASE 1: SPIRIT_DEVICES = fleet-10.example.json  (deterministic, child-only) ==="
 FAKE="$FLEET"
@@ -220,7 +237,7 @@ echo
 echo "=== PHASE 2: real box (SPIRIT_DEVICES unset, no stubs on PATH) ==="
 FAKE=""
 export PATH="${PATH#"$STUB:"}"
-cmp_cmd "probe (real)"           probe
+cmp_probe_real "probe (real)"    probe
 cmp_cmd "roles (real)"           roles
 cmp_cmd "roles --json (real)"    roles --json
 cmp_cmd "plan framegen (real)"   plan --workload 1440p60-framegen

@@ -16,7 +16,10 @@ cards, two of them from 2017, transcoded 240 seconds of 1080p while the gaming c
 Different makers, different ages, different speeds. Two cards, four cards, or the graphics built into
 your processor sitting next to a real card. That is the normal case, not a complication.
 
-Linux. No root. No dependencies.
+Linux. No root. No packages to install — it is one Python file. It drives tools your machine may already
+have: ffmpeg for the jobs, gamescope for upscaling, `unshare` for the second wall. It says so when one is
+missing rather than failing quietly. The optional frame-gen witness is the only piece that wants root,
+and you do not have to install it.
 
 Three builds of the same tool: Python, C++, Rust. All three produce identical output — tested, not
 claimed.
@@ -35,8 +38,10 @@ claimed.
   should have, and the other cards go and do something else entirely.
 - **Not a way to make your game faster.** Your spare cards do not add frames to it. The win is the work
   they do while you play.
-- **Not Nvidia.** The pinning is Mesa-based, so AMD and Intel work today. Nvidia's driver does not give
-  the same control.
+- **Not Nvidia.** The pinning is Mesa-based, and the jobs run on a card's own video encoder — today
+  that means AMD (`radeonsi`) or Intel (`iHD`). An Nvidia card can be the card your game runs on, but it
+  cannot take the offload, and the tool names it as skipped rather than leaving it idle and saying
+  nothing.
 
 ---
 
@@ -56,23 +61,48 @@ nothing, and the tool says so rather than letting you assume otherwise.
 
 ## How you can see it happened
 
-When your game exits, the tool prints what each other card actually did:
+When your game exits, the tool prints what each other card actually did. A divided job, three cards,
+300 seconds each:
 
 ```
-  ── THE TAIL ───────────────────────────────────────────────────────────
-  renderD129   Instinct MI25 (2017)   REAL JOB  lecture.part1.mkv  (279 MB, 300.0 s)
-  renderD130   Vega FE (2017)         REAL JOB  lecture.part2.mkv  (279 MB, 300.0 s)
-  renderD131   Radeon 610M            REAL JOB  lecture.part3.mkv  (286 MB, 300.0 s)
+  ── JOB OUTPUT ────────────────────────────────────────────────────────
+  renderD131     lecture.renderD131_part1.mp4  (286.0 MB, 300.0s)
+  renderD129     lecture.renderD129_part2.mp4  (279.0 MB, 300.0s)
+  renderD130     lecture.renderD130_part3.mp4  (279.0 MB, 300.0s)
+  ── SPLIT CHECK ───────────────────────────────────────────────────────
+  slices written      : 3 of 3
+  slice durations sum : 900.0s
+  original duration   : 900.0s
+  ⇒ COMPLETE — the pieces reconstruct the whole input (within 1%).
+  ── THE TAIL — what the other cards did ───────────────────────────────
+  renderD131   Ryzen iGPU             REAL JOB  .../lecture.renderD131_part1.mp4
+  renderD129   Instinct MI25          REAL JOB  .../lecture.renderD129_part2.mp4
+  renderD130   Vega Frontier Edition  REAL JOB  .../lecture.renderD130_part3.mp4
 ```
 
-If you use frame generation, it also prints the one number frame generation actually moves — and it
-measures that itself, from *below* the frame-gen layer, with a small Vulkan layer it ships
-(`present-counter/`). No game counter and no overlay can see those frames; the game's own number goes
-**down**, because it is now paying for the interpolation. On the test machine the same 300 frames of
-work produced **300** presented images with frame generation off and **1200** with it on at 4x.
+Every output is checked on disk afterwards — it exists, and its duration adds up. A slice that did not
+get written says `MISSING` and the split says `INCOMPLETE`. Nothing here takes a process's exit code
+for an answer.
 
-What that does not tell you is whether the invented frames *look right*. No counter can. That one you
-look at.
+A card the tool cannot drive is named rather than quietly left out:
+
+```
+  spare: SKIPPED renderD134 (Tesla P40) — no VAAPI encoder this tool knows of (kernel driver: nvidia)
+```
+
+If you use frame generation, the tool also prints the one number frame generation actually moves — and
+it measures that itself, from *below* the frame-gen layer, with a small Vulkan layer it ships
+(`present-counter/`). No game counter and no overlay can see those frames. On the test machine the same
+300 frames of work produced **300** presented images with frame generation off and **1200** with it on
+at 4x.
+
+Your game's own counter is a different thing and it cannot see them: it counts the frames the game
+rendered, and with frame generation on the game may be doing less work, because it is now paying for the
+interpolation. On one title here that figure fell about 9%; on another it did not move at all. Either
+way it cannot see what was added, which is why the tool carries its own witness.
+
+What the witness does not tell you is whether the invented frames *look right*. No counter can. That one
+you look at.
 
 ## Install
 
