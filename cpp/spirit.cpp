@@ -1949,10 +1949,10 @@ static vector<string> hidden_argv(const vector<string> &cmd, const J &main, cons
 
 static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                     std::optional<double> scale, std::optional<int> framegen, bool overlay,
-                    string work, string work_outdir, bool split) {
+                    string work, string work_outdir, bool split, string only_spares) {
     if (cmd_in.empty()) {
         fprintf(stderr, "usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] "
-                        "[--work FILE [--work-outdir DIR] [--split]] -- <game command...>\n");
+                        "[--work FILE [--work-outdir DIR] [--split]] [--spare NODE,...] -- <game command...>\n");
         return 1;
     }
     vector<string> cmd = cmd_in;
@@ -1962,6 +1962,34 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
     const J *ga = gpus_arr(db);
     if (ga) for (auto &g : ga->arr)
         if (sfield(g, "card") != sfield(*main, "card")) spares.push_back(&g);
+    if (!only_spares.empty()) {
+        // ★ --spare NODE[,NODE...] — the human names the cards that work. Everything else is left
+        // alone entirely, not merely idle. A real session runs for hours unattended, and an old card
+        // on a marginal link is the human's risk to take, not a default we assume for them.
+        vector<string> want;
+        for (size_t i = 0, j = 0; i <= only_spares.size(); i++)
+            if (i == only_spares.size() || only_spares[i] == ',' || only_spares[i] == ' ') {
+                if (i > j) want.push_back(only_spares.substr(j, i - j));
+                j = i + 1;
+            }
+        vector<const J *> kept;
+        for (auto *g : spares)
+            for (const string &w : want)
+                if (base_of(sfield(*g, "render_node")) == w) kept.push_back(g);
+        if (kept.empty()) {
+            printf("  spare: REFUSED — none of those render nodes is a spare card here. The game would\n"
+                   "         run with no cards working beside it.\n");
+            return 1;
+        }
+        string kepts;
+        for (auto *g : kept) {
+            if (!kepts.empty()) kepts += ", ";
+            kepts += base_of(sfield(*g, "render_node"));
+        }
+        printf("  spare: %d of %d card(s) allowed to work: %s\n", (int)kept.size(), (int)spares.size(),
+               kepts.c_str());
+        spares = kept;
+    }
 
     printf("spirit play — the game on the strongest card, every other card working the tail\n\n");
     const J *L = jget(*main, "link");
@@ -2309,10 +2337,17 @@ int main(int argc, char **argv) {
         size_t i = 1;
         std::optional<double> scale;
         std::optional<int> framegen;
-        string work, work_outdir;
+        string work, work_outdir, only_spares;
         bool split = false;
         while (i < args.size()) {
             if (args[i] == "--no-offload") { offload = false; i += 1; }
+            else if (args[i] == "--spare") {
+                if (i + 1 >= args.size()) {
+                    fprintf(stderr, "spirit play: --spare needs render nodes, e.g. --spare renderD130,renderD131\n");
+                    return 2;
+                }
+                only_spares = args[i + 1]; i += 2;
+            }
             else if (args[i] == "--split") { split = true; i += 1; }
             else if (args[i] == "--work") {
                 // REAL WORK, not the synthetic test load. The input must exist.
@@ -2357,7 +2392,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "spirit play: --framegen must be 2, 3 or 4\n");
             return 2;
         }
-        return play_cmd(probe(), rest, offload, scale, framegen, overlay, work, work_outdir, split);
+        return play_cmd(probe(), rest, offload, scale, framegen, overlay, work, work_outdir, split,
+                        only_spares);
     }
 
     if (args.empty()) { print_help(); return 1; }
