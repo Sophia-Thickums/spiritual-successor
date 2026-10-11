@@ -1346,9 +1346,12 @@ static int plan_cmd(const J &db, const string &workload, std::optional<long long
     printf("  payload: %.2f MB %s\n", S / 1e6, w.has_res ? "per frame" : "per token");
     printf("  sustained one-way: %.2f GB/s\n\n", per_sec / 1e9);
     if (vram_mib && *vram_mib) {
-        printf("  VRAM asked: %d MiB (measured on this box: a light load costs ~800 MiB, a GPU-bound"
-               " 4K load ~8,200 MiB — ~10x)\n\n",
+        // ★ THESE ARE FIGURES WE ACTUALLY MEASURED (fix 2026-10-11, final review). The previous line
+        // quoted ~800 MiB and ~8,200 MiB, and neither appears anywhere in this project's log. What the
+        // log does have is below, each from a named run.
+        printf("  VRAM asked: %d MiB — for scale, measured here: a 4K benchmark peaks at 1,514 MiB,\n",
                (int)*vram_mib);
+        printf("  an 8K benchmark at 6,898 MiB, and a real open-world game at 10,692 MiB.\n\n");
     }
     printf("  %-8s %-11s %-10s %-9s %-8s %s\n", "card", "link GB/s", "capacity", "verdict", "VRAM",
            "arithmetic");
@@ -1413,7 +1416,6 @@ static int plan_cmd(const J &db, const string &workload, std::optional<long long
 // ─────────────────────────────────────────────────────────────────────────────
 // fg
 // ─────────────────────────────────────────────────────────────────────────────
-static const std::map<string, double> HANDOFF_GBPS = {{"card0", 0.76}, {"card2", 0.25}, {"card3", 2.91}};
 static const std::map<string, double> FRAME_MIB = {{"1080p", 8.29}, {"1440p", 14.75}, {"4k", 33.18}};
 
 static int fg_cmd(const J &db, const string &res_in, const string &mode) {
@@ -1446,19 +1448,26 @@ static int fg_cmd(const J &db, const string &res_in, const string &mode) {
 
     printf("spirit fg — can a card carry the frame-gen/upscale pass for %s@%d?\n\n", res.c_str(), hznum);
     printf("  frame payload: %.2f MiB    frame budget: %.2f ms\n\n", payload, budget);
-    printf("  %-8s %-12s %-14s %-12s %s\n", "card", "handoff", "one-way ms", "round-trip ms", "verdict");
+    printf("  %-8s %-12s %-14s %-12s %s\n", "card", "link bound", "one-way ms", "round-trip ms", "verdict");
     printf("  %s\n", string(84, '-').c_str());
 
     const J *ga = gpus_arr(db);
     if (ga) for (auto &g : ga->arr) {
         string c = sfield(g, "card");
-        auto it = HANDOFF_GBPS.find(c);
-        if (it == HANDOFF_GBPS.end()) {
+        // ★ THIS TOOL CANNOT KNOW YOUR MACHINE'S HANDOFF RATE (fix 2026-10-11, found by the final
+        // outside read). This table used to be keyed by card NAME — card0/card2/card3 — and those names
+        // are not portable: a stranger's card0 inherited the MI25's measured rate and was handed a
+        // FEASIBLE/INFEASIBLE verdict about hardware we have never seen. The rate is a property of the
+        // LINK and the driver, so what is computed here is an UPPER BOUND from the card's OWN measured
+        // host link — and the gap between that bound and reality is stated below, not hidden.
+        const J *L = jget(g, "link");
+        auto link = L ? ffield(*L, "gbps_max") : std::nullopt;
+        if (!link || *link == 0.0) {
             printf("  %-8s %-12s %-14s %-12s %s\n", c.c_str(), "n/a", "-", "-",
-                   "not a card pair here / not measured");
+                   "no host link could be read for this card");
             continue;
         }
-        double rate = it->second;
+        double rate = *link;
         double ow = payload / 1024.0 / rate * 1000.0;
         double rt = ow * 2;
         string verdict, arith;
@@ -1474,15 +1483,17 @@ static int fg_cmd(const J &db, const string &res_in, const string &mode) {
         }
         arith = bb;
         char hb[64];
-        snprintf(hb, sizeof(hb), "%.2f GB/s", rate);
+        snprintf(hb, sizeof(hb), "<=%.2f GB/s", rate);
         printf("  %-8s %-12s %-14.2f %-12.2f %s (%s)\n", c.c_str(), hb, ow, rt, verdict.c_str(),
                arith.c_str());
     }
     printf("\n  ★ ARCHITECTURE RULE, from measurement: put the DISPLAY on the card doing the frame-gen, so a\n");
     printf("    frame crosses ONE WAY. A round trip doubles the cost and is the first thing to fail.\n");
-    printf("  ★ The handoff table above is MEASURED ON THE DEV BOX and is a property of its links — on any\n");
-    printf("    other machine re-measure it before trusting a verdict. RADV lands the import in a\n");
-    printf("    HOST-VISIBLE aperture heap, so these are aperture rates, not peer-VRAM rates.\n");
+    printf("  ★ THE VERDICT ABOVE IS AN UPPER BOUND, NOT A MEASUREMENT. It assumes a frame crosses at the\n");
+    printf("    link's own rate. It does not: on the dev box the real handoff ran at roughly a tenth to a\n");
+    printf("    third of the link rate, because RADV lands the import in a HOST-VISIBLE aperture heap. So a\n");
+    printf("    card marked INFEASIBLE is definitely out, and a card marked FEASIBLE may still be out —\n");
+    printf("    measure it on your own machine before trusting the last column.\n");
     return 0;
 }
 
@@ -1766,148 +1777,406 @@ static int boost_cmd(const J &db) {
 // ─────────────────────────────────────────────────────────────────────────────
 // doctor
 // ─────────────────────────────────────────────────────────────────────────────
-static std::optional<int> isolation_count(const string &vid, const string &did) {
+// What a child sees with the exclusive device-select applied to ONE card (outside review).
+struct IsoResult {
+    int rc = 0;
+    int count = 0;
+    vector<std::pair<long long, long long>> ids;   // [(vendor, device), ...]
+};
+
+static std::optional<IsoResult> pinned_isolation(const string &vid, const string &did) {
     if (!which("vulkaninfo")) return std::nullopt;
     vector<string> env = current_env();
     set_env(env, "MESA_VK_DEVICE_SELECT", vid + ":" + did + "!");
-    auto out = run_capture({"vulkaninfo", "--summary"}, &env);
-    if (!out) return std::nullopt;
-    int cnt = 0;
+    ProcResult r = run_capture_both({"vulkaninfo", "--summary"}, &env, 30);
+    if (!r.ok) return std::nullopt;
+    IsoResult res;
+    res.rc = r.rc;
+    const string &out = r.out;
     size_t pos = 0;
-    while ((pos = out->find("deviceName", pos)) != string::npos) { cnt++; pos += 10; }
-    return cnt;
+    while ((pos = out.find("deviceName", pos)) != string::npos) { res.count++; pos += 10; }
+    vector<long long> vids, dids;
+    std::regex rv("vendorID\\s*=\\s*(0x[0-9a-fA-F]+)");
+    std::regex rd("deviceID\\s*=\\s*(0x[0-9a-fA-F]+)");
+    for (std::sregex_iterator it(out.begin(), out.end(), rv), e; it != e; ++it)
+        vids.push_back(strtoll((*it)[1].str().c_str(), nullptr, 16));
+    for (std::sregex_iterator it(out.begin(), out.end(), rd), e; it != e; ++it)
+        dids.push_back(strtoll((*it)[1].str().c_str(), nullptr, 16));
+    size_t n = vids.size() < dids.size() ? vids.size() : dids.size();
+    for (size_t i = 0; i < n; i++) res.ids.push_back({vids[i], dids[i]});
+    return res;
+}
+
+// (vendor, device) as ints from a probe record, or nullopt if it cannot be parsed.
+static std::optional<std::pair<long long, long long>> card_ids(const J &g) {
+    string v = sfield(g, "vendor"), d = sfield(g, "device");
+    if (v.empty() || d.empty()) return std::nullopt;
+    char *ev = nullptr, *ed = nullptr;
+    long long vi = strtoll(v.c_str(), &ev, 16);
+    long long di = strtoll(d.c_str(), &ed, 16);
+    if (ev == v.c_str() || ed == d.c_str()) return std::nullopt;
+    return std::make_pair(vi, di);
+}
+
+// ★ READ INDEPENDENTLY OF THE ROLE ENGINE (helper for doctor's display-card check). It reads sysfs
+// itself so the check can DISAGREE with what the role engine decided, or it is a mirror rather than a
+// check.
+static string base_of(const string &path); // defined below (play section)
+static vector<string> connector_names(const string &card) {
+    vector<string> names;
+    for (const string &entry : glob_prefix("/sys/class/drm", card + "-")) {
+        string base = base_of(entry);
+        string name = base.size() > card.size() ? base.substr(card.size() + 1) : string();
+        if (!name.empty() && read_trim(entry + "/status")) names.push_back(name);
+    }
+    return names;
+}
+
+// ★ READ `enabled`, NOT `status` (outside review). `status` says what is PLUGGED IN — the same predicate
+// the role engine used to pick the main card, so it could never disagree. `enabled` says what is
+// DRIVING a display, which can: a second card with an enabled output is a cross-GPU present.
+static vector<string> enabled_connectors(const string &card) {
+    vector<string> out;
+    for (const string &name : connector_names(card)) {
+        auto e = read_trim("/sys/class/drm/" + card + "-" + name + "/enabled");
+        if (e && *e == "enabled") out.push_back(name);
+    }
+    return out;
+}
+
+static string py_str_int(std::optional<long long> v) {
+    return v ? std::to_string(*v) : string("None");
 }
 
 static int doctor(const J &db, bool as_json) {
+    // ★ FOUR VERDICTS, NOT THREE (redesigned 2026-10-11 from outside design review). The old rule was
+    // "any non-PASS is suspicious", which made a working mixed-vendor machine report PROBLEMS FOUND:
+    // the telemetry check read a sysfs file only one vendor exposes, and an integrated GPU has no such
+    // file to read. The states are now defined by what the tool actually depends on:
+    //
+    //     PASS     observed directly, by something that could have come out the other way
+    //     FAIL     observed to be wrong, or something the tool relies on is broken
+    //     N/A      this check does not apply to this card by design, and nothing depends on it
+    //     UNKNOWN  the tool does depend on it, and doctor could not determine it
+    //
+    // Any FAIL -> PROBLEMS FOUND (exit 1). No FAIL but a CORE UNKNOWN (the device pin, or the main
+    // card's link) -> NOT VERIFIED (exit 3). Only non-core UNKNOWNs left -> WORKS, NOT FULLY VERIFIED
+    // (exit 3). Only PASS and N/A -> ALL CHECKS PASSED (exit 0), with the N/A count printed so nobody
+    // reads N/A as a pass. A bare green verdict is never printed over an UNKNOWN.
+    //
+    // ★ EXIT 3, NOT 2 (outside review). argparse usage errors and the SPIRIT_DEVICES refusals both exit
+    // 2, so 2 could not distinguish "not fully verified" from "you typed it wrong".
     vector<J> checks;
     const J *ga = gpus_arr(db);
-    size_t ngpu = ga ? ga->arr.size() : 0;
+    const J *main = main_card(db);          // nullptr when this machine has no GPUs at all (1a.15)
 
-    // A. probe reads a link for every card
-    {
-        vector<string> miss;
-        if (ga) for (auto &g : ga->arr) {
-            const J *L = jget(g, "link");
-            auto v = L ? ffield(*L, "gbps_max") : std::nullopt;
-            if (!v) miss.push_back(sfield(g, "card"));
-        }
+    if (!ga || ga->arr.empty()) {
+        // ★ NO CARDS IS NOT A CRASH (outside review). With nothing to test, the honest verdict is a FAIL.
         J c = J::object();
-        c.put("check", J::str("probe-links"));
-        c.put("verdict", J::str(miss.empty() ? "PASS" : "FAIL"));
-        c.put("detail", J::str(miss.empty() ? "a host link for every card"
-                                            : ("missing links: " + join(miss, ","))));
+        c.put("check", J::str("gpus"));
+        c.put("verdict", J::str("FAIL"));
+        c.put("core", J::boolean(true));
+        c.put("detail", J::str("no GPUs were found on this machine — there is nothing to render on "
+                               "and nothing to test"));
         checks.push_back(std::move(c));
-    }
-
-    // B. routing isolation
-    if (!which("vulkaninfo")) {
-        J c = J::object();
-        c.put("check", J::str("routing-isolation"));
-        c.put("verdict", J::str("UNKNOWN"));
-        c.put("detail", J::str("vulkaninfo not installed — cannot test"));
-        checks.push_back(std::move(c));
-    } else if (ga) {
+    } else {
+        // A. LINKS. The MAIN card's link is CORE (1d.22): the tool cannot vouch for the launch if it
+        //    cannot even read the card it will render on.
         for (auto &g : ga->arr) {
-            string vendor = sfield(g, "vendor"), device = sfield(g, "device");
-            string vid = vendor.size() > 2 ? vendor.substr(2) : string();
-            string did = device.size() > 2 ? device.substr(2) : string();
-            auto n = isolation_count(vid, did);
-            string v, d;
-            if (!n) { v = "UNKNOWN"; d = "could not run a test child"; }
-            else if (*n == 1) { v = "PASS"; d = "a child sees exactly 1 device"; }
-            else { v = "FAIL"; d = "a child sees " + std::to_string(*n) + " devices (expected 1)"; }
+            const J *L = jget(g, "link");
+            auto gb = L ? ffield(*L, "gbps_max") : std::nullopt;
+            bool core = main && sfield(g, "card") == sfield(*main, "card");
+            J c = J::object();
+            c.put("check", J::str("link"));
+            c.put("card", J::str(sfield(g, "card")));
+            if (gb) {
+                auto mw = L ? ifield(*L, "max_width") : std::nullopt;
+                string mg = L ? s_or_none(*L, "max_gen") : "None";
+                c.put("verdict", J::str("PASS"));
+                c.put("core", J::boolean(core));
+                c.put("detail", J::str("x" + py_str_int(mw) + " " + mg +
+                                       " — the minimum negotiated width along the chain"));
+            } else if (bfield(g, "integrated")) {
+                c.put("verdict", J::str("N/A"));
+                c.put("core", J::boolean(core));
+                c.put("detail", J::str("integrated; there is no card link to measure"));
+            } else {
+                c.put("verdict", J::str("UNKNOWN"));
+                c.put("core", J::boolean(core));
+                c.put("detail", J::str("no PCIe link attributes were readable along the chain"));
+            }
+            checks.push_back(std::move(c));
+        }
+
+        // B. ROUTING ISOLATION. The load-bearing pin, so CORE, and it MATCHES THE PINNED ID (1a.2,
+        //    1a.10, 1b.18): a count alone proves the pin CHANGED something, not that it selected the
+        //    right card. A nonzero rc (a loader failure), a count of 0 (the pin matched nothing) and a
+        //    count above 1 (still sees more than one) are kept as SEPARATE states.
+        if (!which("vulkaninfo")) {
             J c = J::object();
             c.put("check", J::str("routing-isolation"));
+            c.put("verdict", J::str("UNKNOWN"));
+            c.put("core", J::boolean(true));
+            c.put("detail", J::str("vulkaninfo (vulkan-tools) is not installed — the device pin, "
+                                   "which the whole launch depends on, cannot be tested at all"));
+            checks.push_back(std::move(c));
+        } else {
+            vector<string> cards;
+            vector<std::optional<IsoResult>> res;
+            for (auto &g : ga->arr) {
+                string vendor = sfield(g, "vendor"), device = sfield(g, "device");
+                string vid = vendor.size() > 2 ? vendor.substr(2) : string();
+                string did = device.size() > 2 ? device.substr(2) : string();
+                cards.push_back(sfield(g, "card"));
+                res.push_back(pinned_isolation(vid, did));
+            }
+            vector<string> untestable, rcbad, zero, multi;
+            for (size_t i = 0; i < res.size(); i++) {
+                if (!res[i]) { untestable.push_back(cards[i]); continue; }
+                if (res[i]->rc != 0) { rcbad.push_back(cards[i]); continue; }
+                if (res[i]->count == 0) { zero.push_back(cards[i]); continue; }
+                if (res[i]->count > 1) { multi.push_back(cards[i]); continue; }
+            }
+            vector<string> mism;
+            for (size_t i = 0; i < ga->arr.size(); i++) {
+                const J &g = ga->arr[i];
+                const std::optional<IsoResult> &v = res[i];
+                if (v && v->rc == 0 && v->count == 1) {
+                    auto want = card_ids(g);
+                    bool match = want && v->ids.size() == 1 &&
+                                 v->ids[0].first == want->first && v->ids[0].second == want->second;
+                    if (!match) mism.push_back(sfield(g, "card"));
+                }
+            }
+            J c = J::object();
+            c.put("check", J::str("routing-isolation"));
+            if (!untestable.empty()) {
+                c.put("verdict", J::str("UNKNOWN"));
+                c.put("core", J::boolean(true));
+                c.put("detail", J::str("a test child could not be run for: " + join(untestable, ", ")));
+            } else if (!rcbad.empty()) {
+                c.put("verdict", J::str("UNKNOWN"));
+                c.put("core", J::boolean(true));
+                c.put("detail", J::str("vulkaninfo returned nonzero (a loader failure, not 'sees more "
+                                       "than one device') for: " + join(rcbad, ", ")));
+            } else if (!zero.empty()) {
+                c.put("verdict", J::str("FAIL"));
+                c.put("core", J::boolean(true));
+                c.put("detail", J::str("the pin matched nothing — a child saw 0 devices for: "
+                                       + join(zero, ", ")));
+            } else if (!multi.empty()) {
+                c.put("verdict", J::str("FAIL"));
+                c.put("core", J::boolean(true));
+                c.put("detail", J::str("a child still sees more than one device for: " + join(multi, ", ")));
+            } else if (!mism.empty()) {
+                c.put("verdict", J::str("FAIL"));
+                c.put("core", J::boolean(true));
+                c.put("detail", J::str("a child saw exactly 1 device, but it is not the card pinned for: "
+                                       + join(mism, ", ")));
+            } else if (ga->arr.size() == 1) {
+                c.put("verdict", J::str("UNKNOWN"));
+                c.put("core", J::boolean(true));
+                c.put("detail", J::str("only one GPU is present, so a child sees 1 device with or "
+                                       "without the pin — the count cannot show the pin selected anything"));
+            } else {
+                c.put("verdict", J::str("PASS"));
+                c.put("core", J::boolean(true));
+                c.put("detail", J::str("a child saw exactly 1 device AND its vendor:device id matches the "
+                                       "card pinned — per card. (A count alone would prove only that the pin "
+                                       "CHANGED something, not which card; the id match is what ties the "
+                                       "surviving device to the pinned one.)"));
+            }
+            checks.push_back(std::move(c));
+        }
+
+        // B2. IDENTICAL CARDS. Not a gap in doctor — a design defect worth failing loudly, because the
+        //     pin genuinely cannot separate them and the user would never guess.
+        {
+            vector<std::pair<std::pair<string, string>, vector<string>>> seen;
+            for (auto &g : ga->arr) {
+                std::pair<string, string> key{sfield(g, "vendor"), sfield(g, "device")};
+                bool found = false;
+                for (auto &kv : seen)
+                    if (kv.first == key) { kv.second.push_back(sfield(g, "card")); found = true; break; }
+                if (!found) seen.push_back({key, {sfield(g, "card")}});
+            }
+            J c = J::object();
+            c.put("check", J::str("individual-pin"));
+            bool dup = false;
+            for (auto &kv : seen) {
+                if (kv.second.size() > 1) {
+                    dup = true;
+                    string v = kv.first.first, d = kv.first.second;
+                    c.put("verdict", J::str("FAIL"));
+                    c.put("detail", J::str(join(kv.second, ", ") + " share " +
+                                           (v.size() > 2 ? v.substr(2) : string()) + ":" +
+                                           (d.size() > 2 ? d.substr(2) : string()) +
+                                           " — the pin selects the model, not the card, so it cannot "
+                                           "tell them apart"));
+                    break;
+                }
+            }
+            if (!dup) {
+                c.put("verdict", J::str("PASS"));
+                c.put("detail", J::str("every card has its own vendor:device id, so a pin can name one"));
+            }
+            checks.push_back(std::move(c));
+        }
+
+        // C. TELEMETRY. ★ NOTHING IN THIS TOOL READS A CARD'S LIVE LOAD (blocking item 4).
+        //    By the four verdicts' own definition that makes it N/A for EVERY kind of card — a check on
+        //    a dependency that does not exist. Kept as N/A, per card, so it is printed and counted.
+        for (auto &g : ga->arr) {
+            J c = J::object();
+            c.put("check", J::str("telemetry"));
             c.put("card", J::str(sfield(g, "card")));
-            c.put("verdict", J::str(v));
-            c.put("detail", J::str(d));
+            c.put("verdict", J::str("N/A"));
+            c.put("detail", J::str("this tool reads a card's TOTAL VRAM (probe) but never its live load, "
+                                   "so no memory counter is required here"));
+            checks.push_back(std::move(c));
+        }
+
+        // D. DISPLAY CARD. ★ READS `enabled`, NOT `status` (blocking item 1). A second
+        //    card with an enabled output is a cross-GPU present, the real risk. Read independently of
+        //    the engine, as before.
+        {
+            vector<std::pair<string, vector<string>>> enabled_cards;
+            for (auto &g : ga->arr) {
+                string card = sfield(g, "card");
+                vector<string> en = enabled_connectors(card);
+                if (!en.empty()) enabled_cards.push_back({card, en});
+            }
+            J c = J::object();
+            c.put("check", J::str("display-card"));
+            if (enabled_cards.empty()) {
+                c.put("verdict", J::str("N/A"));
+                c.put("detail", J::str("no connector has an active CRTC — no display is being driven"));
+            } else {
+                vector<string> names;
+                for (auto &kv : enabled_cards) names.push_back(kv.first);
+                std::sort(names.begin(), names.end());
+                bool main_lit = false;
+                for (auto &kv : enabled_cards)
+                    if (main && kv.first == sfield(*main, "card")) main_lit = true;
+                if (!main_lit) {
+                    c.put("verdict", J::str("FAIL"));
+                    c.put("detail", J::str("rendering was assigned to " +
+                                           (main ? sfield(*main, "card") : string("?")) +
+                                           ", but " + join(names, ", ") + " is driving a display"));
+                } else if (enabled_cards.size() > 1) {
+                    vector<string> others;
+                    for (auto &kv : enabled_cards)
+                        if (!main || kv.first != sfield(*main, "card")) others.push_back(kv.first);
+                    std::sort(others.begin(), others.end());
+                    c.put("verdict", J::str("FAIL"));
+                    c.put("detail", J::str("more than one card is driving a display (" + join(names, ", ") +
+                                           "): the game window can land on " + join(others, ", ") +
+                                           "'s monitor, a cross-GPU present"));
+                } else {
+                    c.put("verdict", J::str("PASS"));
+                    c.put("detail", J::str("the card picked to render (" +
+                                           (main ? sfield(*main, "card") : string("?")) +
+                                           ") is the one driving a display"));
+                }
+            }
+            checks.push_back(std::move(c));
+        }
+
+        // E. THE SECOND WALL. Now doctor says what it found, which is the least it can do.
+        {
+            std::optional<bool> wall;
+            if (which("unshare")) {
+                vector<string> argv = {"unshare", "-Urm", "true"};
+                ProcResult r = run_capture_both(argv, nullptr, 10);
+                if (r.ok) wall = (r.rc == 0);
+            }
+            J c = J::object();
+            c.put("check", J::str("namespace-wall"));
+            if (wall && *wall) {
+                c.put("verdict", J::str("PASS"));
+                c.put("detail", J::str("unprivileged user namespaces are available; the game can be "
+                                       "separated from the other cards' device nodes"));
+            } else if (wall && !*wall) {
+                c.put("verdict", J::str("UNKNOWN"));
+                c.put("detail", J::str("unprivileged user namespaces are NOT available here, so only the pin "
+                                       "separates the game from the other cards"));
+            } else {
+                c.put("verdict", J::str("UNKNOWN"));
+                c.put("detail", J::str("unshare is not installed, so only the pin separates the game from the "
+                                       "other cards"));
+            }
+            checks.push_back(std::move(c));
+        }
+
+        // F. UPSCALING — a path that needs OPTIONAL software. ABSENT (and present but without FSR) is
+        //    DETERMINED, and nothing depends on it unless the user asks for --scale, so N/A, not UNKNOWN
+        //    (blocking item 3).
+        {
+            auto gs = gamescope_state();
+            J c = J::object();
+            c.put("check", J::str("upscaling"));
+            string gv = "UNKNOWN";
+            if (gs.first == "READY") gv = "PASS";
+            else if (gs.first == "ABSENT" || gs.first == "PARTIAL") gv = "N/A";
+            c.put("verdict", J::str(gv));
+            c.put("detail", J::str(gs.first + " — " + gs.second));
+            checks.push_back(std::move(c));
+        }
+
+        // G. FRAME GENERATION — same rule (blocking item 3): ABSENT / disabled / game-not-in-library
+        //    are DETERMINED and optional, so N/A. Only a broken install (the shaders absent) is a FAIL.
+        //    PARTIAL now AGREES with `play` (blocking item 5, ): the missing piece is
+        //    `lsfg-vk-cli`, which this tool never calls, so both report it PASS.
+        {
+            auto ls = lsfg_state();
+            string lv = "UNKNOWN";
+            if (ls.first == "INSTALLED") lv = "PASS";
+            else if (ls.first == "PARTIAL") lv = "PASS";
+            else if (ls.first == "NEEDS-BRANCH") lv = "FAIL";
+            else if (ls.first == "STOOD-DOWN" || ls.first == "ABSENT" || ls.first == "NEEDS-GAME") lv = "N/A";
+            J c = J::object();
+            c.put("check", J::str("frame-generation"));
+            c.put("verdict", J::str(lv));
+            c.put("detail", J::str(ls.first + " — " + ls.second));
             checks.push_back(std::move(c));
         }
     }
 
-    // C. telemetry readable
-    {
-        int n_ok = 0;
-        if (ga) for (auto &g : ga->arr) {
-            if (read_int("/sys/class/drm/" + sfield(g, "card") + "/device/mem_info_vram_used"))
-                n_ok++;
-        }
-        J c = J::object();
-        c.put("check", J::str("telemetry"));
-        c.put("verdict", J::str((size_t)n_ok == ngpu ? "PASS" : "FAIL"));
-        char b[128];
-        snprintf(b, sizeof(b), "VRAM counters readable on %d/%d cards", n_ok, (int)ngpu);
-        c.put("detail", J::str(b));
-        checks.push_back(std::move(c));
+    // ── the verdict rules, stated once ──────────────────────────────────────────────────────────────
+    int nf = 0, nu = 0, ncu = 0, nna = 0;
+    for (auto &c : checks) {
+        string v = sfield(c, "verdict");
+        if (v == "FAIL") nf++;
+        else if (v == "UNKNOWN") { nu++; if (bfield(c, "core")) ncu++; }
+        else if (v == "N/A") nna++;
     }
-
-    // D. role plan
-    {
-        J rp = assign_roles(db, "game");
-        int placed = 0;
-        vector<string> unexplained;
-        for (auto &r : rp.arr) {
-            const J *rls = jget(r, "roles");
-            bool idle = rls && rls->arr.size() == 1 && rls->arr[0].t == J::T::STR && rls->arr[0].s == "idle";
-            const J *why = jget(r, "why");
-            bool why_empty = !why || why->arr.empty();
-            if (!idle) placed++;
-            if (idle && why_empty) unexplained.push_back(sfield(r, "card"));
-        }
-        J c = J::object();
-        c.put("check", J::str("role-plan"));
-        c.put("verdict", J::str((placed && unexplained.empty()) ? "PASS" : "FAIL"));
-        char b[192];
-        snprintf(b, sizeof(b), "places %d/%d cards", placed, (int)rp.arr.size());
-        string det = b;
-        if (!unexplained.empty()) det += "; unexplained idle: " + join(unexplained, ",");
-        c.put("detail", J::str(det));
-        checks.push_back(std::move(c));
+    string overall;
+    int code;
+    if (nf) { overall = "PROBLEMS FOUND"; code = 1; }
+    else if (ncu) {
+        char b[64]; snprintf(b, sizeof(b), "%d", ncu);
+        overall = string("NOT VERIFIED — a core check could not be determined (") + b + ")";
+        code = 3;
     }
-
-    // E. UPSCALING — the path the tool advertises actually exists on this machine.
-    {
-        auto gs = gamescope_state();
-        J c = J::object();
-        c.put("check", J::str("upscaling"));
-        c.put("verdict", J::str(gs.first == "READY" ? "PASS" : "UNKNOWN"));
-        c.put("detail", J::str(gs.first + " — " + gs.second));
-        checks.push_back(std::move(c));
+    else if (nu) {
+        overall = "WORKS, NOT FULLY VERIFIED (" + std::to_string(nu) + " item" + (nu == 1 ? "" : "s") + ")";
+        code = 3;
     }
-
-    // F. FRAME GENERATION — reported honestly; UNKNOWN is never green, and absent is not a
-    //    failure of THIS machine (it needs software the user must own). Only a broken install
-    //    is a FAIL.
-    {
-        auto ls = lsfg_state();
-        // ★ THE VERDICT MUST BE DERIVED FROM THE STATES THIS FUNCTION ACTUALLY RETURNS (fix
-        // 2026-10-11, outside review). This mapped only "READY" and "NOT-WORKING" — and lsfg_state()
-        // returns NEITHER, so the check printed UNKNOWN on every machine that ever ran it, including a
-        // working one. A check that can never reach a verdict is not a cautious check; it is a dead one.
-        string lv = "UNKNOWN";
-        if (ls.first == "INSTALLED") lv = "PASS";
-        else if (ls.first == "NEEDS-BRANCH" || ls.first == "PARTIAL") lv = "FAIL";
-        // STANDS-DOWN / ABSENT / NEEDS-GAME → UNKNOWN
-        J c = J::object();
-        c.put("check", J::str("frame-generation"));
-        c.put("verdict", J::str(lv));
-        c.put("detail", J::str(ls.first + " — " + ls.second));
-        checks.push_back(std::move(c));
-    }
-
-    bool bad = false;
-    for (auto &c : checks) if (sfield(c, "verdict") == "FAIL") bad = true;
-    string overall = bad ? "PROBLEMS FOUND" : "READY";
+    else { overall = "ALL CHECKS PASSED"; code = 0; }
 
     if (as_json) {
         J o = J::object();
         o.put("spirit", J::str("doctor/1.0.0"));
         o.put("overall", J::str(overall));
+        o.put("fails", J::integer(nf));
+        o.put("unknown", J::integer(nu));
+        o.put("core_unknown", J::integer(ncu));
+        o.put("not_applicable", J::integer(nna));
         J arr = J::array();
         for (auto &c : checks) arr.push(c);
         o.put("checks", std::move(arr));
         printf("%s\n", json_dumps_indent2(o).c_str());
-        return bad ? 1 : 0;
+        return code;
     }
 
     printf("spirit doctor — verifying this machine's multi-GPU readiness\n\n");
@@ -1915,16 +2184,28 @@ static int doctor(const J &db, bool as_json) {
         const J *cp = jget(c, "card");
         string card;
         if (cp && cp->t == J::T::STR) {
-            char b[32];
+            char b[64];
             snprintf(b, sizeof(b), "%-6s ", cp->s.c_str());
             card = b;
         }
         printf("  [%-7s] %s%s\n", sfield(c, "verdict").c_str(), card.c_str(),
                sfield(c, "detail").c_str());
     }
-    printf("\n  OVERALL: %s%s\n", overall.c_str(),
-           bad ? " — see FAIL lines above" : "");
-    return bad ? 1 : 0;
+    printf("\n  OVERALL: %s\n", overall.c_str());
+    if (nna)
+        printf("  (%d check%s did not apply here and %s not counted as passes.)\n",
+               nna, nna == 1 ? "" : "s", nna == 1 ? "was" : "were");
+    if (nu) {
+        printf("  An item above could not be determined. That is not a failure, and it is not a pass —\n");
+        printf("  it means the tool cannot vouch for that part on this machine.\n");
+        if (ncu) {
+            printf("  ★ %d of them %s CORE (the device pin, or the main card's link): without those, this\n",
+                   ncu, ncu == 1 ? "is" : "are");
+            printf("    build does not claim the launch works — hence NOT VERIFIED above, not WORKS.\n");
+        }
+    }
+    if (nf) printf("  See the FAIL lines above.\n");
+    return code;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2016,7 +2297,11 @@ static int origin_cmd(bool check_only) {
         printf("     This is a copy of, or derived from: %s\n", ORIGIN_TRUE);
         printf("     Expected mark %s, found %s.\n", string(ORIGIN_SEAL).substr(0, 16).c_str(),
                actual.substr(0, 16).c_str());
-        printf("     Removing this notice is the one thing the licence forbids. Put it back.\n\n");
+        // ★ THIS LINE USED TO OVERSTATE THE LICENCE (corrected 2026-10-11, outside review). It said
+        // removing the notice was "the one thing the licence forbids". MIT forbids nothing of the sort:
+        // it permits modification freely, and requires only that the copyright notice travel with copies.
+        printf("     This banner is not the licence. MIT lets anyone modify this freely — it asks that\n");
+        printf("     the copyright notice travel with copies, not that this line be kept.\n\n");
     }
     return 0;
 }
@@ -2036,14 +2321,36 @@ static std::pair<string, string> va_driver(const J &g) {
     return {"", "no VAAPI encoder this tool knows of (kernel driver: " + (d.empty() ? string("unknown") : d) + ")"};
 }
 
+// Why this card's link is marginal, or nullopt if it is fine.
+// ★ A REAL JOB DOES NOT REACH A MARGINAL CARD UNLESS THE USER NAMES IT (from outside design review,
+// 2026-10-11). A benchmark that enumerated every display device reached a card sitting on an external
+// dock, the card latched its own thermal alarm, and the machine went down. A user typing `spirit play
+// --work film.mp4 -- game` did not ask for that. A card on a narrow link or behind an external bridge
+// is usable — it is just not a default we assume on their behalf. `--spare <node>` includes it.
+static std::optional<string> marginal_reason(const J &g) {
+    const J *L = jget(g, "link");
+    auto w = L ? ifield(*L, "max_width") : std::nullopt;
+    if (w && *w < 4) return "x" + std::to_string(*w) + " link at the host";
+    if (L && bfield(*L, "capped_by_topology"))
+        return "the host link is narrower than the card reports (x" + py_str_int(w) + ")";
+    return std::nullopt;
+}
+
 // A SYNTHETIC load: ffmpeg's OWN generated test pattern (testsrc2), piped to /dev/null. The encoder
 // really runs — that is why the counters move — but the input is a test card and the output is
 // discarded. A LOAD proves a card can be DRIVEN; a JOB produces something. --work is the job.
-static pid_t start_test_load(const string &node, const string &va) {
+//
+// ★ BOUNDED IN TIME, PACED TO REAL TIME (fix 2026-10-11, from the final outside read). The old load ran
+// until the game exited — an uninvited, unbounded workload on every spare card, the shape of the
+// incident where a card on an external dock latched its thermal alarm and took the machine down. It now
+// runs for `cap` seconds of REAL time and stops: `-re` paces the generated input to native frame rate
+// (without it ffmpeg would encode the whole clip in a few seconds and exit), and `-t` bounds it.
+static pid_t start_test_load(const string &node, const string &va, int cap) {
     vector<string> env = current_env();
     set_env(env, "LIBVA_DRIVER_NAME", va);
     vector<string> argv = {"ffmpeg", "-hide_banner", "-loglevel", "error",
-                           "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=60",
+                           "-re", "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=60",
+                           "-t", std::to_string(cap),
                            "-vaapi_device", "/dev/dri/" + node,
                            "-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-f", "null", "-"};
     return spawn_detached(argv, env);
@@ -2308,7 +2615,8 @@ static vector<string> hidden_argv(const vector<string> &cmd, const J &main, cons
 
 static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                     std::optional<double> scale, std::optional<int> framegen, bool overlay,
-                    string work, string work_outdir, bool split, string only_spares) {
+                    string work, string work_outdir, bool split, string only_spares,
+                    std::optional<int> test_load) {
     if (cmd_in.empty()) {
         fprintf(stderr, "usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] "
                         "[--work FILE [--work-outdir DIR] [--split]] [--spare NODE,...] -- <game command...>\n");
@@ -2468,6 +2776,8 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
     vector<std::pair<string, string>> job_outputs;   // (node, out path)
     double job_expect = -1.0;
     string no_job_reason;                             // set when --work was asked for but nothing could start
+    string no_load_reason;                            // set when --test-load was asked for but nothing could start
+    bool load_started = false;                        // True once at least one bounded test load is running
 
     // ★ REFUSE --overlay BEFORE ANYTHING IS SPAWNED (fix 2026-10-11, outside review). This check used
     // to run AFTER the spare cards had already been put to work, so refusing the overlay left the
@@ -2486,22 +2796,44 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
     struct Skip { string node, name, why; };
     vector<std::pair<string, string>> encoders;       // (render_node, va_driver)
     vector<Skip> skipped;                             // (node_or_card, name, reason)
+    vector<Skip> marginal;                            // (render_node, name, why) — usable only if named
     for (auto *g : spares) {
         string node = sfield(*g, "render_node");
         auto vd = va_driver(*g);
-        if (!vd.first.empty() && !node.empty()) {
-            encoders.push_back({base_of(node), vd.first});
-        } else {
+        if (vd.first.empty() || node.empty()) {
             Skip s;
             s.node = node.empty() ? sfield(*g, "card") : base_of(node);
             s.name = gpu_name(*g);
             s.why  = vd.second.empty() ? "no render node" : vd.second;
             skipped.push_back(s);
+            continue;
         }
+        // ★ A REAL JOB DOES NOT REACH A MARGINAL CARD UNLESS THE USER NAMES IT (from outside design
+        // review, 2026-10-11). When the human named the cards with --spare, honour that; otherwise a
+        // card on a narrow link or behind an external bridge is left alone and NAMED before launch.
+        if (only_spares.empty()) {
+            auto mw = marginal_reason(*g);
+            if (mw) {
+                Skip m;
+                m.node = base_of(node);
+                m.name = gpu_name(*g);
+                m.why  = *mw;
+                marginal.push_back(m);
+                continue;
+            }
+        }
+        encoders.push_back({base_of(node), vd.first});
     }
-    if (do_offload && which("ffmpeg")) {
+    bool want_work = !work.empty();
+    bool want_load = test_load.has_value();
+    if (do_offload && (want_work || want_load) && which("ffmpeg")) {
         for (auto &s : skipped)
             printf("  spare: SKIPPED %s (%s) — %s\n", s.node.c_str(), s.name.c_str(), s.why.c_str());
+        const char *_what = work.empty() ? "load" : "job";
+        for (auto &m : marginal) {
+            printf("  %s: NOT using %s (%s) — %s\n", _what, m.node.c_str(), m.name.c_str(), m.why.c_str());
+            printf("       Add --spare %s to include it anyway.\n", m.node.c_str());
+        }
         // ★ NOTHING TO RUN A JOB ON — say it here, before the job block, so the reason is set for the
         // "no job was started" line at the end (A1, fix 2026-10-11).
         if (!work.empty() && encoders.empty()) {
@@ -2578,18 +2910,28 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                         printf("      %s -> %s\n", jo.first.c_str(), jo.second.c_str());
                 }
             }
-        } else {
+        } else if (want_load) {
             for (auto &e : encoders) {
-                pid_t p = start_test_load(e.first, e.second);
+                pid_t p = start_test_load(e.first, e.second, *test_load);
                 if (p > 0) { procs.push_back(p); proc_nodes.push_back(e.first); }
             }
             if (!procs.empty()) {
-                printf("  cards: %d spare card(s) running a SYNTHETIC TEST LOAD\n", (int)procs.size());
-                printf("         (ffmpeg's own testsrc2 test pattern -> /dev/null). This proves the\n");
-                printf("         cards can be DRIVEN; it is not a job and produces nothing.\n");
-                printf("         For real work: spirit play --work <file> [--work-outdir DIR] -- <game>\n");
+                load_started = true;
+                printf("  TEST LOAD on %d card(s) for %ds wall time, then it stops.\n", (int)procs.size(), *test_load);
+                printf("         It writes no file. It only shows these cards can be driven.\n");
+                printf("         For real work: spirit play --work <file> [--split] -- <game>\n");
+            } else {
+                // ★ NO ENCODABLE SPARE IS SAID, NOT SILENT (blocking item 9).
+                no_load_reason = "no spare card on this machine can be driven (see the SKIPPED lines above)";
+                printf("  test-load: no load started — %s\n", no_load_reason.c_str());
             }
         }
+    } else if (work.empty() && !want_load) {
+        // ★ THE DEFAULT, SAID OUT LOUD (from the final outside read). Doing nothing silently would read
+        // as the tool being broken; saying nothing runs on the other cards makes the default honest.
+        printf("  no job given — your other cards will stay idle.\n");
+        printf("          give them a real job:      spirit play --work FILE -- CMD\n");
+        printf("          check they can be driven:  spirit doctor\n");
     } else if (!work.empty() && do_offload) {
         // ★ An absent tool must be SAID, not silently skipped (the README promises exactly this, and
         // the promise was false for ffmpeg). Found 2026-10-11 by an outside review.
@@ -2598,6 +2940,14 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
     } else if (!work.empty()) {
         no_job_reason = "--no-offload was given, so no card was asked to do anything";
         printf("  work: no job started — %s\n", no_job_reason.c_str());
+    } else if (want_load && !do_offload) {
+        // ★ THE THREE SILENT / FALSE TEST-LOAD CASES (blocking item 9). Each names why no
+        // load started, so a --test-load that began nothing never asserts a load ran.
+        no_load_reason = "--no-offload was given, so no card was asked to do anything";
+        printf("  test-load: no load started — %s\n", no_load_reason.c_str());
+    } else if (want_load) {
+        no_load_reason = "ffmpeg is not installed, so no card can be driven here";
+        printf("  test-load: no load started — %s\n", no_load_reason.c_str());
     }
     printf("\n  launching…\n\n");
     fflush(stdout);
@@ -2719,8 +3069,15 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
             printf("  NO JOB WAS STARTED — %s\n",
                    no_job_reason.empty() ? "nothing was given the work" : no_job_reason.c_str());
             printf("  Nothing was transcoded, so there is no output to check. The game ran normally.\n");
+        } else if (want_load) {
+            if (load_started)
+                printf("\n  game exited (rc=%d) — the bounded test load ended with the session\n", rc);
+            else
+                // ★ DO NOT SAY "test load stopped" WHEN NONE STARTED (blocking item 9).
+                printf("\n  game exited (rc=%d) — NO TEST LOAD WAS STARTED (%s). The game ran normally.\n",
+                       rc, no_load_reason.empty() ? "nothing was given the load" : no_load_reason.c_str());
         } else {
-            printf("\n  game exited (rc=%d) — test load stopped\n", rc);
+            printf("\n  game exited (rc=%d) — no work was running on the other cards\n", rc);
         }
     }
     // Real-valued, ever-so-slightly-positive wall delta, with the same 1e-6 floor as the Python.
@@ -2734,9 +3091,30 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
     // ★ THE TAIL — what the OTHER cards actually did. A feature you cannot see is indistinguishable
     // from one that is broken, and the loads are silent by design (ffmpeg's output goes to /dev/null).
     // So say it plainly, per card, and say "alive for" rather than claiming work was done.
-    if (!procs.empty() || !job_outputs.empty()) {
+    if (!procs.empty() || !job_outputs.empty() || want_load || (work.empty() && !want_load)) {
         printf("\n  ── THE TAIL — what the other cards did ───────────────────────────────\n");
-        if (!job_outputs.empty()) {
+        if (work.empty() && !want_load) {
+            // ★ SAY IDLE, DON'T SAY NOTHING (from the final outside read). With the default now doing
+            // nothing, an empty tail would read as a broken tool. An explicit IDLE per card also shows
+            // the skipped ones are still being accounted for.
+            std::map<string, string> names;
+            for (auto *g : spares) names[base_of(sfield(*g, "render_node"))] = gpu_name(*g);
+            for (auto *g : spares) {
+                string node = base_of(sfield(*g, "render_node"));
+                if (node.empty()) continue;
+                string nm = names.count(node) ? names[node] : "?";
+                bool is_skipped = false;
+                for (auto &s : skipped) if (s.node == node) is_skipped = true;
+                if (is_skipped) {
+                    string why = "not used";
+                    for (auto &s : skipped) if (s.node == node) { why = s.why; break; }
+                    printf("  %-12s %s SKIPPED — %s\n", node.c_str(), pad_display(nm, 22).c_str(),
+                           why.c_str());
+                } else {
+                    printf("  %-12s %s IDLE  (no job given)\n", node.c_str(), pad_display(nm, 22).c_str());
+                }
+            }
+        } else if (!job_outputs.empty()) {
             for (auto &jo : job_outputs) {
                 struct stat st;
                 bool ok = stat(jo.second.c_str(), &st) == 0;
@@ -2744,6 +3122,27 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                 for (auto *g : spares) if (base_of(sfield(*g, "render_node")) == jo.first) nm = gpu_name(*g);
                 printf("  %-12s %s REAL JOB  %s\n", jo.first.c_str(), pad_display(nm, 22).c_str(),
                        ok ? jo.second.c_str() : "FAILED — no file");
+            }
+        } else if (want_load && !load_started) {
+            // ★ NOTHING RAN, AND WE SAY SO (blocking item 9). The old tail had no branch for
+            // "a load was asked for and none started", so it printed nothing at all here.
+            std::map<string, string> names;
+            for (auto *g : spares) names[base_of(sfield(*g, "render_node"))] = gpu_name(*g);
+            for (auto *g : spares) {
+                string node = base_of(sfield(*g, "render_node"));
+                if (node.empty()) continue;
+                string nm = names.count(node) ? names[node] : "?";
+                bool is_enc = false;
+                for (auto &e : encoders) if (e.first == node) is_enc = true;
+                if (is_enc) {
+                    printf("  %-12s %s NOT DRIVEN — %s\n", node.c_str(), pad_display(nm, 22).c_str(),
+                           no_load_reason.empty() ? "no load was started" : no_load_reason.c_str());
+                } else {
+                    string why = "not used";
+                    for (auto &s : skipped) if (s.node == node) { why = s.why; break; }
+                    printf("  %-12s %s SKIPPED — %s\n", node.c_str(), pad_display(nm, 22).c_str(),
+                           why.c_str());
+                }
             }
         } else {
             std::map<string, string> names;
@@ -2756,15 +3155,21 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                 for (auto &e : encoders) if (e.first == node) is_enc = true;
                 if (is_enc) {
                     auto it = died_early.find(node);
+                    int cap = test_load ? *test_load : 0;
                     if (it == died_early.end()) {
-                        printf("  %-12s %s SYNTHETIC TEST LOAD — ran for the whole session (%.0f s),\n",
-                               node.c_str(), pad_display(nm, 22).c_str(), elapsed);
+                        printf("  %-12s %s SYNTHETIC TEST LOAD — still running when the game exited\n",
+                               node.c_str(), pad_display(nm, 22).c_str());
+                        printf("  %-12s %-22s   (%.0f s of session; bounded to %ds by the wall clock)\n",
+                               "", "", elapsed, cap);
+                    } else if (it->second == 0) {
+                        // ★ NORMAL COMPLETION IS NOT A FAULT (blocking item 9). The load is
+                        // DESIGNED to run for `cap` seconds and then stop; a clean rc 0 means it did
+                        // exactly that. It used to be reported as "EXITED EARLY ... it did NOT run".
+                        printf("  %-12s %s SYNTHETIC TEST LOAD — COMPLETED its %ds bounded run, as designed\n",
+                               node.c_str(), pad_display(nm, 22).c_str(), cap);
                     } else {
-                        // ★ Say what was SEEN, not what was hoped: this one was already gone before the
-                        // game exited, so it did not run the session however long the game lasted.
-                        printf("  %-12s %s SYNTHETIC TEST LOAD — EXITED EARLY (rc=%d, before the game\n",
-                               node.c_str(), pad_display(nm, 22).c_str(), it->second);
-                        printf("  %-12s %-22s   exited): it did NOT run for the session.\n", "", "");
+                        printf("  %-12s %s SYNTHETIC TEST LOAD — DIED (rc=%d) before its %ds run finished\n",
+                               node.c_str(), pad_display(nm, 22).c_str(), it->second, cap);
                     }
                     printf("  %-12s %-22s produced nothing (a job needs --work FILE)\n", "", "");
                 } else {
@@ -2811,6 +3216,8 @@ options:
   --scale F             render at F of native and let gamescope upscale it (0.3-1.0)
   --framegen N          frame generation at Nx, via lsfg-vk (2, 3 or 4)
   --overlay             show MangoHud over the game, via mangoapp
+  --test-load [SECS]    run a bounded synthetic load on the spare cards (default 60s, max 600) — it
+                        proves they can be driven and writes no file; nothing runs without this
   --work FILE           transcode FILE on the spare cards while you play (a real job)
   --work-outdir DIR     where a job's output goes (default: beside FILE)
   --split               divide ONE job across the spare cards instead of one job each
@@ -3019,21 +3426,25 @@ static bool parse_py_float(const string &s, double &out) {
 int main(int argc, char **argv) {
     vector<string> args(argv + 1, argv + argc);
 
-    // ★ THE MARK, ON EVERY RUN. Python calls origin() at the very top of main(), before the `run`
-    // and `play` hand-parse branches. Skipped only when any argv element is `--json` (a machine is
-    // reading), `origin` (which prints it properly), or `--version` (which must print exactly one
-    // line). A tampered build cannot silence the warning.
-    {
-        bool skip = false;
-        for (const string &a : args) if (a == "--json" || a == "origin" || a == "--version") skip = true;
-        if (!skip) origin_cmd(false);
-    }
-
+    // ★ ONLY OUR OWN FLAGS COUNT, NOT THE GAME'S (fix 2026-10-11, found by the final outside read).
+    // These checks used to scan the WHOLE argv, so `spirit play -- ./game --version` printed the version
+    // and never launched the game, and any game invoked with a `--json` flag silently lost the banner.
+    // A flag only means something to us if it is the first token, or if it appears before the `--` that
+    // separates our arguments from the game's.
+    vector<string> ours = args;
+    for (size_t i = 0; i < args.size(); i++)
+        if (args[i] == "--") { ours.assign(args.begin(), args.begin() + i); break; }
+    auto in_ours = [&](const string &t) {
+        for (const string &a : ours) if (a == t) return true;
+        return false;
+    };
+    bool suppress_mark = in_ours("origin")
+                         || (!args.empty() && args[0] == "--version")
+                         || (!args.empty() && (args[0] == "probe" || args[0] == "roles") && in_ours("--json"));
+    if (!suppress_mark) origin_cmd(false);
     // ★ --version prints THE one version string and nothing else: a single line, exit 0, no origin
     // mark and no help footer. Handled ahead of every other branch so it matches the Python exactly.
-    for (const string &a : args) {
-        if (a == "--version") { printf("spirit %s\n", VERSION); return 0; }
-    }
+    if (!args.empty() && args[0] == "--version") { printf("spirit %s\n", VERSION); return 0; }
 
     if (!args.empty() && args[0] == "ui") {
         vector<string> rest(args.begin() + 1, args.end());
@@ -3068,6 +3479,7 @@ int main(int argc, char **argv) {
         std::optional<int> framegen;
         string work, work_outdir, only_spares;
         bool split = false;
+        std::optional<int> test_load;
         while (i < args.size()) {
             if (args[i] == "--no-offload") { offload = false; i += 1; }
             else if (args[i] == "--spare") {
@@ -3110,6 +3522,28 @@ int main(int argc, char **argv) {
                 framegen = (int)v; i += 2;
             }
             else if (args[i] == "--overlay") { overlay = true; i += 1; }
+            else if (args[i] == "--test-load" || starts_with(args[i], "--test-load=")) {
+                // ★ OPT-IN, AND BOUNDED (from the final outside read). The synthetic load used to be the
+                // default and ran until the game exited; it is now something you ask for, for a stated
+                // number of seconds, and it stops.
+                string raw;
+                if (starts_with(args[i], "--test-load=")) { raw = args[i].substr(12); i += 1; }
+                else {
+                    bool digits = (i + 1 < args.size() && !args[i + 1].empty());
+                    for (size_t z = 0; digits && z < args[i + 1].size(); z++)
+                        if (args[i + 1][z] < '0' || args[i + 1][z] > '9') digits = false;
+                    if (digits) { raw = args[i + 1]; i += 2; }
+                    else { raw = "60"; i += 1; }
+                }
+                long long v;
+                if (!parse_py_int(raw, v)) {
+                    fprintf(stderr, "spirit play: --test-load needs seconds, e.g. --test-load 30\n");
+                    return 2;
+                }
+                if (v < 1) v = 1;
+                if (v > 600) v = 600;
+                test_load = (int)v;
+            }
             else if (args[i] == "-h" || args[i] == "--help") {
                 // ★ Without this, `play --help` fell through to `rest` and was executed as the game.
                 printf("%s\n", PLAY_USAGE);
@@ -3127,7 +3561,7 @@ int main(int argc, char **argv) {
             return 2;
         }
         return play_cmd(probe(), rest, offload, scale, framegen, overlay, work, work_outdir, split,
-                        only_spares);
+                        only_spares, test_load);
     }
 
     if (args.empty()) { print_help(); return 1; }

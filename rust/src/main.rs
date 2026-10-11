@@ -1718,10 +1718,13 @@ fn plan(db: &Json, workload: &str, vram_mib: Option<i64>) -> i32 {
     println!("  sustained one-way: {:.2} GB/s", per_sec / 1e9);
     println!();
     if let Some(vm) = vram_mib {
+        // ★ THESE ARE FIGURES WE ACTUALLY MEASURED (fix 2026-10-11, A3). The previous line quoted
+        // ~800 MiB and ~8,200 MiB, neither of which appears anywhere in this project's log.
         println!(
-            "  VRAM asked: {} MiB (measured on this box: a light load costs ~800 MiB, a GPU-bound 4K load ~8,200 MiB — ~10x)",
+            "  VRAM asked: {} MiB — for scale, measured here: a 4K benchmark peaks at 1,514 MiB,",
             vm
         );
+        println!("  an 8K benchmark at 6,898 MiB, and a real open-world game at 10,692 MiB.");
         println!();
     }
     println!(
@@ -1817,168 +1820,575 @@ fn plan(db: &Json, workload: &str, vram_mib: Option<i64>) -> i32 {
 }
 
 // ── doctor ───────────────────────────────────────────────────────────────────────────────
-fn isolation_count(vid: &str, did: &str) -> Option<usize> {
+/// What a child sees with the exclusive device-select applied to ONE card.
+///
+/// Returns None if the child could not be run at all, else a `PinResult` with the return code, the
+/// device count, and the (vendor, device) id list `vulkaninfo --summary` printed.
+///
+/// ★ THE ID LIST IS THE POINT (outside review). A count proves the pin CHANGED something, not that it
+/// SELECTED the right card — two identical cards share a vendor:device id, so a correct pin to either
+/// still counts 1. `vulkaninfo --summary` prints vendorID/deviceID per device, so the surviving
+/// device can be matched to the vid:did that was pinned. The return code is kept separate too: a
+/// nonzero rc is a LOADER failure, not "sees more than one device" (outside review), and a count of 0
+/// gets its own verdict as well.
+struct PinResult {
+    rc: i32,
+    count: usize,
+    ids: Vec<(u64, u64)>,
+}
+
+/// Python `re.findall(r"vendorID\s*=\s*(0x[0-9a-fA-F]+)", out)` as ints.
+fn find_hex_after(s: &str, key: &str) -> Vec<u64> {
+    let mut res = Vec::new();
+    let bytes = s.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = s[from..].find(key) {
+        let mut i = from + rel + key.len();
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'=' {
+            i += 1;
+            while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() && bytes[i] == b'0' && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X')
+            {
+                let start = i + 2;
+                i = start;
+                while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                    i += 1;
+                }
+                if i > start {
+                    if let Ok(v) = u64::from_str_radix(&s[start..i], 16) {
+                        res.push(v);
+                    }
+                }
+                from = i;
+                continue;
+            }
+        }
+        from = i + 1;
+    }
+    res
+}
+
+fn pinned_isolation(vid: &str, did: &str) -> Option<PinResult> {
     which("vulkaninfo")?;
     let mut cmd = Command::new("vulkaninfo");
     cmd.arg("--summary")
         .env("MESA_VK_DEVICE_SELECT", format!("{}:{}!", vid, did));
     // Python: `timeout=30`; any exception (including the timeout) yields None -> UNKNOWN.
     let out = cap_timeout(&mut cmd, 30).ok()?;
-    let s = String::from_utf8_lossy(&out.stdout);
-    Some(s.matches("deviceName").count())
+    let s = String::from_utf8_lossy(&out.stdout).to_string();
+    let vids = find_hex_after(&s, "vendorID");
+    let dids = find_hex_after(&s, "deviceID");
+    Some(PinResult {
+        rc: rc_of(&out.status),
+        count: s.matches("deviceName").count(),
+        ids: vids.into_iter().zip(dids).collect(),
+    })
+}
+
+/// (vendor, device) as ints from a probe record, or None if it cannot be parsed.
+fn card_ids(g: &Json) -> Option<(u64, u64)> {
+    let v = g.get("vendor")?.as_str()?;
+    let d = g.get("device")?.as_str()?;
+    let parse = |s: &str| -> Option<u64> {
+        let t = s.trim();
+        let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+        u64::from_str_radix(t, 16).ok()
+    };
+    Some((parse(v)?, parse(d)?))
 }
 
 struct Check {
     check: String,
     card: Option<String>,
     verdict: String,
+    core: bool,
+    /// Whether the JSON form carries the `core` key at all (Python sets it on the link, the routing
+    /// and the gpus checks, and only those).
+    has_core: bool,
     detail: String,
 }
 
+/// Render a JSON value the way Python's `%s` would (None for absent/null) — used by the doctor link
+/// detail, which interpolates `link.get("max_width")` and `link.get("max_gen")`.
+fn json_py_str(v: Option<&Json>) -> String {
+    match v {
+        None | Some(Json::Null) => "None".to_string(),
+        Some(Json::Bool(b)) => if *b { "True" } else { "False" }.to_string(),
+        Some(Json::Int(i)) => i.to_string(),
+        Some(Json::Float(f)) => py_str_float(*f),
+        Some(Json::Str(s)) => s.clone(),
+        Some(other) => json_dump(other),
+    }
+}
+
+/// The connector names belonging to one DRM card, e.g. `["DP-1", "HDMI-A-1"]`.
+///
+/// ★ READ INDEPENDENTLY OF THE ROLE ENGINE (A5). `doctor`'s display-card check has to be able to
+/// DISAGREE with what the role engine decided, or it is a mirror rather than a check — so it reads
+/// sysfs itself and never consults the engine's own answer.
+fn connector_names(card: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for entry in glob_children(DRM, &format!("{}-", card), None) {
+        let base = entry
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let cut = card.chars().count() + 1;
+        let name: String = base.chars().skip(cut).collect();
+        if !name.is_empty()
+            && read_trim(&entry.join("status").to_string_lossy()).is_some()
+        {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Connector names on this card that have an ACTIVE CRTC (`enabled` == "enabled").
+///
+/// ★ `status` says what is PLUGGED IN; `enabled` says what is DRIVING a display. The old display-card
+/// check read `status`, the same predicate the role engine used to pick the main card, so it could
+/// never disagree (outside review). `enabled` can: a second card with an enabled output is a cross-GPU
+/// present, which is the real risk.
+fn enabled_connectors(card: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in connector_names(card) {
+        if read_trim(&format!("{}/{}-{}/enabled", DRM, card, name)) == Some("enabled".to_string()) {
+            out.push(name);
+        }
+    }
+    out
+}
+
 fn doctor(db: &Json, as_json: bool) -> i32 {
+    // ★ FOUR VERDICTS, NOT THREE (redesigned 2026-10-11, A5). The old rule was "any non-PASS is
+    // suspicious", which made a working mixed-vendor machine report PROBLEMS FOUND. The states are now
+    // defined by what the tool actually depends on:
+    //   PASS observed directly / FAIL observed wrong or a dependency broken / N/A does not apply by
+    //   design / UNKNOWN the tool depends on it and could not determine it.
     let gpus = gpus_of(db);
     let mut checks: Vec<Check> = Vec::new();
+    let main = main_card(db); // None when this machine has no GPUs at all (outside review)
 
-    // A. the probe reads a link for every card
-    let miss: Vec<String> = gpus
-        .iter()
-        .filter(|g| {
-            g.get("link")
-                .and_then(|l| l.get("gbps_max"))
-                .map(|v| matches!(v, Json::Null))
-                .unwrap_or(true)
-        })
-        .map(card_of)
-        .collect();
-    checks.push(Check {
-        check: "probe-links".into(),
-        card: None,
-        verdict: if miss.is_empty() { "PASS" } else { "FAIL" }.into(),
-        detail: if miss.is_empty() {
-            "a host link for every card".into()
+    if gpus.is_empty() {
+        // ★ NO CARDS IS NOT A CRASH (outside review). `main_card` used to be `max([])`, which raised
+        // ValueError with a traceback before a single check ran — and `boost` crashed the same way.
+        // With nothing to test, the honest verdict is a FAIL: this tool needs a GPU and found none.
+        checks.push(Check {
+            check: "gpus".into(),
+            card: None,
+            verdict: "FAIL".into(),
+            core: true,
+            has_core: true,
+            detail: "no GPUs were found on this machine — there is nothing to render on and nothing to test".into(),
+        });
+    } else {
+    let main_card_name = main.as_ref().map(card_of).unwrap_or_default();
+
+    // A. LINKS. The tool does not branch on vendor here — current_link_width/speed come from the PCI
+    //    core. What lacks them is a device with nothing upstream to describe. The MAIN card's link is
+    //    CORE (1d.22): the tool cannot vouch for the launch if it cannot even read the card it renders on.
+    for g in &gpus {
+        let link = g.get("link");
+        let core = card_of(g) == main_card_name;
+        let has = link
+            .and_then(|l| l.get("gbps_max"))
+            .map(|v| !matches!(v, Json::Null))
+            .unwrap_or(false);
+        if has {
+            checks.push(Check {
+                check: "link".into(),
+                card: Some(card_of(g)),
+                verdict: "PASS".into(),
+                core,
+                has_core: true,
+                detail: format!(
+                    "x{} {} — the minimum negotiated width along the chain",
+                    json_py_str(link.and_then(|l| l.get("max_width"))),
+                    json_py_str(link.and_then(|l| l.get("max_gen")))
+                ),
+            });
+        } else if g.get("integrated").map(|v| v.is_truthy()).unwrap_or(false) {
+            checks.push(Check {
+                check: "link".into(),
+                card: Some(card_of(g)),
+                verdict: "N/A".into(),
+                core,
+                has_core: true,
+                detail: "integrated; there is no card link to measure".into(),
+            });
         } else {
-            format!("missing links: {}", miss.join(","))
-        },
-    });
+            checks.push(Check {
+                check: "link".into(),
+                card: Some(card_of(g)),
+                verdict: "UNKNOWN".into(),
+                core,
+                has_core: true,
+                detail: "no PCIe link attributes were readable along the chain".into(),
+            });
+        }
+    }
 
-    // B. routing ISOLATES on every card
+    // B. ROUTING ISOLATION. This is the load-bearing pin, so the check is CORE and it MATCHES THE
+    //    PINNED ID (1a.10, 1b.18): a count alone proves the pin CHANGED something, not
+    //    that it selected the right card. A nonzero return code (a loader failure), a count of 0 (the
+    //    pin matched nothing) and a count above 1 (still sees more than one) are kept as SEPARATE
+    //    states — none of them is "sees more than one device" except the last.
     if which("vulkaninfo").is_none() {
         checks.push(Check {
             check: "routing-isolation".into(),
             card: None,
             verdict: "UNKNOWN".into(),
-            detail: "vulkaninfo not installed — cannot test".into(),
+            core: true,
+            has_core: true,
+            detail: "vulkaninfo (vulkan-tools) is not installed — the device pin, which the whole launch depends on, cannot be tested at all".into(),
         });
     } else {
-        for g in &gpus {
-            let vendor = g.get("vendor").and_then(|v| v.as_str()).unwrap_or("");
-            let device = g.get("device").and_then(|v| v.as_str()).unwrap_or("");
-            let n = isolation_count(&tail2(vendor), &tail2(device));
-            let (v, d) = match n {
-                None => ("UNKNOWN", "could not run a test child".to_string()),
-                Some(1) => ("PASS", "a child sees exactly 1 device".to_string()),
-                Some(k) => ("FAIL", format!("a child sees {} devices (expected 1)", k)),
-            };
+        let res: Vec<(String, Option<PinResult>)> = gpus
+            .iter()
+            .map(|g| {
+                let vendor = g.get("vendor").and_then(|v| v.as_str()).unwrap_or("");
+                let device = g.get("device").and_then(|v| v.as_str()).unwrap_or("");
+                (card_of(g), pinned_isolation(&tail2(vendor), &tail2(device)))
+            })
+            .collect();
+        let untestable: Vec<String> = res
+            .iter()
+            .filter(|(_, v)| v.is_none())
+            .map(|(c, _)| c.clone())
+            .collect();
+        let rcbad: Vec<String> = res
+            .iter()
+            .filter(|(_, v)| v.as_ref().map(|r| r.rc != 0).unwrap_or(false))
+            .map(|(c, _)| c.clone())
+            .collect();
+        let zero: Vec<String> = res
+            .iter()
+            .filter(|(_, v)| v.as_ref().map(|r| r.rc == 0 && r.count == 0).unwrap_or(false))
+            .map(|(c, _)| c.clone())
+            .collect();
+        let multi: Vec<String> = res
+            .iter()
+            .filter(|(_, v)| v.as_ref().map(|r| r.rc == 0 && r.count > 1).unwrap_or(false))
+            .map(|(c, _)| c.clone())
+            .collect();
+        let mut mism: Vec<String> = Vec::new();
+        for (i, g) in gpus.iter().enumerate() {
+            if let Some(r) = &res[i].1 {
+                if r.rc == 0 && r.count == 1 {
+                    match card_ids(g) {
+                        Some(want) if r.ids == vec![want] => {}
+                        _ => mism.push(card_of(g)),
+                    }
+                }
+            }
+        }
+        if !untestable.is_empty() {
             checks.push(Check {
                 check: "routing-isolation".into(),
-                card: Some(card_of(g)),
-                verdict: v.into(),
-                detail: d,
+                card: None,
+                verdict: "UNKNOWN".into(),
+                core: true,
+                has_core: true,
+                detail: "a test child could not be run for: ".to_string() + &untestable.join(", "),
+            });
+        } else if !rcbad.is_empty() {
+            checks.push(Check {
+                check: "routing-isolation".into(),
+                card: None,
+                verdict: "UNKNOWN".into(),
+                core: true,
+                has_core: true,
+                detail: "vulkaninfo returned nonzero (a loader failure, not 'sees more than one device') for: ".to_string() + &rcbad.join(", "),
+            });
+        } else if !zero.is_empty() {
+            checks.push(Check {
+                check: "routing-isolation".into(),
+                card: None,
+                verdict: "FAIL".into(),
+                core: true,
+                has_core: true,
+                detail: "the pin matched nothing — a child saw 0 devices for: ".to_string() + &zero.join(", "),
+            });
+        } else if !multi.is_empty() {
+            checks.push(Check {
+                check: "routing-isolation".into(),
+                card: None,
+                verdict: "FAIL".into(),
+                core: true,
+                has_core: true,
+                detail: "a child still sees more than one device for: ".to_string() + &multi.join(", "),
+            });
+        } else if !mism.is_empty() {
+            checks.push(Check {
+                check: "routing-isolation".into(),
+                card: None,
+                verdict: "FAIL".into(),
+                core: true,
+                has_core: true,
+                detail: "a child saw exactly 1 device, but it is not the card pinned for: ".to_string() + &mism.join(", "),
+            });
+        } else if gpus.len() == 1 {
+            checks.push(Check {
+                check: "routing-isolation".into(),
+                card: None,
+                verdict: "UNKNOWN".into(),
+                core: true,
+                has_core: true,
+                detail: "only one GPU is present, so a child sees 1 device with or without the pin — the count cannot show the pin selected anything".into(),
+            });
+        } else {
+            checks.push(Check {
+                check: "routing-isolation".into(),
+                card: None,
+                verdict: "PASS".into(),
+                core: true,
+                has_core: true,
+                detail: "a child saw exactly 1 device AND its vendor:device id matches the card pinned — per card. (A count alone would prove only that the pin CHANGED something, not which card; the id match is what ties the surviving device to the pinned one.)".into(),
             });
         }
     }
 
-    // C. telemetry is readable
-    let n_ok = gpus
-        .iter()
-        .filter(|g| read_int(&format!("{}/{}/device/mem_info_vram_used", DRM, card_of(g))).is_some())
-        .count();
-    checks.push(Check {
-        check: "telemetry".into(),
-        card: None,
-        verdict: if n_ok == gpus.len() { "PASS" } else { "FAIL" }.into(),
-        detail: format!("VRAM counters readable on {}/{} cards", n_ok, gpus.len()),
-    });
+    // B2. IDENTICAL CARDS — a design defect worth failing loudly, because the pin genuinely cannot
+    //     separate them and the user would never guess.
+    let mut seen: Vec<(String, String, Vec<String>)> = Vec::new(); // (vendor, device, cards)
+    for g in &gpus {
+        let vendor = g.get("vendor").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let device = g.get("device").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if let Some(e) = seen.iter_mut().find(|(v, d, _)| *v == vendor && *d == device) {
+            e.2.push(card_of(g));
+        } else {
+            seen.push((vendor, device, vec![card_of(g)]));
+        }
+    }
+    match seen.iter().find(|(_, _, c)| c.len() > 1) {
+        Some((v, d, cards)) => checks.push(Check {
+            check: "individual-pin".into(),
+            card: None,
+            verdict: "FAIL".into(),
+            core: false,
+            has_core: false,
+            detail: format!(
+                "{} share {}:{} — the pin selects the model, not the card, so it cannot tell them apart",
+                cards.join(", "),
+                tail2(v),
+                tail2(d)
+            ),
+        }),
+        None => checks.push(Check {
+            check: "individual-pin".into(),
+            card: None,
+            verdict: "PASS".into(),
+            core: false,
+            has_core: false,
+            detail: "every card has its own vendor:device id, so a pin can name one".into(),
+        }),
+    }
 
-    // D. the role plan places at least one card, and says why for the rest
-    let rp = assign_roles(db, "game");
-    let placed = rp
-        .iter()
-        .filter(|r| {
-            r.get("roles")
-                .and_then(|v| v.as_arr())
-                .map(|a| !(a.len() == 1 && a[0].as_str() == Some("idle")))
-                .unwrap_or(false)
-        })
-        .count();
-    let unexplained: Vec<String> = rp
-        .iter()
-        .filter(|r| {
-            let idle = r
-                .get("roles")
-                .and_then(|v| v.as_arr())
-                .map(|a| a.len() == 1 && a[0].as_str() == Some("idle"))
-                .unwrap_or(false);
-            let why_empty = r
-                .get("why")
-                .and_then(|v| v.as_arr())
-                .map(|a| a.is_empty())
-                .unwrap_or(true);
-            idle && why_empty
-        })
-        .map(|r| r.get("card").and_then(|v| v.as_str()).unwrap_or("").to_string())
-        .collect();
-    checks.push(Check {
-        check: "role-plan".into(),
-        card: None,
-        verdict: if placed > 0 && unexplained.is_empty() { "PASS" } else { "FAIL" }.into(),
-        detail: format!(
-            "places {}/{} cards{}",
-            placed,
-            rp.len(),
-            if unexplained.is_empty() {
-                String::new()
-            } else {
-                format!("; unexplained idle: {}", unexplained.join(","))
-            }
-        ),
-    });
+    // C. TELEMETRY. ★ NOTHING IN THIS TOOL READS A CARD'S LIVE LOAD (blocking item 4).
+    //    `mem_info_vram_used` feeds only `vram_used_mib` in `probe --json`. By the four verdicts' own
+    //    definition that makes it N/A for EVERY kind of card — a check on a dependency that does not
+    //    exist, which also produced a spurious FAIL on a readable-but-different vendor. Kept as N/A,
+    //    per card, so it is printed and counted and nobody reads its absence as a pass.
+    for g in &gpus {
+        checks.push(Check {
+            check: "telemetry".into(),
+            card: Some(card_of(g)),
+            verdict: "N/A".into(),
+            core: false,
+            has_core: false,
+            detail: "this tool reads a card's TOTAL VRAM (probe) but never its live load, so no memory counter is required here".into(),
+        });
+    }
 
-    // E. UPSCALING — the path the tool advertises actually exists on this machine.
+    // D. DISPLAY CARD. ★ READS `enabled`, NOT `status` (blocking item 1). `status` is
+    //    what is PLUGGED IN — the very predicate the role engine uses to choose the main card, so the
+    //    old check could only PASS or N/A. `enabled` is what is DRIVING a display, so this check can
+    //    genuinely disagree: a second card with an enabled output is a cross-GPU present.
+    let mut enabled_cards: Vec<String> = Vec::new();
+    for g in &gpus {
+        let c = card_of(g);
+        if !enabled_connectors(&c).is_empty() {
+            enabled_cards.push(c);
+        }
+    }
+    if enabled_cards.is_empty() {
+        checks.push(Check {
+            check: "display-card".into(),
+            card: None,
+            verdict: "N/A".into(),
+            core: false,
+            has_core: false,
+            detail: "no connector has an active CRTC — no display is being driven".into(),
+        });
+    } else if !enabled_cards.contains(&main_card_name) {
+        let mut sorted = enabled_cards.clone();
+        sorted.sort();
+        checks.push(Check {
+            check: "display-card".into(),
+            card: None,
+            verdict: "FAIL".into(),
+            core: false,
+            has_core: false,
+            detail: format!(
+                "rendering was assigned to {}, but {} is driving a display",
+                main_card_name,
+                sorted.join(", ")
+            ),
+        });
+    } else if enabled_cards.len() > 1 {
+        let mut sorted = enabled_cards.clone();
+        sorted.sort();
+        let mut others: Vec<String> = enabled_cards
+            .iter()
+            .filter(|c| **c != main_card_name)
+            .cloned()
+            .collect();
+        others.sort();
+        checks.push(Check {
+            check: "display-card".into(),
+            card: None,
+            verdict: "FAIL".into(),
+            core: false,
+            has_core: false,
+            detail: format!(
+                "more than one card is driving a display ({}): the game window can land on {}'s monitor, a cross-GPU present",
+                sorted.join(", "),
+                others.join(", ")
+            ),
+        });
+    } else {
+        checks.push(Check {
+            check: "display-card".into(),
+            card: None,
+            verdict: "PASS".into(),
+            core: false,
+            has_core: false,
+            detail: format!(
+                "the card picked to render ({}) is the one driving a display",
+                main_card_name
+            ),
+        });
+    }
+
+    // E. THE SECOND WALL. doctor now says what it found.
+    let mut wall: Option<bool> = None;
+    if which("unshare").is_some() {
+        let mut cmd = Command::new("unshare");
+        cmd.args(["-Urm", "true"]);
+        match cap_timeout(&mut cmd, 10) {
+            Ok(o) => wall = Some(o.status.code().map(|c| c == 0).unwrap_or(false)),
+            Err(_) => wall = None,
+        }
+    }
+    match wall {
+        Some(true) => checks.push(Check {
+            check: "namespace-wall".into(),
+            card: None,
+            verdict: "PASS".into(),
+            core: false,
+            has_core: false,
+            detail: "unprivileged user namespaces are available; the game can be separated from the other cards' device nodes".into(),
+        }),
+        Some(false) => checks.push(Check {
+            check: "namespace-wall".into(),
+            card: None,
+            verdict: "UNKNOWN".into(),
+            core: false,
+            has_core: false,
+            detail: "unprivileged user namespaces are NOT available here, so only the pin separates the game from the other cards".into(),
+        }),
+        None => checks.push(Check {
+            check: "namespace-wall".into(),
+            card: None,
+            verdict: "UNKNOWN".into(),
+            core: false,
+            has_core: false,
+            detail: "unshare is not installed, so only the pin separates the game from the other cards".into(),
+        }),
+    }
+
+    // F. UPSCALING — the tool advertises a path that needs OPTIONAL software. ABSENT (and present but
+    //    without FSR) is DETERMINED, and nothing depends on it unless the user asks for --scale, so it
+    //    belongs in N/A, not UNKNOWN (blocking item 3).
     let (gs_state, gs_detail) = gamescope_state();
+    let gs_verdict = match gs_state.as_str() {
+        "READY" => "PASS",
+        "ABSENT" => "N/A",
+        "PARTIAL" => "N/A",
+        _ => "UNKNOWN",
+    };
     checks.push(Check {
         check: "upscaling".into(),
         card: None,
-        verdict: if gs_state == "READY" { "PASS" } else { "UNKNOWN" }.into(),
+        verdict: gs_verdict.into(),
+        core: false,
+        has_core: false,
         detail: format!("{} — {}", gs_state, gs_detail),
     });
 
-    // F. FRAME GENERATION — reported honestly; UNKNOWN is never green, and absent is not a failure
-    //    of THIS machine (it needs software the user must own). Only a broken install is a FAIL.
+    // G. FRAME GENERATION — same rule (blocking item 3): ABSENT / disabled / game-not-in-library are
+    //    DETERMINED and optional, so N/A. Only a broken install (the shaders absent) is a FAIL. And
+    //    PARTIAL now AGREES with `play` (blocking item 5, ): the missing piece is
+    //    `lsfg-vk-cli`, which this tool never calls — it sets LSFGVK_PROFILE and lets the layer read
+    //    it — so `play --framegen` accepts PARTIAL and doctor reports it PASS, not UNKNOWN.
     let (ls_state, ls_detail) = lsfg_state();
-    // ★ THE VERDICT MUST BE DERIVED FROM THE STATES THIS FUNCTION ACTUALLY RETURNS (fix 2026-10-11,
-    // outside review; C++/Rust item A3). This mapped only "READY" and "NOT-WORKING" — and lsfg_state()
-    // returns NEITHER, so the check printed UNKNOWN on every machine that ever ran it, including a
-    // working one. A check that can never reach a verdict is not a cautious check; it is a dead one.
     let ls_verdict = match ls_state.as_str() {
-        "INSTALLED" => "PASS",     // layer present AND the shaders are actually there
-        "NEEDS-BRANCH" => "FAIL",  // installed but the shaders are absent — it dies at startup
-        "PARTIAL" => "FAIL",       // layer present without its helper
-        "STANDS-DOWN" => "UNKNOWN", // installed but disabled at the loader; not this machine's fault
-        "ABSENT" => "UNKNOWN",     // not installed — it requires software we do not ship
-        "NEEDS-GAME" => "UNKNOWN", // the game that carries the shaders is not in the library
+        "INSTALLED" => "PASS",    // layer present AND the shaders are actually there
+        "PARTIAL" => "PASS",      // layer + shaders present; only the unused lsfg-vk-cli is absent
+        "NEEDS-BRANCH" => "FAIL", // installed but the shaders are absent — it will die at startup
+        "STOOD-DOWN" => "N/A",    // DETERMINED: disabled at the loader; optional software
+        "ABSENT" => "N/A",        // DETERMINED: not installed; optional software we do not ship
+        "NEEDS-GAME" => "N/A",    // DETERMINED: the game that carries the shaders is not in the library
         _ => "UNKNOWN",
     };
-
     checks.push(Check {
         check: "frame-generation".into(),
         card: None,
         verdict: ls_verdict.into(),
+        core: false,
+        has_core: false,
         detail: format!("{} — {}", ls_state, ls_detail),
     });
+    }
 
-    let bad = checks.iter().any(|c| c.verdict == "FAIL");
-    let overall = if !bad { "READY" } else { "PROBLEMS FOUND" };
+    // ── the verdict rules, stated once ──────────────────────────────────────────────────────────
+    let fails: Vec<&Check> = checks.iter().filter(|c| c.verdict == "FAIL").collect();
+    let unknowns: Vec<&Check> = checks.iter().filter(|c| c.verdict == "UNKNOWN").collect();
+    let core_unknowns: Vec<&Check> = unknowns.iter().filter(|c| c.core).cloned().collect();
+    let nas: Vec<&Check> = checks.iter().filter(|c| c.verdict == "N/A").collect();
+    let (overall, code) = if !fails.is_empty() {
+        ("PROBLEMS FOUND".to_string(), 1)
+    } else if !core_unknowns.is_empty() {
+        // ★ A CORE CHECK THAT IS UNKNOWN IS NOT "WORKS" (blocking item 8). With no
+        //    vulkaninfo the pin is untested, and "WORKS" would be a conclusion doctor never reached.
+        //    ★ EXIT 3, NOT 2 (blocking item 6): argparse usage errors and the
+        //    SPIRIT_DEVICES refusals already exit 2, so a script could not tell "not fully verified"
+        //    from "you typed it wrong". 3 is distinct from both.
+        (
+            format!(
+                "NOT VERIFIED — a core check could not be determined ({})",
+                core_unknowns.len()
+            ),
+            3,
+        )
+    } else if !unknowns.is_empty() {
+        (
+            format!(
+                "WORKS, NOT FULLY VERIFIED ({} item{})",
+                unknowns.len(),
+                if unknowns.len() == 1 { "" } else { "s" }
+            ),
+            3,
+        )
+    } else {
+        ("ALL CHECKS PASSED".to_string(), 0)
+    };
 
     if as_json {
         let checks_json: Vec<Json> = checks
@@ -1989,17 +2399,24 @@ fn doctor(db: &Json, as_json: bool) -> i32 {
                     m.push(("card".into(), Json::Str(card.clone())));
                 }
                 m.push(("verdict".into(), Json::Str(c.verdict.clone())));
+                if c.has_core {
+                    m.push(("core".into(), Json::Bool(c.core)));
+                }
                 m.push(("detail".into(), Json::Str(c.detail.clone())));
                 Json::Obj(m)
             })
             .collect();
         let obj = Json::Obj(vec![
             ("spirit".into(), Json::Str("doctor/1.0.0".into())),
-            ("overall".into(), Json::Str(overall.into())),
+            ("overall".into(), Json::Str(overall.clone())),
+            ("fails".into(), Json::Int(fails.len() as i64)),
+            ("unknown".into(), Json::Int(unknowns.len() as i64)),
+            ("core_unknown".into(), Json::Int(core_unknowns.len() as i64)),
+            ("not_applicable".into(), Json::Int(nas.len() as i64)),
             ("checks".into(), Json::Arr(checks_json)),
         ]);
         println!("{}", json_dump(&obj));
-        return if bad { 1 } else { 0 };
+        return code;
     }
 
     println!("spirit doctor — verifying this machine's multi-GPU readiness");
@@ -2009,29 +2426,38 @@ fn doctor(db: &Json, as_json: bool) -> i32 {
             Some(card) => format!("{} ", ljust(card, 6)),
             None => String::new(),
         };
-        println!(
-            "  [{}] {}{}",
-            ljust(&c.verdict, 7),
-            card,
-            c.detail
-        );
+        println!("  [{}] {}{}", ljust(&c.verdict, 7), card, c.detail);
     }
     println!();
-    println!(
-        "  OVERALL: {}{}",
-        overall,
-        if !bad { "" } else { " — see FAIL lines above" }
-    );
-    if bad {
-        1
-    } else {
-        0
+    println!("  OVERALL: {}", overall);
+    if !nas.is_empty() {
+        println!(
+            "  ({} check{} did not apply here and {} not counted as passes.)",
+            nas.len(),
+            if nas.len() == 1 { "" } else { "s" },
+            if nas.len() == 1 { "was" } else { "were" }
+        );
     }
+    if !unknowns.is_empty() {
+        println!("  An item above could not be determined. That is not a failure, and it is not a pass —");
+        println!("  it means the tool cannot vouch for that part on this machine.");
+        if !core_unknowns.is_empty() {
+            println!(
+                "  ★ {} of them {} CORE (the device pin, or the main card's link): without those, this",
+                core_unknowns.len(),
+                if core_unknowns.len() == 1 { "is" } else { "are" }
+            );
+            println!("    build does not claim the launch works — hence NOT VERIFIED above, not WORKS.");
+        }
+    }
+    if !fails.is_empty() {
+        println!("  See the FAIL lines above.");
+    }
+    code
 }
 
 // ── fg ────────────────────────────────────────────────────────────────────────────────────
 const FRAME_MIB: [(&str, f64); 3] = [("1080p", 8.29), ("1440p", 14.75), ("4k", 33.18)];
-const HANDOFF_GBPS: [(&str, f64); 3] = [("card0", 0.76), ("card2", 0.25), ("card3", 2.91)];
 
 /// Python `re.match(r"^\s*(1080p|1440p|4k)\s*@?\s*(\d+)?\s*$", res, re.IGNORECASE)`.
 /// Returns (lowercased resolution, refresh) — the refresh defaults to 60 when absent.
@@ -2108,7 +2534,7 @@ fn fg(db: &Json, res: &str, mode: &str) -> i32 {
         format!(
             "  {} {} {} {} {}",
             ljust("card", 8),
-            ljust("handoff", 12),
+            ljust("link bound", 12),
             ljust("one-way ms", 14),
             ljust("round-trip ms", 12),
             "verdict"
@@ -2117,9 +2543,17 @@ fn fg(db: &Json, res: &str, mode: &str) -> i32 {
     println!("  {}", "-".repeat(84));
     for g in &gpus_of(db) {
         let c = card_of(g);
-        let rate = HANDOFF_GBPS.iter().find(|(k, _)| *k == c).map(|(_, v)| *v);
-        match rate {
-            None => {
+        // ★ THIS TOOL CANNOT KNOW YOUR MACHINE'S HANDOFF RATE (fix 2026-10-11, A2). The old table was
+        // keyed by card NAME — card0/card2/card3 — so a stranger's card0 inherited the MI25's measured
+        // rate. The rate is a property of the LINK and the driver, so what is computed here is an
+        // UPPER BOUND from the card's OWN measured host link, and the gap is stated below.
+        let link = g
+            .get("link")
+            .and_then(|l| l.get("gbps_max"))
+            .and_then(|v| v.as_f64());
+        let rate = match link {
+            Some(r) if r != 0.0 => r,
+            _ => {
                 println!(
                     "{}",
                     format!(
@@ -2128,47 +2562,48 @@ fn fg(db: &Json, res: &str, mode: &str) -> i32 {
                         ljust("n/a", 12),
                         ljust("-", 14),
                         ljust("-", 12),
-                        "not a card pair here / not measured"
+                        "no host link could be read for this card"
                     )
                 );
+                continue;
             }
-            Some(rate) => {
-                let ow = payload / 1024.0 / rate * 1000.0;
-                let rt = ow * 2.0;
-                let (verdict, arith) = if one_way {
-                    let ok = ow <= budget;
-                    (
-                        if ok { "FEASIBLE one-way" } else { "INFEASIBLE one-way" },
-                        format!("{:.1} ms vs {:.1} ms budget", ow, budget),
-                    )
-                } else {
-                    let ok = rt <= budget;
-                    (
-                        if ok { "FEASIBLE round-trip" } else { "INFEASIBLE round-trip" },
-                        format!("{:.1} ms vs {:.1} ms budget", rt, budget),
-                    )
-                };
-                println!(
-                    "{}",
-                    format!(
-                        "  {} {} {} {} {} ({})",
-                        ljust(&c, 8),
-                        ljust(&format!("{:.2} GB/s", rate), 12),
-                        ljust(&format!("{:.2}", ow), 14),
-                        ljust(&format!("{:.2}", rt), 12),
-                        verdict,
-                        arith
-                    )
-                );
-            }
-        }
+        };
+        let ow = payload / 1024.0 / rate * 1000.0;
+        let rt = ow * 2.0;
+        let (verdict, arith) = if one_way {
+            let ok = ow <= budget;
+            (
+                if ok { "FEASIBLE one-way" } else { "INFEASIBLE one-way" },
+                format!("{:.1} ms vs {:.1} ms budget", ow, budget),
+            )
+        } else {
+            let ok = rt <= budget;
+            (
+                if ok { "FEASIBLE round-trip" } else { "INFEASIBLE round-trip" },
+                format!("{:.1} ms vs {:.1} ms budget", rt, budget),
+            )
+        };
+        println!(
+            "{}",
+            format!(
+                "  {} {} {} {} {} ({})",
+                ljust(&c, 8),
+                ljust(&format!("<={:.2} GB/s", rate), 12),
+                format!("{:<14.2}", ow),
+                format!("{:<12.2}", rt),
+                verdict,
+                arith
+            )
+        );
     }
     println!();
     println!("  ★ ARCHITECTURE RULE, from measurement: put the DISPLAY on the card doing the frame-gen, so a");
     println!("    frame crosses ONE WAY. A round trip doubles the cost and is the first thing to fail.");
-    println!("  ★ The handoff table above is MEASURED ON THE DEV BOX and is a property of its links — on any");
-    println!("    other machine re-measure it before trusting a verdict. RADV lands the import in a");
-    println!("    HOST-VISIBLE aperture heap, so these are aperture rates, not peer-VRAM rates.");
+    println!("  ★ THE VERDICT ABOVE IS AN UPPER BOUND, NOT A MEASUREMENT. It assumes a frame crosses at the");
+    println!("    link's own rate. It does not: on the dev box the real handoff ran at roughly a tenth to a");
+    println!("    third of the link rate, because RADV lands the import in a HOST-VISIBLE aperture heap. So a");
+    println!("    card marked INFEASIBLE is definitely out, and a card marked FEASIBLE may still be out —");
+    println!("    measure it on your own machine before trusting the last column.");
     0
 }
 
@@ -2577,7 +3012,11 @@ fn origin_cmd(check_only: bool) -> i32 {
         println!("  ★★ THIS IS A MODIFIED COPY. The origin mark does not verify.");
         println!("     This is a copy of, or derived from: {}", ORIGIN_TRUE);
         println!("     Expected mark {}, found {}.", &ORIGIN_SEAL[..16], &actual[..16]);
-        println!("     Removing this notice is the one thing the licence forbids. Put it back.");
+        // ★ THIS USED TO OVERSTATE THE LICENCE (corrected 2026-10-11, A6). It said removing the
+        // notice was "the one thing the licence forbids". MIT forbids nothing of the sort: it permits
+        // modification freely and requires only that the copyright notice travel with copies.
+        println!("     This banner is not the licence. MIT lets anyone modify this freely — it asks that");
+        println!("     the copyright notice travel with copies, not that this line be kept.");
         println!();
     }
     0
@@ -2617,6 +3056,21 @@ fn media_duration(src: &str) -> f64 {
     }
 }
 
+/// Wall-clock seconds since the Unix epoch (Python `time.time()`), for the job's STALE-output check.
+fn epoch_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// A file's mtime in wall-clock seconds (Python `os.path.getmtime`), or None if it cannot be read.
+fn mtime_secs(path: &str) -> Option<f64> {
+    let md = fs::metadata(path).ok()?;
+    let mt = md.modified().ok()?;
+    mt.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs_f64())
+}
+
 // ★ THE ENCODER DRIVER IS NOT ALWAYS radeonsi (fix 2026-10-11, found by the outside review).
 // `LIBVA_DRIVER_NAME=radeonsi` was hard-coded at both launch sites, so a spare card that is not AMD was
 // handed AMD's VAAPI driver. With `--work` the job then failed and printed MISSING; with a test load it
@@ -2648,19 +3102,49 @@ fn va_driver(g: &Json) -> (Option<String>, Option<String>) {
     )
 }
 
-/// A SYNTHETIC load: ffmpeg's OWN generated test pattern (testsrc2), piped to /dev/null. The encoder
-/// really runs — that is why the counters move — but the input is a test card and the output is
-/// discarded. A LOAD proves a card can be DRIVEN; a JOB produces something. --work is the job.
-fn start_test_load(node: &str, va: &str) -> std::io::Result<Child> {
+/// Why this card's link is marginal, or None if it is fine.
+///
+/// ★ A REAL JOB DOES NOT REACH A MARGINAL CARD UNLESS THE USER NAMES IT (A4). The incident this rule
+/// exists for: a benchmark enumerated a card on an external dock, the card latched its thermal
+/// alarm, and the machine went down. A card on a NARROW host link is usable — it is just not a
+/// default we assume on the user's behalf. `--spare <node>` includes it, and this is SAID, not done
+/// quietly.
+///
+/// ★ `capped_by_topology` IS NOT A PROXY FOR "BEHIND AN EXTERNAL BRIDGE" (blocking item
+/// 12). It fires whenever the card's OWN bridge reports wider than the host gives — which is the
+/// NORMAL case for every modern AMD card, because Vega, Navi and RDNA all contain an internal PCIe
+/// switch. A wide-but-capped card is not the dock shape. A genuinely NARROW link (below x4) is, and
+/// that is the only rule left here.
+fn marginal(g: &Json) -> Option<String> {
+    let link = g.get("link");
+    let w = link.and_then(|l| l.get("max_width")).and_then(|v| v.as_i64());
+    if let Some(w) = w {
+        if w < 4 {
+            return Some(format!("x{} link at the host — too narrow to use unasked", w));
+        }
+    }
+    None
+}
+
+/// A SYNTHETIC load: ffmpeg's OWN generated test pattern (testsrc2), piped to /dev/null.
+///
+/// ★ BOUNDED IN TIME, PACED TO REAL TIME (fix 2026-10-11, A4). The old load ran until the game
+/// exited — an uninvited, unbounded workload on every spare card. It now runs for `cap` seconds of
+/// REAL time and stops: `-re` paces the generated input to native frame rate (without it ffmpeg
+/// would encode the whole clip in a few seconds and exit), and `-t` bounds it.
+fn start_test_load(node: &str, va: &str, cap: i64) -> std::io::Result<Child> {
     Command::new("ffmpeg")
         .args([
             "-hide_banner",
             "-loglevel",
             "error",
+            "-re",
             "-f",
             "lavfi",
             "-i",
             "testsrc2=size=1920x1080:rate=60",
+            "-t",
+            &format!("{}", cap),
             "-vaapi_device",
             &format!("/dev/dri/{}", node),
             "-vf",
@@ -2708,6 +3192,12 @@ fn start_work(
         node.to_string()
     };
     let out = format!("{}/{}.{}.mp4", outdir, stem, tag);
+    // ★ DELETE THE TARGET BEFORE STARTING (blocking item 11). `ffmpeg -y` plus "nothing
+    // takes a process's exit code for an answer" means: if ffmpeg dies before it opens its output (a
+    // VAAPI init failure, say), the file from a PREVIOUS identical run is still on disk — and it was
+    // then reported as a REAL JOB with the old size and duration, and under --split a stale part could
+    // pass the SPLIT CHECK. Removing the target first makes "the file exists" mean THIS run wrote it.
+    let _ = fs::remove_file(&out);
     let mut args: Vec<String> = vec![
         "-hide_banner".into(), "-loglevel".into(), "error".into(), "-y".into(),
     ];
@@ -2954,7 +3444,8 @@ fn spawn_argv(argv: &[String], env_pins: &[(OsString, OsString)]) -> Result<i32,
 }
 
 fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framegen: Option<i64>,
-        overlay: bool, work: &str, work_outdir: &str, split: bool, only_spares: &str) -> i32 {
+        overlay: bool, work: &str, work_outdir: &str, split: bool, only_spares: &str,
+        test_load: Option<i64>) -> i32 {
     if cmd.is_empty() {
         eprintln!("usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] \
 [--work FILE [--work-outdir DIR] [--split]] [--spare NODE,...] -- <game command...>");
@@ -3088,8 +3579,10 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
     if let Some(n) = framegen {
         let (st, detail) = lsfg_state();
         // ★ "READY" was renamed to "INSTALLED" when this check moved to the Steam manifest.
-        // A rename that misses one caller is exactly how a working feature reports itself broken.
-        if st != "INSTALLED" {
+        // ★ PARTIAL IS ACCEPTED, MATCHING `doctor` (blocking item 5, ). PARTIAL means the
+        // layer and the shaders are present and only `lsfg-vk-cli` is missing — a helper this tool
+        // never calls. doctor reports PARTIAL as PASS; `play` must not contradict it by refusing.
+        if st != "INSTALLED" && st != "PARTIAL" {
             println!("  framegen: UNAVAILABLE — {}", detail);
             println!("            (launching without it; spirit boost explains the state)");
         } else {
@@ -3151,6 +3644,12 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
     // ★ Set when --work was asked for but nothing could be started, so the exit block can SAY so
     // instead of claiming "the job ran to completion" over an empty output block (A1).
     let mut no_job_reason: Option<String> = None;
+    let mut no_load_reason: Option<String> = None; // set when --test-load was asked for but nothing started
+    let mut load_started = false; // true once at least one bounded test load is actually running
+    let mut job_start_time: Option<f64> = None;
+    // ★ PARENT-SIDE WALL-CLOCK CANCEL FLAG for the test loads (blocking item 10): the timer thread
+    // terminates them at `cap` seconds of WALL time, and teardown cancels it so it cannot fire later.
+    let load_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // ★ REFUSE --overlay BEFORE ANYTHING IS SPAWNED (fix 2026-10-11, outside review; item A5). This
     // check used to run AFTER the spare cards had already been put to work, so refusing the overlay
@@ -3168,27 +3667,42 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
     // dies instantly with its output going to /dev/null, which looks exactly like a card doing work.
     let mut encoders: Vec<(String, String)> = Vec::new(); // [(render_node, va_driver)]
     let mut skipped: Vec<(String, String, String)> = Vec::new(); // [(render_node_or_card, name, reason)]
+    let mut marginal_cards: Vec<(String, String, String)> = Vec::new(); // [(render_node, name, why)]
     for g in &spares {
         let node = g.get("render_node").and_then(|v| v.as_str()).unwrap_or("");
         let (va, why) = va_driver(g);
-        if va.is_some() && !node.is_empty() {
-            encoders.push((base_of(node), va.unwrap()));
-        } else {
+        if va.is_none() || node.is_empty() {
             let key = if node.is_empty() { card_of(g) } else { base_of(node) };
             skipped.push((key, gpu_name(g), why.unwrap_or_else(|| "no render node".to_string())));
+            continue;
         }
+        // ★ THE MARGINAL RULE (A4): without `--spare`, a card whose host link is marginal is NOT used.
+        if only_spares.is_empty() {
+            if let Some(mw) = marginal(g) {
+                marginal_cards.push((base_of(node), gpu_name(g), mw));
+                continue;
+            }
+        }
+        encoders.push((base_of(node), va.unwrap()));
     }
-    if do_offload && which("ffmpeg").is_some() {
+    let want_work = !work.is_empty();
+    let want_load = test_load.is_some();
+    if do_offload && (want_work || want_load) && which("ffmpeg").is_some() {
         for (node, nm, why) in &skipped {
             println!("  spare: SKIPPED {} ({}) — {}", node, nm, why);
         }
-        if !work.is_empty() && encoders.is_empty() {
+        let what = if want_work { "job" } else { "load" };
+        for (node, nm, why) in &marginal_cards {
+            println!("  {}: NOT using {} ({}) — {}", what, node, nm, why);
+            println!("       Add --spare {} to include it anyway.", node);
+        }
+        if want_work && encoders.is_empty() {
             let r = "no spare card on this machine can encode (see the SKIPPED lines above)".to_string();
             println!("  work: no job started — {}", r);
             no_job_reason = Some(r);
         }
         let targets: Vec<(String, String)> = encoders.clone();
-        if !work.is_empty() {
+        if want_work {
             // ★ A REAL JOB. Real input, real output, on cards that are NOT the one running the game.
             if !Path::new(work).is_file() {
                 // One shape for every refusal in this file, so a reader learns it once — and so the
@@ -3225,6 +3739,7 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
                 println!("          (the job needs a directory it can write to; check the path)");
                 return 1;
             }
+            job_start_time = Some(epoch_secs()); // anything older than this is a STALE output
             let stem = stem_of(work);
             if split && targets.len() > 1 {
                 let total = media_duration(work);
@@ -3264,7 +3779,11 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
                 job_expect = total;
             } else {
                 if split {
-                    println!("  split: only one spare card has a render node — replicating instead, and saying so rather than calling it a split.");
+                    // ★ NOT ABOUT "RENDER NODES" (blocking item 12). A single eligible card
+                    // here means the OTHER spares were excluded — marginal (a narrow host link) or not
+                    // encodable — and the lines above already name which and why. Replication is a
+                    // different claim from division, and it is named as such.
+                    println!("  split: only one spare card is eligible to work — replicating instead (the others were skipped or are marginal; see the lines above), and saying so rather than calling it a split.");
                 }
                 for (node, va) in &targets {
                     if let Ok((out, ch)) = start_work(node, work, &outdir, &stem, -1, 0.0, 0.0, va) {
@@ -3287,30 +3806,81 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
                     }
                 }
             }
-        } else {
+        } else if want_load {
             for (node, va) in &encoders {
-                if let Ok(ch) = start_test_load(node, va) {
+                if let Ok(ch) = start_test_load(node, va, test_load.unwrap()) {
                     procs.push(ch);
                     proc_nodes.push(node.clone());
                 }
             }
             if !procs.is_empty() {
-                println!("  cards: {} spare card(s) running a SYNTHETIC TEST LOAD", procs.len());
-                println!("         (ffmpeg's own testsrc2 test pattern -> /dev/null). This proves the");
-                println!("         cards can be DRIVEN; it is not a job and produces nothing.");
-                println!("         For real work: spirit play --work <file> [--work-outdir DIR] -- <game>");
+                load_started = true;
+                // ★ A PARENT-SIDE WALL CLOCK, NOT JUST `-t` (blocking item 10). `-t` after
+                // `-i` bounds MEDIA time and `-re` paces the INPUT; a spare that cannot encode 1080p60
+                // in real time (an old card) falls behind, and wall time then runs past the cap without
+                // bound. This thread terminates the loads at `cap` seconds of WALL time; `-t` stays as
+                // the backstop, and the cancel flag lets teardown disarm it so it cannot fire later.
+                let cap = test_load.unwrap().max(0) as u64;
+                let pids: Vec<i32> = procs.iter().map(|p| p.id() as i32).collect();
+                let cancel = load_cancel.clone();
+                std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(cap);
+                    while std::time::Instant::now() < deadline {
+                        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    if !cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                        #[cfg(unix)]
+                        for pid in pids {
+                            unsafe {
+                                kill(pid, 15);
+                            }
+                        }
+                    }
+                });
+                println!(
+                    "  TEST LOAD on {} card(s) for {}s wall time, then it stops.",
+                    procs.len(),
+                    test_load.unwrap()
+                );
+                println!("         It writes no file. It only shows these cards can be driven.");
+                println!("         For real work: spirit play --work <file> [--split] -- <game>");
+            } else {
+                // ★ NO ENCODABLE SPARE IS SAID, NOT SILENT (blocking item 9). This used to
+                // fall straight to the exit message with nothing but SKIPPED lines before it.
+                let r = "no spare card on this machine can be driven (see the SKIPPED lines above)".to_string();
+                println!("  test-load: no load started — {}", r);
+                no_load_reason = Some(r);
             }
         }
-    } else if !work.is_empty() && do_offload {
+    } else if !want_work && !want_load {
+        // ★ THE DEFAULT, SAID OUT LOUD (A4, from the final outside read). Doing nothing silently would
+        // read as the tool being broken; saying nothing runs on the other cards makes the default
+        // honest rather than surprising.
+        println!("  no job given — your other cards will stay idle.");
+        println!("          give them a real job:      spirit play --work FILE -- CMD");
+        println!("          check they can be driven:  spirit doctor");
+    } else if want_work && do_offload {
         // ★ An absent tool must be SAID, not silently skipped (the README promises exactly this, and
         // the promise was false for ffmpeg). Found 2026-10-11 by an outside review. (Item A6.)
         let r = "ffmpeg is not installed, so no card can be given a job here".to_string();
         println!("  work: no job started — {}", r);
         no_job_reason = Some(r);
-    } else if !work.is_empty() {
+    } else if want_work {
         let r = "--no-offload was given, so no card was asked to do anything".to_string();
         println!("  work: no job started — {}", r);
         no_job_reason = Some(r);
+    } else if want_load && !do_offload {
+        // ★ THE THREE SILENT / FALSE TEST-LOAD CASES (blocking item 9). Each now names why.
+        let r = "--no-offload was given, so no card was asked to do anything".to_string();
+        println!("  test-load: no load started — {}", r);
+        no_load_reason = Some(r);
+    } else if want_load {
+        let r = "ffmpeg is not installed, so no card can be driven here".to_string();
+        println!("  test-load: no load started — {}", r);
+        no_load_reason = Some(r);
     }
     println!();
     println!("  launching…");
@@ -3380,9 +3950,16 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
     // A TEST LOAD IS A LOAD AND DIES WITH THE GAME. A JOB IS NOT: killing a half-finished transcode
     // leaves a truncated file and calls it done. Jobs are WAITED FOR, then each output is checked
     // for size and duration ON DISK — the artifact, never the child's exit code.
+    // ★ Disarm the wall-clock timer FIRST (blocking item 10): once tearing down there is nothing left
+    // for it to do, and leaving it armed could fire on a later, unrelated run in the same process.
+    load_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut job_rcs: Vec<i32> = Vec::new();
     if !work.is_empty() {
         for p in procs.iter_mut() {
-            let _ = p.wait();
+            match p.wait() {
+                Ok(st) => job_rcs.push(rc_of(&st)),
+                Err(_) => job_rcs.push(-1),
+            }
         }
     } else {
         // ★ ASK EACH LOAD WHETHER IT IS STILL ALIVE, BEFORE KILLING IT (fix 2026-10-11, from the
@@ -3408,37 +3985,48 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
     if !work.is_empty() && !procs.is_empty() {
         println!("  game exited (rc={}) — the job ran to completion (not stopped with the game)", rc);
         println!("  ── JOB OUTPUT ────────────────────────────────────────────────────────");
-        let mut got = 0.0f64;
-        let mut written = 0usize;
-        for (node, out) in &job_outputs {
-            if std::path::Path::new(out).is_file() {
+        // ★ A FILE IS EVIDENCE ONLY IF THIS RUN WROTE IT (blocking item 11). Two
+        // independent conditions now have to hold: the file was written after the job started, AND the
+        // child exited 0. (The output is also deleted before start in `start_work`.)
+        let mut results: Vec<(String, String, bool, f64)> = Vec::new();
+        for (i, (node, out)) in job_outputs.iter().enumerate() {
+            let rcode = job_rcs.get(i).copied().unwrap_or(1);
+            let fresh = Path::new(out).is_file()
+                && job_start_time
+                    .map(|t| mtime_secs(out).map(|m| m >= t - 1.0).unwrap_or(false))
+                    .unwrap_or(true);
+            let d = if fresh && rcode == 0 { media_duration(out) } else { 0.0 };
+            results.push((node.clone(), out.clone(), fresh && rcode == 0, d));
+        }
+        let got: f64 = results.iter().map(|(_, _, _, d)| *d).sum();
+        let written = results.iter().filter(|(_, _, ok, _)| *ok).count();
+        for (node, out, ok, d) in &results {
+            if *ok {
                 let sz = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
-                let d = media_duration(out);
-                if d > 0.0 {
-                    got += d;
-                    written += 1;
-                }
                 println!(
                     "  {:<14} {}  ({:.1} MB, {:.1}s)",
                     node,
                     base_of(out),
                     sz as f64 / 1048576.0,
-                    if d > 0.0 { d } else { 0.0 }
+                    d
                 );
             } else {
                 println!(
-                    "  {:<14} MISSING — {} was not written. The job failed; do not report it as done.",
+                    "  {:<14} MISSING/FAILED — {} was not written by THIS run (or the job exited nonzero). Do not report it as done.",
                     node, out
                 );
             }
         }
         if job_expect > 0.0 {
+            // ★ THE SPLIT HAS TO ADD BACK UP. Each slice is checked for existence AND duration AND a
+            // clean exit, and the sum is compared to the original — a missing or truncated slice is a
+            // job that silently lost the middle.
             println!("  ── SPLIT CHECK {}", "─".repeat(55));
             println!("  slices written      : {} of {}", written, job_outputs.len());
             println!("  slice durations sum : {:.1}s", got);
             println!("  original duration   : {:.1}s", job_expect);
             let tol = if job_expect * 0.01 < 1.0 { 1.0 } else { job_expect * 0.01 };
-            if (got - job_expect).abs() <= tol {
+            if written == job_outputs.len() && (got - job_expect).abs() <= tol {
                 println!("  ⇒ COMPLETE — the pieces reconstruct the whole input (within 1%).");
             } else {
                 println!(
@@ -3451,8 +4039,7 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
     } else if !work.is_empty() {
         // ★ DO NOT CLAIM A JOB THAT WAS NEVER STARTED (fix 2026-10-11, outside review; item A1). With
         // --work given but nothing able to run — --no-offload, no ffmpeg, or no card that can encode —
-        // this printed "the job ran to completion" over an empty output block. Nothing had run. That
-        // is the same class of false statement the tail was printing, in a different path.
+        // this printed "the job ran to completion" over an empty output block. Nothing had run.
         println!("  game exited (rc={})", rc);
         println!("  ── JOB OUTPUT {}", "─".repeat(56));
         println!(
@@ -3460,16 +4047,26 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
             no_job_reason.unwrap_or_else(|| "nothing was given the work".to_string())
         );
         println!("  Nothing was transcoded, so there is no output to check. The game ran normally.");
+    } else if want_load {
+        if load_started {
+            println!("  game exited (rc={}) — the bounded test load ended with the session", rc);
+        } else {
+            // ★ DO NOT SAY "test load stopped" WHEN NONE STARTED (blocking item 9).
+            println!(
+                "  game exited (rc={}) — NO TEST LOAD WAS STARTED ({}). The game ran normally.",
+                rc,
+                no_load_reason.clone().unwrap_or_else(|| "nothing was given the load".to_string())
+            );
+        }
     } else {
-        println!("  game exited (rc={}) — test load stopped", rc);
+        println!("  game exited (rc={}) — no work was running on the other cards", rc);
     }
     let elapsed = f64::max(t_game.elapsed().as_secs_f64(), 1e-6);
 
     // ★ THE TAIL — what the OTHER cards actually did. A feature you cannot see is indistinguishable
     // from one that is broken, and the loads are silent by design (ffmpeg's output goes to /dev/null).
     // So say it plainly, per card, and say "alive for" rather than claiming work was done.
-    if !procs.is_empty() || !job_outputs.is_empty() {
-        // Python builds `names` as a dict keyed on the node basename, so a later spare wins a collision.
+    if !procs.is_empty() || !job_outputs.is_empty() || want_load || (!want_work && !want_load) {
         let mut names: Vec<(String, String)> = Vec::new();
         for g in &spares {
             let r = g.get("render_node").and_then(|v| v.as_str()).unwrap_or("");
@@ -3485,11 +4082,67 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
         };
         println!();
         println!("  ── THE TAIL — what the other cards did ───────────────────────────────");
-        if !job_outputs.is_empty() {
-            for (node, out) in &job_outputs {
-                let ok = std::path::Path::new(out).is_file();
-                println!("  {:<12} {:<22} REAL JOB  {}", node, name_of(node),
-                         if ok { out.clone() } else { "FAILED — no file".to_string() });
+        if !want_work && !want_load {
+            // ★ SAY IDLE, DON'T SAY NOTHING (A4, from the final outside read). With the default now
+            // doing nothing, an empty tail would read as a broken tool. An explicit IDLE per card also
+            // shows the skipped ones are still accounted for.
+            for g in &spares {
+                let r = g.get("render_node").and_then(|v| v.as_str()).unwrap_or("");
+                let node = base_of(r);
+                if node.is_empty() {
+                    continue;
+                }
+                let nm = name_of(&node);
+                if let Some((_, _, w)) = skipped.iter().find(|(n, _, _)| n == &node) {
+                    println!("  {:<12} {:<22} SKIPPED — {}", node, nm, w);
+                } else {
+                    println!("  {:<12} {:<22} IDLE  (no job given)", node, nm);
+                }
+            }
+        } else if !job_outputs.is_empty() {
+            // ★ A file is a REAL JOB only when THIS run wrote it AND the child exited 0 (blocking
+            // item 11); otherwise it is named FAILED rather than reported as done.
+            for (i, (node, out)) in job_outputs.iter().enumerate() {
+                let rcode = job_rcs.get(i).copied().unwrap_or(1);
+                let ok = Path::new(out).is_file()
+                    && rcode == 0
+                    && job_start_time
+                        .map(|t| mtime_secs(out).map(|m| m >= t - 1.0).unwrap_or(false))
+                        .unwrap_or(true);
+                println!(
+                    "  {:<12} {:<22} REAL JOB  {}",
+                    node,
+                    name_of(node),
+                    if ok { out.clone() } else { "FAILED — no file from this run".to_string() }
+                );
+            }
+        } else if want_load && !load_started {
+            // ★ NOTHING RAN, AND WE SAY SO (blocking item 9). The old tail had no branch
+            // for "a load was asked for and none started", so it printed nothing at all here.
+            for g in &spares {
+                let r = g.get("render_node").and_then(|v| v.as_str()).unwrap_or("");
+                let node = base_of(r);
+                if node.is_empty() {
+                    continue;
+                }
+                let nm = name_of(&node);
+                if encoders.iter().any(|(n, _)| n == &node) {
+                    println!(
+                        "  {:<12} {:<22} NOT DRIVEN — {}",
+                        node,
+                        nm,
+                        no_load_reason
+                            .clone()
+                            .unwrap_or_else(|| "no load was started".to_string())
+                    );
+                } else {
+                    let why = skipped
+                        .iter()
+                        .find(|(n2, _, _)| n2 == &node)
+                        .map(|(_, _, w)| w.clone())
+                        .unwrap_or_else(|| "not used".to_string());
+                    println!("  {:<12} {:<22} SKIPPED — {}", node, nm, why);
+                }
             }
         } else {
             for g in &spares {
@@ -3499,14 +4152,25 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
                 let nm = name_of(&node);
                 if encoders.iter().any(|(n, _)| n == &node) {
                     match died_early.iter().find(|(n, _)| n == &node).map(|(_, rc)| *rc) {
-                        None => println!("  {:<12} {:<22} SYNTHETIC TEST LOAD — ran for the whole session ({:.0} s),",
-                                         node, nm, elapsed),
-                        Some(rc) => {
-                            // ★ Say what was SEEN, not what was hoped: this one was already gone before the
-                            // game exited, so it did not run the session however long the game lasted.
-                            println!("  {:<12} {:<22} SYNTHETIC TEST LOAD — EXITED EARLY (rc={}, before the game",
-                                     node, nm, rc);
-                            println!("  {:<12} {:<22}   exited): it did NOT run for the session.", "", "");
+                        None => {
+                            // ★ Say what was SEEN, not what was hoped: it is still alive, so what we
+                            // can honestly say is that it is still running, bounded by the wall clock.
+                            println!("  {:<12} {:<22} SYNTHETIC TEST LOAD — still running when the game exited",
+                                     node, nm);
+                            println!("  {:<12} {:<22}   ({:.0} s of session; bounded to {}s by the wall clock)",
+                                     "", "", elapsed, test_load.unwrap());
+                        }
+                        Some(rce) => {
+                            if rce == 0 {
+                                // ★ NORMAL COMPLETION IS NOT A FAULT (blocking item 9). The
+                                // load is DESIGNED to run for `cap` seconds and then stop; a clean rc 0
+                                // means it did exactly that. It used to be reported as "EXITED EARLY".
+                                println!("  {:<12} {:<22} SYNTHETIC TEST LOAD — COMPLETED its {}s bounded run, as designed",
+                                         node, nm, test_load.unwrap());
+                            } else {
+                                println!("  {:<12} {:<22} SYNTHETIC TEST LOAD — DIED (rc={}) before its {}s run finished",
+                                         node, nm, rce, test_load.unwrap());
+                            }
                         }
                     }
                     println!("  {:<12} {:<22} produced nothing (a job needs --work FILE)", "", "");
@@ -3558,6 +4222,8 @@ options:
   --scale F             render at F of native and let gamescope upscale it (0.3-1.0)
   --framegen N          frame generation at Nx, via lsfg-vk (2, 3 or 4)
   --overlay             show MangoHud over the game, via mangoapp
+  --test-load [SECS]    run a bounded synthetic load on the spare cards (default 60s, max 600) — it
+                        proves they can be driven and writes no file; nothing runs without this
   --work FILE           transcode FILE on the spare cards while you play (a real job)
   --work-outdir DIR     where a job's output goes (default: beside FILE)
   --split               divide ONE job across the spare cards instead of one job each
@@ -3733,17 +4399,27 @@ fn main() {
 }
 
 fn dispatch(argv: &[String]) -> i32 {
-    // ★ THE MARK, ON EVERY RUN — printed first, exactly as the Python `main()` does before argparse
-    // ever sees the argv. Skipped only for --json (a machine is reading), for `origin` itself, and for
-    // --version (which must print exactly one line).
-    if !argv.iter().any(|a| a == "--json") && !argv.iter().any(|a| a == "origin")
-        && !argv.iter().any(|a| a == "--version") {
+    // ★ ONLY OUR OWN FLAGS COUNT, NOT THE GAME'S (A1). A flag means something to us only if it is the
+    // first token, or if it appears BEFORE the `--` that separates our arguments from the game's. So
+    // `spirit play -- ./game --version` LAUNCHES the game, and `spirit play -- ./game --json` still
+    // prints the mark — the game's flags are the game's, not ours.
+    let ours: &[String] = match argv.iter().position(|a| a == "--") {
+        Some(i) => &argv[..i],
+        None => argv,
+    };
+    let suppress_mark = ours.iter().any(|a| a == "origin")
+        || (!argv.is_empty() && argv[0] == "--version")
+        || (!argv.is_empty()
+            && (argv[0] == "probe" || argv[0] == "roles")
+            && ours.iter().any(|a| a == "--json"));
+    if !suppress_mark {
         origin_cmd(false);
     }
 
     // ★ --version prints THE one version string and nothing else: a single line, exit 0, no origin
     // mark and no help footer. Handled ahead of every other branch so it matches the Python exactly.
-    if argv.iter().any(|a| a == "--version") {
+    // Only the FIRST token — a `--version` after `--` belongs to the game.
+    if !argv.is_empty() && argv[0] == "--version" {
         println!("spirit {}", VERSION);
         return 0;
     }
@@ -3823,6 +4499,7 @@ fn dispatch(argv: &[String]) -> i32 {
         let mut only_spares = String::new();
         let mut work_outdir = String::new();
         let mut split = false;
+        let mut test_load: Option<i64> = None;
         let mut i = 1;
         while i < argv.len() {
             if argv[i] == "--no-offload" {
@@ -3880,6 +4557,31 @@ fn dispatch(argv: &[String]) -> i32 {
             } else if argv[i] == "--overlay" {
                 overlay = true;
                 i += 1;
+            } else if argv[i] == "--test-load" || argv[i].starts_with("--test-load=") {
+                // ★ OPT-IN, AND BOUNDED (A4, from the final outside read). The synthetic load used to
+                // be the default and ran until the game exited; it is now something you ask for, for a
+                // stated number of seconds, and it stops. `--test-load=30` and `--test-load 30` both work.
+                let raw: String;
+                if let Some(r) = argv[i].strip_prefix("--test-load=") {
+                    raw = r.to_string();
+                    i += 1;
+                } else if i + 1 < argv.len()
+                    && !argv[i + 1].is_empty()
+                    && argv[i + 1].chars().all(|c| c.is_ascii_digit())
+                {
+                    raw = argv[i + 1].clone();
+                    i += 2;
+                } else {
+                    raw = "60".to_string();
+                    i += 1;
+                }
+                match py_int(&raw) {
+                    Some(v) => test_load = Some(std::cmp::max(1, std::cmp::min(v, 600))),
+                    None => {
+                        eprintln!("spirit play: --test-load needs seconds, e.g. --test-load 30");
+                        return 2;
+                    }
+                }
             } else if argv[i] == "-h" || argv[i] == "--help" {
                 // ★ Without this, `play --help` fell through to `rest` and was executed as the game.
                 println!("{}", PLAY_USAGE);
@@ -3905,7 +4607,7 @@ fn dispatch(argv: &[String]) -> i32 {
             }
         }
         return play(&probe(), &rest, offload, scale, framegen, overlay, &work, &work_outdir, split,
-                    &only_spares);
+                    &only_spares, test_load);
     }
 
     let cmd = argv[0].as_str();

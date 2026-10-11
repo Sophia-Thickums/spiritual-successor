@@ -27,6 +27,10 @@ FLEETWEAK=$PARENT/fleet-monitor-on-weak.example.json
 
 [ -x "$RS" ] || { echo "build first: cargo build --release" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "python3 required" >&2; exit 1; }
+# ★ ASSERT THE FIXTURES EXIST (B2). If a fake-fleet fixture is missing, every case that reads it
+# silently becomes "both sides refuse identically" and PASSES. Fail loudly instead.
+[ -f "$FLEET10" ]   || { echo "test.sh: fixture missing: $FLEET10" >&2; exit 1; }
+[ -f "$FLEETWEAK" ] || { echo "test.sh: fixture missing: $FLEETWEAK" >&2; exit 1; }
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -36,6 +40,7 @@ NOFFMPEG="$TMP/bin-noff"; mkdir -p "$NOFFMPEG"       # no ffmpeg  -> "ffmpeg is 
 NOFFPROBE="$TMP/bin-nofp";mkdir -p "$NOFFPROBE"      # no ffprobe -> split: REFUSED
 NOGS="$TMP/bin-nogs";     mkdir -p "$NOGS"           # no gamescope -> overlay: REFUSED
 HANG="$TMP/bin-hang";     mkdir -p "$HANG"           # gamescope --help never returns
+NOTOOLS="$TMP/bin-notools"; mkdir -p "$NOTOOLS"      # no vulkaninfo/unshare/gamescope -> doctor UNKNOWNs
 UNLOG="$TMP/un.log"; FFLOG="$TMP/ff.log"; GSLOG="$TMP/gs.log"
 : > "$UNLOG"; : > "$FFLOG"; : > "$GSLOG"
 REAL_PATH=$PATH
@@ -82,35 +87,100 @@ dump("modes.json", [
     gpu("card1", "0000:02:00.0", "RX 6800", "amdgpu", 16384, True, "renderD129", 54.4),
     gpu("card0", "0000:01:00.0", "RX 9070 XT", "amdgpu", 16304, False, "renderD128"),
 ])
+# ★ DOCTOR FIXTURES (C): real card NAMES, so the live sysfs telemetry / connector reads apply, and
+# explicit vendor:device so one fleet PASSES the individual-pin check and one DUPLICATES it.
+def dgpu(card, bdf, name, out, gbps, vid="1002", did="0001", integ=False, mw=16, gen="Gen5"):
+    return {"card": card, "bdf": bdf, "name": name, "driver": "amdgpu",
+            "vendor": "0x" + vid, "device": "0x" + did, "integrated": integ,
+            "render_node": "renderD" + card[4:], "vram_total_mib": 16384, "vram_used_mib": 0,
+            "display_outputs": 1 if out else 0, "connectors_total": 3, "has_output": out,
+            "link": {"binding_element": "0000:00:00.0", "max_width": mw, "max_gen": gen,
+                     "gbps_max": gbps, "current_width": mw, "current_gen": gen,
+                     "gbps_current": gbps, "idle_degraded": False,
+                     "own_reports_width": mw, "capped_by_topology": False}}
+dump("onecard.json", [dgpu("card1", "0000:03:00.0", "RX 7900 XTX", True, 54.4)])
+dump("dup.json", [dgpu("card1", "0000:03:00.0", "RX 7900 XTX", True, 54.4, vid="1002", did="0000"),
+                  dgpu("card2", "0000:11:00.0", "RX 6600", False, 0.85, vid="1002", did="0000",
+                       mw=1, gen="Gen3")])
+# ★ A fleet that can PASS every doctor check (exit 0): TWO distinct cards, so the routing-isolation
+# check gets past its one-GPU UNKNOWN, and each vendor:device is unique so individual-pin PASSES.
+# Used with the smart-vulkaninfo stub (below), which honours the pin like the real one.
+dump("doctorok.json", [dgpu("card1", "0000:03:00.0", "RX 7900 XTX", True, 54.4, vid="1002", did="744c"),
+                       dgpu("card2", "0000:11:00.0", "RX 6600", False, 13.5, vid="1002", did="73ff",
+                            mw=16, gen="Gen4")])
+# ★ SPLIT FIXTURES: non-marginal, encodable spares so a real SPLIT runs and the on-disk
+# COMPLETE/INCOMPLETE arithmetic is exercised (2 parts sum back; 3 do not).
+dump("split2.json", [
+    gpu("card0", "0000:01:00.0", "RX 9070 XT", "amdgpu", 16304, True, "renderD128", 54.4),
+    gpu("card1", "0000:02:00.0", "RX 6800", "amdgpu", 16384, False, "renderD129"),
+    gpu("card2", "0000:03:00.0", "RX 6600", "amdgpu", 8192, False, "renderD130"),
+])
+dump("split3.json", [
+    gpu("card0", "0000:01:00.0", "RX 9070 XT", "amdgpu", 16304, True, "renderD128", 54.4),
+    gpu("card1", "0000:02:00.0", "RX 6800", "amdgpu", 16384, False, "renderD129"),
+    gpu("card2", "0000:03:00.0", "RX 6600", "amdgpu", 8192, False, "renderD130"),
+    gpu("card3", "0000:04:00.0", "RX 5700", "amdgpu", 8192, False, "renderD131"),
+])
 PYEOF
 : > "$TMP/job.mkv"          # a real (tiny, empty) input for --work
-: > "$TMP/nonfile-dir"      # used as the NON-file --work argument
+mkdir -p "$TMP/nonfile-dir" # ★ a DIRECTORY (B3): the --work case must hit the REFUSED branch, not the normal path
+
+# ★ ISOLATE HOME FOR EVERY --framegen CASE (B4). `_ensure_lsfg_profile` APPENDS to
+# ~/.config/lsfg-vk/conf.toml and copies it aside; a test run must never touch the user's real config.
+# This fake HOME carries a Lossless Scaling install on the lsfg-vk branch and a conf that ALREADY
+# names 'spirit 2x', so ensure_lsfg_profile takes the read-only "already present" path.
+FAKEHOME="$TMP/fakehome"
+mkdir -p "$FAKEHOME/.config/lsfg-vk" \
+         "$FAKEHOME/.local/share/Steam/steamapps/common/Lossless Scaling"
+: > "$FAKEHOME/.local/share/Steam/steamapps/common/Lossless Scaling/Lossless.dll"
+printf '"BetaKey" "lsfg-vk"\n' > "$FAKEHOME/.local/share/Steam/steamapps/appmanifest_993090.acf"
+printf '[[profile]]\nname = "spirit 2x"\nmultiplier = 2\n' > "$FAKEHOME/.config/lsfg-vk/conf.toml"
 
 # ── stubs on PATH ─────────────────────────────────────────────────────────────────────────────
-# unshare: log the WHOLE argv, then do what `unshare -rm sh -c SCRIPT sh HIDE$ cmd...` does —
-# drop -rm, and hand the rest to the shell. Nothing is actually namespaced or mounted.
+# ★ unshare: RECORD THE ARGV AND ATTEMPT NO REAL MOUNT (B1). The old stub dropped -rm and ran the
+# hide script, so `mount --bind /dev/null /dev/dri/<node>` was attempted against the host's real
+# render nodes — harmless as a user, but as ROOT it would bind over the host's LIVE GPU nodes. This
+# stub reproduces only the STDERR the real path would print when the bind fails (an unprivileged
+# user) and runs the command; it never mounts anything.
 cat > "$STUB/unshare" <<'EOF'
 #!/bin/sh
 { for a in "$@"; do printf 'ARG[%s]\n' "$a"; done; } >> "$STUB_UN"
-shift
+if [ "${2:-}" = "sh" ] && [ "${3:-}" = "-c" ]; then
+    shift 5                 # -rm sh -c SCRIPT sh
+    hide="${1:-}"; shift    # the hidden node list
+    for n in $hide; do
+        [ -e "/dev/dri/$n" ] && \
+            echo "  wall: could NOT hide /dev/dri/$n - the game can still see this card" >&2
+    done
+    exec "$@"
+fi
+shift                       # e.g. `unshare -Urm true` -> run `true`
 exec "$@"
 EOF
-# ffmpeg: log argv + the LIBVA driver the tool chose for THIS card (the thing that was never
-# checked), then either linger (a SYNTHETIC TEST LOAD) or exit at once (a --work job).
+# ffmpeg: log argv + the LIBVA driver the tool chose for THIS card, then either linger (a SYNTHETIC
+# TEST LOAD) or finish at once (a --work job). ★ A JOB NOW WRITES ITS OUTPUT FILE (B3) so the
+# on-disk COMPLETE/INCOMPLETE arithmetic and the JOB OUTPUT line are actually exercised, instead of
+# every output arriving MISSING.
 cat > "$STUB/ffmpeg" <<'EOF'
 #!/bin/sh
 printf 'FFMPEG ARGS: %s\nLIBVA=%s\n' "$*" "$LIBVA_DRIVER_NAME" >> "$STUB_FF"
 case " $* " in *" -f null "*) exec sleep 30 ;; esac   # a test load: stays alive, dies with the game
-exit 0                                               # a job: "finishes" and writes nothing
+for last; do :; done                                  # a job: write the file the tool checks on disk
+[ -n "${last:-}" ] && : > "$last"
+exit 0
 EOF
 cat > "$STUB/vulkaninfo" <<'EOF'
 #!/bin/sh
 echo "deviceName stub"
 EOF
-# ffprobe: a fixed duration, so --split has something to divide.
+# ffprobe: the input clip is 120 s; a SPLIT PART reports its own share, so a correct 2-way split sums
+# back to the input (COMPLETE) and anything else does not (INCOMPLETE) — B3.
 cat > "$STUB/ffprobe" <<'EOF'
 #!/bin/sh
-echo 120.000
+case "$*" in
+    *_part1.mp4|*_part2.mp4) echo 60.000 ;;
+    *)                       echo 120.000 ;;
+esac
 EOF
 # gamescope: --help prints its help to STDERR (it contains "fsr"); otherwise log argv, run the game.
 cat > "$STUB/gamescope" <<'EOF'
@@ -137,6 +207,47 @@ ln -sf "$STUB/vulkaninfo" "$NOGS/vulkaninfo"
 # A non-exec stub (sh spawning sleep) leaves an orphan holding the pipe and costs ~60 s.
 printf '#!/bin/sh\nexec sleep 60\n' > "$HANG/gamescope"
 chmod +x "$HANG/gamescope"
+# ★ NOTOOLS: just enough PATH to launch the interpreter, and NO vulkaninfo/unshare/gamescope, so
+# doctor's optional checks all land on UNKNOWN rather than PASS (C).
+ln -sf "$(command -v python3)" "$NOTOOLS/python3"
+ln -sf "$(command -v sh)"      "$NOTOOLS/sh"
+
+# ★ VKOK: the normal stubs, but a vulkaninfo that HONOURS the exclusive pin like the real one — it
+# reads MESA_VK_DEVICE_SELECT=<vid>:<did>! and prints exactly that one device's vendorID/deviceID.
+# Without this, doctor's routing-isolation check always saw a count but no id, so no fake fleet could
+# ever reach the ALL CHECKS PASSED (exit 0) outcome.
+VKOK="$TMP/bin-vkok"; mkdir -p "$VKOK"
+cat > "$VKOK/vulkaninfo" <<'EOF'
+#!/bin/sh
+sel="${MESA_VK_DEVICE_SELECT:-}"
+sel="${sel%!}"
+vid="${sel%%:*}"; did="${sel#*:}"
+echo "deviceName stub GPU"
+[ -n "$vid" ] && echo "  vendorID = 0x$vid"
+[ -n "$did" ] && echo "  deviceID = 0x$did"
+EOF
+chmod +x "$VKOK/vulkaninfo"
+ln -sf "$STUB/unshare"    "$VKOK/unshare"
+ln -sf "$STUB/gamescope"  "$VKOK/gamescope"
+ln -sf "$STUB/ffmpeg"     "$VKOK/ffmpeg"
+ln -sf "$STUB/ffprobe"    "$VKOK/ffprobe"
+
+# ★ FASTLOAD: a test load that COMPLETES at once (exits 0) instead of lingering, so the tail's
+# "COMPLETED its Ns bounded run, as designed" branch is actually exercised.
+FASTLOAD="$TMP/bin-fastload"; mkdir -p "$FASTLOAD"
+cat > "$FASTLOAD/ffmpeg" <<'EOF'
+#!/bin/sh
+printf 'FFMPEG ARGS: %s\nLIBVA=%s\n' "$*" "$LIBVA_DRIVER_NAME" >> "$STUB_FF"
+case " $* " in *" -f null "*) exit 0 ;; esac   # a test load: completes immediately
+for last; do :; done
+[ -n "${last:-}" ] && : > "$last"
+exit 0
+EOF
+chmod +x "$FASTLOAD/ffmpeg"
+ln -sf "$STUB/unshare"    "$FASTLOAD/unshare"
+ln -sf "$STUB/gamescope"  "$FASTLOAD/gamescope"
+ln -sf "$STUB/vulkaninfo" "$FASTLOAD/vulkaninfo"
+ln -sf "$STUB/ffprobe"    "$FASTLOAD/ffprobe"
 
 # normalizer for the live probe --json (drops the fields that legitimately flap run to run)
 NORM_JSON='import sys,json
@@ -151,6 +262,9 @@ print(json.dumps(d,indent=2,sort_keys=True))'
 
 pass=0; fail=0
 DEV=""                   # SPIRIT_DEVICES value for the pair; "" = unset for both children
+CHILD_HOME=""            # when non-empty, the CHILD's HOME is replaced (isolate ~/.config writes)
+PYBIN="python3"          # the Python interpreter for the pair; overridden to an ABSOLUTE path when
+                         # PATH is emptied (an empty PATH cannot find `python3` by name)
 
 kill_stubs() {
   pkill -f "$STUB/unshare"    2>/dev/null
@@ -159,13 +273,19 @@ kill_stubs() {
   true
 }
 
-# run_side <binary> <args...> — SPIRIT_DEVICES/PATH/stub logs are granted to the CHILD, never
+# run_side <binary> <args...> — SPIRIT_DEVICES/PATH/HOME/stub logs are granted to the CHILD, never
 # exported into this shell (a leaked export poisons every later reading with a fake fleet).
 run_side() {
   bin=$1; shift
-  if [ -n "$DEV" ]; then
+  if [ -n "$DEV" ] && [ -n "$CHILD_HOME" ]; then
+    env SPIRIT_DEVICES="$DEV" HOME="$CHILD_HOME" PATH="$PATHVAL" \
+        STUB_UN="$UNLOG" STUB_FF="$FFLOG" STUB_GS="$GSLOG" "$bin" "$@"
+  elif [ -n "$DEV" ]; then
     env SPIRIT_DEVICES="$DEV" PATH="$PATHVAL" STUB_UN="$UNLOG" STUB_FF="$FFLOG" STUB_GS="$GSLOG" \
         "$bin" "$@"
+  elif [ -n "$CHILD_HOME" ]; then
+    env -u SPIRIT_DEVICES HOME="$CHILD_HOME" PATH="$PATHVAL" \
+        STUB_UN="$UNLOG" STUB_FF="$FFLOG" STUB_GS="$GSLOG" "$bin" "$@"
   else
     env -u SPIRIT_DEVICES PATH="$PATHVAL" STUB_UN="$UNLOG" STUB_FF="$FFLOG" STUB_GS="$GSLOG" \
         "$bin" "$@"
@@ -179,7 +299,7 @@ compare() {
   label=$1; dev=$2; shift 2
   DEV=$dev
   : > "$UNLOG"; : > "$FFLOG"; : > "$GSLOG"
-  run_side python3 "$PY" "$@" >"$TMP/py.out" 2>"$TMP/py.err"; prc=$?
+  run_side "$PYBIN" "$PY" "$@" >"$TMP/py.out" 2>"$TMP/py.err"; prc=$?
   cp "$UNLOG" "$TMP/py.un"; cp "$GSLOG" "$TMP/py.gs"; sort "$FFLOG" > "$TMP/py.ff"
   : > "$UNLOG"; : > "$FFLOG"; : > "$GSLOG"
   run_side "$RS" "$@" >"$TMP/rs.out" 2>"$TMP/rs.err"; rrc=$?
@@ -276,10 +396,12 @@ compare "play --scale abc"             "$FLEET10" play --scale abc --no-offload 
 compare "play --scale (no value)"      "$FLEET10" play --scale
 compare "play --framegen 7"            "$FLEET10" play --framegen 7 --no-offload -- /bin/echo HI
 compare "play --framegen abc"          "$FLEET10" play --framegen abc --no-offload -- /bin/echo HI
-# positive --framegen on this box resolves to an UNAVAILABLE lsfg state, so it launches
-# without writing any config (state-free, deterministic). A box with a working install
-# would append a profile instead — that path is exercised by the real-box diff script.
+# ★ ISOLATE HOME (B4): on a box where lsfg is INSTALLED this reaches ensure_lsfg_profile, which
+# APPENDS to ~/.config/lsfg-vk/conf.toml. The child gets a fake HOME whose conf already names the
+# profile, so it takes the read-only "already present" path and the user's REAL config is untouched.
+CHILD_HOME="$FAKEHOME"
 compare "play --framegen 2"            "$FLEET10" play --framegen 2 --no-offload -- /bin/echo HI
+CHILD_HOME=""
 
 echo
 echo "== play: the game command that cannot be found (B) and a SIGNALLED game (C2) =="
@@ -323,21 +445,86 @@ compare "play --spare (no value)"       "$FLEET10" play --spare
 echo
 echo "== play --overlay: the refusal happens BEFORE anything is spawned (A5) =="
 compare "play --overlay (gamescope READY)" "$FLEET10" play --overlay -- /bin/echo HI
+CHILD_HOME="$FAKEHOME"
 compare "play --overlay --framegen 2"      "$FLEET10" play --overlay --framegen 2 -- /bin/echo HI
+CHILD_HOME=""
 PATHVAL="$NOGS:$REAL_PATH"
 compare "play --overlay, gamescope absent" "$FLEET10" play --overlay -- /bin/echo HI
 PATHVAL="$STUB:$REAL_PATH"
 
 echo
 echo "== C5: a hung child must not hang THIS tool (gamescope --help, 15 s each side) =="
+# ★ WIRE THE HANG DIRECTORY ONTO PATHVAL (B3): it was built but never used, so the case never hung.
+PATHVAL="$HANG:$REAL_PATH"
 compare "boost with a hung gamescope"  "$FLEET10" boost
+PATHVAL="$STUB:$REAL_PATH"
 
 echo
 echo "== play: gamescope wrapping, with a readable native mode (argv compared via the stub) =="
 compare "play --scale 0.7 (gamescope wrapped)" "$TMP/modes.json" play --scale 0.7 -- /bin/echo HI
+CHILD_HOME="$FAKEHOME"
 compare "play --scale 0.7 --framegen 2"        "$TMP/modes.json" play --scale 0.7 --framegen 2 -- /bin/echo HI
-compare "play --overlay (native readable)"     "$TMP/modes.json" play --overlay -- /bin/echo HI
 compare "play --overlay --framegen 2 (native)" "$TMP/modes.json" play --overlay --framegen 2 -- /bin/echo HI
+CHILD_HOME=""
+compare "play --overlay (native readable)"     "$TMP/modes.json" play --overlay -- /bin/echo HI
+
+echo
+echo "== C: the play DEFAULT — nothing runs without --work/--test-load (A4) =="
+compare "play default (IDLE tail, nothing starts)"    "$FLEET10"   play -- /bin/echo HI
+compare "play default (weak fleet)"                    "$FLEETWEAK" play -- /bin/echo HI
+compare "play default --no-offload"                    "$FLEET10"   play --no-offload -- /bin/echo HI
+compare "play -- ./game --version LAUNCHES (A1)"       "$FLEET10"   play --no-offload -- /bin/echo --version
+compare "play -- ./game --json still prints the mark"  "$FLEET10"   play --no-offload -- /bin/echo --json
+
+echo
+echo "== C: --test-load [SECS] (A4) =="
+compare "play --test-load 5 (bounded load)"   "$TMP/two.json" play --test-load 5 -- /bin/echo HI
+compare "play --test-load=30 (= form)"        "$TMP/two.json" play --test-load=30 -- /bin/echo HI
+compare "play --test-load (default 60)"       "$TMP/two.json" play --test-load -- /bin/echo HI
+compare "play --test-load=abc (exit 2)"       "$FLEET10"      play --test-load=abc -- /bin/echo HI
+compare "play --test-load= (empty, exit 2)"   "$FLEET10"      play --test-load= -- /bin/echo HI
+# ★ THE TWO NOW-DISTINCT REPORTING PATHS (/2.5): a load that COMPLETES its bounded run
+# (rc 0 → "COMPLETED its Ns bounded run, as designed") vs one still running when the game exits
+# (bounded by the parent-side wall clock).
+PATHVAL="$FASTLOAD:$REAL_PATH"
+compare "play --test-load 6 (load COMPLETES the run)"     "$TMP/two.json" play --test-load 6 -- /bin/sh -c 'sleep 1'
+PATHVAL="$STUB:$REAL_PATH"
+compare "play --test-load 5 (load capped, still running)" "$TMP/two.json" play --test-load 5 -- /bin/echo HI
+
+echo
+echo "== C: the MARGINAL rule and its --spare override (A4) =="
+compare "play --work marginal exclusion (NOT using)"  "$FLEET10" play --work "$TMP/job.mkv" -- /bin/echo HI
+compare "play --spare override includes a marginal"   "$FLEET10" play --spare renderD129 --work "$TMP/job.mkv" -- /bin/echo HI
+
+echo
+echo "== C: plan / fg additions (A2/A3) =="
+compare "plan --vram-mib 6898 (A3 figures)"   "$FLEET10" plan --workload 1440p60-framegen --vram-mib 6898
+compare "fg --res 1440p60 (link bound)"       "$FLEET10" fg --res 1440p60
+
+echo
+echo "== C: a real SPLIT — COMPLETE (2 parts sum back) vs INCOMPLETE (3 do not) (B3) =="
+compare "play --split 2 cards -> COMPLETE"    "$TMP/split2.json" play --work "$TMP/job.mkv" --split -- /bin/echo HI
+compare "play --split 3 cards -> INCOMPLETE"  "$TMP/split3.json" play --work "$TMP/job.mkv" --split -- /bin/echo HI
+compare "play --work replication writes output" "$TMP/split2.json" play --work "$TMP/job.mkv" -- /bin/echo HI
+compare "play --work non-file -> REFUSED (B3)" "$FLEET10" play --work "$TMP/nonfile-dir" -- /bin/echo HELLO
+
+echo
+echo "== C: doctor in its THREE outcome states — exit 0 / 1 / 3 (A5) =="
+# (0) ALL CHECKS PASSED: distinct cards + a vulkaninfo that HONOURS the pin, so routing-isolation
+#     PASSES (a bare count with no matching id could only ever FAIL or be UNKNOWN).
+PATHVAL="$VKOK:$REAL_PATH"
+compare "doctor ALL CHECKS PASSED (exit 0)"    "$TMP/doctorok.json" doctor
+PATHVAL="$STUB:$REAL_PATH"
+# (1) PROBLEMS FOUND: two cards share vendor:device, so the pin cannot tell them apart.
+compare "doctor duplicate vid:did (exit 1)"    "$TMP/dup.json"     doctor
+# (3) NOT VERIFIED: no vulkaninfo/unshare/gamescope on PATH, so the device pin (a CORE check) cannot
+#     be tested at all. ★ The interpreter is named by ABSOLUTE PATH, because with an EMPTY PATH
+#     `python3` is not resolvable by name.
+PYBIN="$(command -v python3)"
+PATHVAL=""
+compare "doctor tools-absent (empty PATH; exit 3)" "$TMP/onecard.json" doctor
+PATHVAL="$STUB:$REAL_PATH"
+PYBIN="python3"
 
 echo
 echo "== doctor (fake fleet; uses real vulkaninfo/gamescope/lsfg, identical on both sides) =="

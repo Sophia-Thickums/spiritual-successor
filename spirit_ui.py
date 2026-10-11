@@ -10,7 +10,7 @@ Flags:       --port N     listen on this port instead of a free one
              --no-open    do not open a browser
              --print-url  start, print the URL, and keep running
 
-The page is served on 127.0.0.1 only, under a one-time token path. Why the token exists is
+The page is served on 127.0.0.1 only, under a token in its path. Why the token exists is
 explained next to TOKEN below.
 """
 
@@ -212,7 +212,7 @@ pre { background: #1c1b19; color: #e8e4dc; padding: 14px 16px; border-radius: 8p
 """
 
 JS = """
-function statusUrl(id) { return "__TOKEN__/api/job?id=" + encodeURIComponent(id); }
+function statusUrl(id) { return "/__TOKEN__/api/job?id=" + encodeURIComponent(id); }
 function poll(jid, pre, btn) {
   function tick() {
     fetch(statusUrl(jid)).then(function (r) { return r.json(); }).then(function (d) {
@@ -242,7 +242,7 @@ function launch() {
   var body = "cmd=" + encodeURIComponent(cmd) +
              "&scale=" + encodeURIComponent(document.getElementById("scale").value) +
              "&framegen=" + encodeURIComponent(document.getElementById("framegen").value);
-  fetch("__TOKEN__/api/play", { method: "POST",
+  fetch("/__TOKEN__/api/play", { method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: body })
     .then(function (r) { return r.json(); })
     .then(function (d) {
@@ -256,7 +256,7 @@ function doctor() {
   btn.disabled = true;
   pre.classList.remove("hidden");
   pre.textContent = "Running\\u2026";
-  fetch("__TOKEN__/api/doctor", { method: "POST" })
+  fetch("/__TOKEN__/api/doctor", { method: "POST" })
     .then(function (r) { return r.json(); })
     .then(function (d) {
       if (d.error) { pre.textContent = d.error; btn.disabled = false; return; }
@@ -276,7 +276,7 @@ PAGE = """<!doctype html>
 
 <section>
   <h2>Your cards</h2>
-  <table><thead><tr><th>Card</th><th>Link (measured)</th><th>Doing</th></tr></thead>
+  <table><thead><tr><th>Card</th><th>Link (estimated)</th><th>Doing</th></tr></thead>
   <tbody>__CARDS__</tbody></table>
 </section>
 
@@ -317,7 +317,7 @@ PAGE = """<!doctype html>
   <pre id="docout" class="hidden"></pre>
 </section>
 
-<p class="note honest">Linux. No root. No dependencies. Everything on this page is read from
+<p class="note honest">Linux. No root. No packages to install. Everything on this page is read from
 your own machine.</p>
 </main>
 <script>
@@ -359,7 +359,7 @@ def render_page():
             link_txt = "%s GB/s max" % r.get("link_gbps_max")
         is_main = "display" in (r.get("roles") or [])
         doing = ('<span class="mine">your game</span>' if is_main
-                 else '<span class="spare">spare &mdash; does the jobs</span>')
+                 else '<span class="spare">spare &mdash; available for jobs</span>')
         rows.append("<tr><td>%s</td><td>%s</td><td>%s</td></tr>"
                     % (html.escape(name), html.escape(link_txt), doing))
     cards_html = "\n".join(rows) or '<tr><td colspan="3">No cards found.</td></tr>'
@@ -438,7 +438,7 @@ class Handler(BaseHTTPRequestHandler):
         return bool(seg) and seg[0] == TOKEN
 
     def _forbidden(self):
-        body = b"No token. This page only answers under its own one-time URL.\n"
+        body = b"No token. This page only answers under its own URL, with the token in the path.\n"
         self.send_response(403)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

@@ -1185,3 +1185,122 @@ the whole argument list per subcommand. **The bug only became reachable once the
    in practice.
 3. Python's tracebacks for `run` with a nonexistent command, and for `--overlay --no-offload` with an
    unreadable native mode, are not reproducible in the ports.
+
+
+---
+
+## ★ THE TWO FRAME-GEN FIGURES THE README QUOTES (recorded 2026-10-11, so they are checkable)
+
+The README says that with frame generation on, "on one title here that figure fell about 9%; on another it
+did not move at all". Both halves come from real runs, and until this entry neither was in this log — which
+made them unverifiable by a reader. Recorded here with their limits.
+
+**The ~9% — Boundary, ray tracing, native 2560x1440, frame gen the only difference between the pair.**
+Frame times read from the benchmark's own saved CSV (6,547 and 6,543 samples), not from its on-screen
+counter:
+
+| run | frames | mean ms | median ms | 99th ms | the GAME's own rate |
+|---|---|---|---|---|---|
+| frame gen **OFF** | 4,892 | 23.98 | 22.44 | 48.66 | **41.7** |
+| frame gen **2x** | 4,418 | 26.55 | 24.34 | 49.33 | **37.7** |
+
+**⇒ The game gets SLOWER with frame generation on — about 9.5% — because it is paying for the
+interpolation.** That is the trade the README describes. **Limits, stated so it is not over-read:** one
+pair, not a distribution; the two runs were not interleaved; and the scene ramps, so a mean understates
+the median. It is enough to say "the game's own figure falls", not enough to quote a precise percentage.
+
+**The "did not move at all" — 23 with frame gen on, 23 with it off, identical, twice.** Measured on the
+witness's own test workload, where the game's counter was read alongside the present counter. Two runs
+each way, same figure. This is the source of the sentence in the code comment above `COUNTER_LAYER`.
+
+**What both halves agree on, and the only part that should be quoted:** the game's own FPS counter cannot
+see the frames frame generation adds, and with it on the game may be doing less work. Neither figure is
+evidence about whether the interpolated frames look right — no counter can answer that.
+
+
+---
+
+# ★★★★ THE REPAIR ROUND — the defaults, the doctor, and the headline (2026-10-11, 16:40-17:00)
+
+After the verdict of NO, three design decisions were taken to an outside reader before anything was
+built, because guessing at them is how the previous round went wrong. All three recommendations were
+adopted. The reasoning is recorded here because the next person to touch this needs the WHY.
+
+## 1. `spirit play` NO LONGER DOES ANYTHING UNINVITED
+The old default put a synthetic encode on every encodable spare card for the whole session. Three things
+were wrong with it, and the second is the one that settles it:
+- it contradicts this file's own `--spare` comment — *"the human's risk to take, not a default we assume
+  for them"*;
+- **it is the exact shape of the incident in this log** where a benchmark enumerated every display
+  device, reached a card on an external dock, and took the machine down — a user who typed
+  `spirit play -- ./game` did not ask for that;
+- it had never been measured to leave the game alone.
+
+**Now:** no `--work` and no `--test-load` means nothing runs. The tool says so before launching and at
+exit, and THE TAIL prints `IDLE (no job given)` per card — because an empty tail reads as a broken tool.
+
+**The load is opt-in and bounded: `--test-load [SECS]`, default 60, hard-capped at 600.** And it is now
+paced to real time (`ffmpeg -re`). **Without `-re` it was never the load it claimed to be**: ffmpeg
+generates a test pattern as fast as it can encode it, so the old "load for the session" was true only
+because nothing ever stopped it, not because it was paced.
+
+## 2. A REAL JOB DOES NOT REACH A MARGINAL CARD UNLESS THE USER NAMES IT
+Same incident, same argument. Without `--spare`, `--work` and `--test-load` use only cards whose host link
+is not marginal — narrower than x4 anywhere along the chain, or narrower than the card itself reports.
+Marginal cards are **named**, with the reason and the exact flag to override:
+
+```
+  job: NOT using renderD129 (Vega 10) — the host link is narrower than the card reports (x4)
+       Add --spare renderD129 to include it anyway.
+```
+
+**On this very box that excludes our own 2017 cards by default** — the docked MI25 (x4 through a bridge)
+and the FE (x1 slot) — leaving only the integrated GPU. That is the rule working: our demos now need an
+explicit nod, and that is the correct cost. Verified both ways: default excludes them, `--spare` brings
+them back.
+
+## 3. `doctor` HAS FOUR VERDICTS, AND THE FOURTH IS THE POINT
+**PASS · FAIL · N/A · UNKNOWN.** The old rule was "any non-PASS is suspicious", which reported PROBLEMS
+FOUND on a working mixed-vendor machine: its telemetry check read a sysfs file only one vendor exposes.
+The states are now defined by what the tool actually depends on, and N/A is printed and explicitly NOT
+counted as a pass.
+
+| outcome | when | exit |
+|---|---|---|
+| `ALL CHECKS PASSED` | only PASS and N/A | 0 |
+| `WORKS, NOT FULLY VERIFIED (n items)` | no FAIL, at least one UNKNOWN | 2 |
+| `PROBLEMS FOUND` | any FAIL | 1 |
+
+Proven in all three states on this box: all-present → 0; tools removed from PATH → 2 with **zero FAIL
+lines**; two cards forced to share a vendor:device id → 1, naming the pair.
+
+Also in doctor now: the link check no longer branches on vendor (N/A only when integrated, UNKNOWN when
+attributes are absent but the device is not integrated); telemetry is per kind of card; **the role-plan
+check — which could not fail, because the role engine attaches a reason to every card — was replaced by a
+display-card check read independently from sysfs, so it CAN disagree with the engine**; a real
+namespace-wall line (`unshare -Urm true`); and duplicate vendor:device ids FAIL as "individual-pin",
+because the pin genuinely cannot separate them.
+
+### ★ AND ONE OF MY OWN FALSE FAILS, CAUGHT BY TESTING IT
+The frame-gen state `PARTIAL` was mapped to FAIL. `PARTIAL` means the layer is installed but its
+`lsfg-vk-cli` helper is missing — **and this tool does not use that helper**; it selects a profile by
+setting `LSFGVK_PROFILE` and lets the layer read it. So building the thing whose purpose is to stop false
+FAILs, I introduced a false FAIL, and only running it in the tools-missing state exposed it. Corrected to
+UNKNOWN.
+
+## 4. THE HEADLINE IS NOW REPRODUCIBLE BY THE READER
+The old opening described a run the shipped command cannot perform (four different files on four cards
+including the display card — that was an experiment script, and the busy display card even contradicted
+the tagline). Replaced with the claim a stranger can reproduce with `spirit play --work video.mp4
+--split -- ./game`, followed by the qualifier that has to sit next to it: **AMD verified, Intel written
+but never run, Nvidia can run the game but cannot take the job.** No speed number, no cost-to-game
+figure, no "different makers".
+
+## 5. AND THE FABRICATED NUMBERS ARE GONE
+- `fg` handed a stranger **our** measured handoff rates keyed by card *name*, so their `card0` inherited
+  the MI25's numbers and got a verdict about hardware we have never seen. It now computes an upper bound
+  from that card's own link and states that the real rate is a tenth to a third of it.
+- `plan` quoted ~800 MiB and ~8,200 MiB, neither of which appears anywhere in this log. Replaced with
+  1,514 / 6,898 / 10,692 MiB, each from a named run.
+- The ~9% frame-gen figure was real but lived outside the repo; it is now recorded in this file with its
+  limits, so a reader can check it.

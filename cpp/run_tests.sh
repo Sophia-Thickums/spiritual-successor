@@ -29,6 +29,10 @@ FLEET="$HERE/../fleet-10.example.json"
 
 [ -x "$CPP" ]     || { echo "build first: make" >&2; exit 1; }
 [ -f "$PYSPIRIT" ] || { echo "spirit.py not found at $PYSPIRIT" >&2; exit 1; }
+# ★ ASSERT THE FIXTURES EXIST (spec B2). If fleet-10.example.json is missing, every fake-fleet case
+# silently becomes "both sides refuse identically" and PASSES — a suite that tests nothing while looking
+# green. Fail loudly here instead.
+[ -f "$FLEET" ]   || { echo "FIXTURE MISSING: $FLEET (fake-fleet cases would silently pass)" >&2; exit 1; }
 
 WORK=$(mktemp -d)
 STUB="$WORK/bin"; mkdir -p "$STUB"
@@ -41,8 +45,23 @@ CHILD_HOME=""           # when non-empty, the CHILD's HOME is replaced (isolate 
 # ── stubs on PATH ─────────────────────────────────────────────────────────────
 cat > "$STUB/unshare" <<'EOF'
 #!/bin/sh
+# ★ RECORD ARGV AND NEVER TOUCH /dev/dri (spec B1). The real `unshare -rm` runs the hide script, which
+# bind-mounts /dev/null over each of the OTHER cards' render nodes — harmless as a user, but as ROOT it
+# would bind over the host's LIVE GPU nodes. So this stub never runs the script. For the mount form
+# (`-rm sh -c SCRIPT sh HIDELIST cmd...`) it prints the same stderr line the real (unprivileged) path
+# prints for each node it cannot hide, then runs the wrapped command, so the game's own output and exit
+# code are still exercised. For any other form (e.g. doctor's `unshare -Urm true`) it just runs the tail.
 { for a in "$@"; do printf 'ARG[%s]\n' "$a"; done; } >> "$STUB_UN"
-shift           # drop -rm; then act like: sh -c SCRIPT sh HIDESTR cmd...
+if [ "${1:-}" = "-rm" ] && [ "${3:-}" = "-c" ]; then
+    shift 4                 # drop: -rm sh -c SCRIPT
+    shift                   # drop the inner `sh` (its $0)
+    hide="$1"; shift        # the space-joined hide list, then the wrapped command
+    for n in $hide; do
+        echo "  wall: could NOT hide /dev/dri/$n - the game can still see this card" >&2
+    done
+    exec "$@"
+fi
+shift                       # drop the leading flag (e.g. -Urm) and run the rest
 exec "$@"
 EOF
 cat > "$STUB/ffmpeg" <<'EOF'
@@ -52,7 +71,20 @@ exec sleep 30
 EOF
 cat > "$STUB/ffprobe" <<'EOF'
 #!/bin/sh
-echo "60.000"
+# ★ REPORT A REAL DURATION FOR A REAL FILE (spec B3). For a file whose content is a plain number, echo
+# that number; otherwise fall back to 60.000. This lets the split stub's slices sum back to the
+# original, exercising the COMPLETE/INCOMPLETE arithmetic rather than forcing every case to MISSING.
+f=""
+for a in "$@"; do f="$a"; done
+if [ -f "$f" ]; then
+    d=$(cat "$f" 2>/dev/null)
+    case "$d" in
+        ''|*[!0-9.]*) echo "60.000" ;;
+        *) echo "$d" ;;
+    esac
+else
+    echo "60.000"
+fi
 EOF
 cat > "$STUB/vulkaninfo" <<'EOF'
 #!/bin/sh
@@ -73,13 +105,23 @@ EOF
 chmod +x "$STUB/unshare" "$STUB/ffmpeg" "$STUB/ffprobe" "$STUB/vulkaninfo" "$STUB/gamescope"
 
 # ── auxiliary stub sets (★ new coverage) ──────────────────────────────────────
-# FASTB: same stubs but ffmpeg exits at once, so a --work job finishes the moment the game does
-#        (the default ffmpeg sleeps 30 s, which would make every job case a 30 s wait).
+# FASTB: same stubs but ffmpeg writes a REAL output file and exits at once, so a --work job finishes the
+#        moment the game does (the default ffmpeg sleeps 30 s, which would make every job case a wait).
+#        ★ It writes the requested slice duration (its -t value, default 60) into the output file, so the
+#        on-disk check, the JOB OUTPUT line and the SPLIT CHECK arithmetic are actually exercised
+#        (spec B3) — a split's slices then sum back to the original instead of every output being MISSING.
 FASTB="$WORK/fastbin"; mkdir -p "$FASTB"
 cp "$STUB/unshare" "$STUB/ffprobe" "$STUB/vulkaninfo" "$STUB/gamescope" "$FASTB/"
 cat > "$FASTB/ffmpeg" <<'EOF'
 #!/bin/sh
-# no output is produced — this is what the on-disk check must report
+dur=60; prev=""
+for a in "$@"; do
+    [ "$prev" = "-t" ] && dur="$a"
+    prev="$a"
+done
+out=""
+for a in "$@"; do out="$a"; done
+[ -n "$out" ] && printf '%s\n' "$dur" > "$out" 2>/dev/null
 exit 0
 EOF
 chmod +x "$FASTB"/*
@@ -90,6 +132,36 @@ MINB="$WORK/minbin"; mkdir -p "$MINB"
 for t in env timeout sh python3 cat; do
     p=$(command -v "$t") && ln -sf "$p" "$MINB/$t"
 done
+# EARLY: the fast (output-writing) stubs PLUS a real sh/sleep, used to observe a test load that runs to
+# completion before the game does (a clean rc 0 -> "COMPLETED its Ns bounded run, as designed").
+EARLY="$WORK/earlybin"; mkdir -p "$EARLY"
+cp "$FASTB/unshare" "$FASTB/gamescope" "$FASTB/ffmpeg" "$FASTB/ffprobe" "$EARLY/"
+for t in sh sleep env cat; do
+    p=$(command -v "$t") && ln -sf "$p" "$EARLY/$t"
+done
+# DEADB: fast stubs but ffmpeg exits NONZERO at once — observes a test load that DIED (rc != 0) before
+# its bounded run finished. EARLY's ffmpeg exits 0, so it can only ever exercise the COMPLETED arm.
+DEADB="$WORK/deadbin"; mkdir -p "$DEADB"
+cp "$FASTB/unshare" "$FASTB/gamescope" "$FASTB/ffprobe" "$DEADB/"
+cat > "$DEADB/ffmpeg" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+for t in sh sleep env cat; do
+    p=$(command -v "$t") && ln -sf "$p" "$DEADB/$t"
+done
+chmod +x "$DEADB"/*
+# BADSUB: like FASTB but every output file claims a 5 s duration, so a split's slices do NOT add back up
+# to the 60 s original — this is what exercises the INCOMPLETE arm of the split arithmetic.
+BADSUB="$WORK/badsub"; mkdir -p "$BADSUB"
+cp "$STUB/unshare" "$STUB/ffprobe" "$STUB/gamescope" "$BADSUB/"
+cat > "$BADSUB/ffmpeg" <<'EOF'
+#!/bin/sh
+out=""; for a in "$@"; do out="$a"; done
+[ -n "$out" ] && printf '5\n' > "$out" 2>/dev/null
+exit 0
+EOF
+chmod +x "$BADSUB"/*
 
 # ── fixtures, all inside $WORK (deleted at the end — we keep no test media) ────
 printf 'clip\n' > "$WORK/clip.mkv"
@@ -114,6 +186,35 @@ db = {"gpufan": "probe/1.0.0", "gpus": [g("card0", "RX 9070 XT", "renderD128", T
 open(work + "/fleet-nonascii.json", "w").write(json.dumps(db, indent=1))
 print("      fleet-nonascii.json: long=%d cp / %d bytes, short=%d cp" %
       (len(longname), len(longname.encode()), len(shortname)))
+
+# ★ TWO MORE DETERMINISTIC FIXTURES for the A4 marginal rule and the doctor FOUR-VERDICT redesign.
+def card(cname, node, w, capped=False, out=False, vendor="0x1002", device="0x6860"):
+    return {"card": cname, "bdf": "0000:0%s:00.0" % cname[-1], "name": "Test GPU " + cname,
+            "driver": "amdgpu", "vendor": vendor, "device": device, "integrated": False,
+            "render_node": node, "vram_total_mib": 16384, "vram_used_mib": 0,
+            "display_outputs": 1 if out else 0, "connectors_total": 4, "has_output": out,
+            "link": {"binding_element": "0000:00:00.0", "max_width": w, "max_gen": "Gen3",
+                     "gbps_max": 8.0, "current_width": w, "current_gen": "Gen3", "gbps_current": 8.0,
+                     "idle_degraded": False, "own_reports_width": 16, "capped_by_topology": capped}}
+# fleet-marginal.json: main card0 (x16, has a panel); spare card1 on a capped x4 link — MARGINAL by the
+# capped_by_topology rule, so a default `--work` must NOT use it and must NAME it before launch.
+mdb = {"gpufan": "probe/1.0.0", "gpus": [card("card0", "renderD128", 16, out=True),
+                                          card("card1", "renderD129", 4, capped=True)]}
+open(work + "/fleet-marginal.json", "w").write(json.dumps(mdb, indent=1))
+# fleet-dupe.json: two cards sharing one vendor:device id — doctor's individual-pin check must FAIL.
+ddb = {"gpufan": "probe/1.0.0", "gpus": [card("card0", "renderD128", 16, out=True),
+                                          card("card1", "renderD129", 16)]}
+open(work + "/fleet-dupe.json", "w").write(json.dumps(ddb, indent=1))
+# fleet-jobs.json: a main card plus TWO clean x16 amdgpu spares (distinct ids, not marginal), so a
+# --work job actually runs and a --split divides the input across two cards. fleet-10's spares are all
+# on marginal links, which the default now (correctly) declines — so the job path needs this fixture.
+import copy
+j0 = card("card0", "renderD128", 16, out=True, device="0x6860")
+j1 = card("card1", "renderD129", 16, device="0x731f")
+j2 = card("card2", "renderD130", 16, device="0x67df")
+jdb = {"gpufan": "probe/1.0.0", "gpus": [j0, j1, j2]}
+open(work + "/fleet-jobs.json", "w").write(json.dumps(jdb, indent=1))
+print("      fleet-marginal.json, fleet-dupe.json, fleet-jobs.json written")
 PYEOF
 
 # A fake HOME so `play --framegen` can never write the user's REAL ~/.config/lsfg-vk/conf.toml.
@@ -284,6 +385,8 @@ cmp_cmd "play --scale 1.5"      play --scale 1.5 -- /bin/echo HI
 cmp_cmd "play --framegen 7"     play --framegen 7 -- /bin/echo HI
 cmp_cmd "play --scale abc"      play --scale abc -- /bin/echo HI
 cmp_cmd "play --scale (novalue)" play --scale
+cmp_cmd "play --test-load=abc (exit 2)" play --test-load=abc -- /bin/echo HI
+cmp_cmd "play --test-load (no value -> 60, no cmd)" play --test-load
 cmp_cmd "play (no cmd)"         play
 cmp_cmd "ui -h"                 ui -h
 cmp_cmd "ui --help"             ui --help
@@ -332,7 +435,7 @@ if [ "$pyrc" = "$crc" ] && diff -q "$WORK/py.err" "$WORK/cpp.err" >/dev/null; th
 else echo "FAIL  run bad card (py=$pyrc cpp=$crc)"; fail=$((fail+1)); diff "$WORK/py.err" "$WORK/cpp.err"; fi
 
 echo "--- play: stdout + exact spawn argv (offload stubbed) ---"
-for o in "--offload" "--no-offload"; do
+for o in "default" "--no-offload"; do
     arg=""; [ "$o" = "--no-offload" ] && arg="--no-offload"
     : > "$STUB_UN"; : > "$STUB_FF"
     run_py  play $arg -- /bin/echo HELLO > "$WORK/py.out" 2>&1
@@ -340,21 +443,50 @@ for o in "--offload" "--no-offload"; do
     : > "$STUB_UN"; : > "$STUB_FF"
     run_cpp play $arg -- /bin/echo HELLO > "$WORK/cpp.out" 2>&1
     cp "$STUB_UN" "$WORK/cpp.un"; cp "$STUB_FF" "$WORK/cpp.ff"
-    lbl="play $o -- /bin/echo"
+    lbl="play [$o] -- /bin/echo"
     if diff -q "$WORK/py.out" "$WORK/cpp.out" >/dev/null; then echo "PASS  $lbl stdout"; pass=$((pass+1))
     else echo "FAIL  $lbl stdout"; fail=$((fail+1)); diff "$WORK/py.out" "$WORK/cpp.out"|head -20; fi
     if diff -q "$WORK/py.un" "$WORK/cpp.un" >/dev/null 2>&1; then echo "PASS  $lbl unshare-argv"; pass=$((pass+1))
     else echo "FAIL  $lbl unshare-argv"; fail=$((fail+1)); diff "$WORK/py.un" "$WORK/cpp.un"|head -30; fi
-    if [ "$o" = "--offload" ]; then
-        sort "$WORK/py.ff" > "$WORK/py.ffs"; sort "$WORK/cpp.ff" > "$WORK/cpp.ffs"
-        if [ -s "$WORK/cpp.ffs" ] && diff -q "$WORK/py.ffs" "$WORK/cpp.ffs" >/dev/null; then
-            echo "PASS  $lbl ffmpeg argv ($(grep -c '^FFMPEG' "$WORK/cpp.ff") encodes)"; pass=$((pass+1))
-        else echo "FAIL  $lbl ffmpeg argv"; fail=$((fail+1)); diff "$WORK/py.ffs" "$WORK/cpp.ffs"|head -30; fi
+    # ★ THE DEFAULT NOW STARTS NOTHING (spec A4/B3). The old default put a synthetic encode on every
+    # spare; the case used to assert that encode's argv and so "could not fail" once the default stopped
+    # doing it. It now asserts the OPPOSITE — that ffmpeg was NOT invoked at all.
+    if [ "$o" = "default" ]; then
+        if [ ! -s "$WORK/py.ff" ] && [ ! -s "$WORK/cpp.ff" ]; then
+            echo "PASS  $lbl starts no encode (default = no work)"; pass=$((pass+1))
+        else echo "FAIL  $lbl default started an encode"; fail=$((fail+1)); cat "$WORK/cpp.ff"; fi
+        # the tail must actually SAY IDLE — an empty tail would pass the diff above but read as broken.
+        if grep -q 'IDLE  (no job given)' "$WORK/cpp.out"; then
+            echo "PASS  $lbl tail prints IDLE"; pass=$((pass+1))
+        else echo "FAIL  $lbl tail missing IDLE"; fail=$((fail+1)); sed -n '1,40p' "$WORK/cpp.out"; fi
     fi
     pkill -f "$STUB/unshare" 2>/dev/null; pkill -f "$STUB/ffmpeg" 2>/dev/null; pkill -f "$STUB/gamescope" 2>/dev/null
 done
 
+# ★ --test-load SECS (A4): a paced, bounded encode on the spares. Assert the exact ffmpeg argv carries
+# -re and -t SECS and the stdout carries the TEST LOAD block, so the opt-in bounded load is really tested.
+echo "--- play --test-load: opt-in bounded load ---"
+# ★ fleet-10's spares are almost all on marginal links (so the default correctly declines them); use a
+# fixture whose spare is a clean x16 amdgpu, so a test load is actually STARTED and its argv observable.
+FAKE="$WORK/fleet-dupe.json"
+: > "$STUB_UN"; : > "$STUB_FF"
+run_py  play --test-load 30 -- sh -c 'sleep 1' > "$WORK/py.out" 2>&1
+cp "$STUB_FF" "$WORK/py.ff"
+: > "$STUB_FF"
+run_cpp play --test-load 30 -- sh -c 'sleep 1' > "$WORK/cpp.out" 2>&1
+cp "$STUB_FF" "$WORK/cpp.ff"
+sort "$WORK/py.ff" > "$WORK/py.ffs"; sort "$WORK/cpp.ff" > "$WORK/cpp.ffs"
+if diff -q "$WORK/py.out" "$WORK/cpp.out" >/dev/null && diff -q "$WORK/py.ffs" "$WORK/cpp.ffs" >/dev/null \
+   && [ -s "$WORK/cpp.ffs" ] && grep -q -- '-t 30' "$WORK/cpp.ff" && grep -q -- '-re' "$WORK/cpp.ff"; then
+    echo "PASS  play --test-load 30 (bounded load argv; still running at game exit)"; pass=$((pass+1))
+else echo "FAIL  play --test-load 30 (py=$pyrc cpp=$crc)"; fail=$((fail+1)); diff "$WORK/py.out" "$WORK/cpp.out"|head -20; cat "$WORK/cpp.ff"; fi
+pkill -f "$STUB/unshare" 2>/dev/null; pkill -f "$STUB/ffmpeg" 2>/dev/null; pkill -f "$STUB/gamescope" 2>/dev/null
+FAKE="$FLEET"
+
 echo "--- play --scale / --framegen: stdout + exact gamescope argv (gamescope stubbed) ---"
+# ★ ISOLATE HOME FOR EVERY --framegen CASE (spec B4): _ensure_lsfg_profile appends to
+#   ~/.config/lsfg-vk/conf.toml and copies it aside, so a test run must never touch the user's own file.
+CHILD_HOME="$FAKEHOME"
 for combo in "--scale 0.7 --no-offload" "--framegen 2 --no-offload" "--scale 0.7 --framegen 2 --no-offload"; do
     : > "$STUB_UN"; : > "$STUB_FF"; : > "$STUB_GS"
     run_py  play $combo -- /bin/echo HELLO > "$WORK/py.out" 2>&1
@@ -369,8 +501,12 @@ for combo in "--scale 0.7 --no-offload" "--framegen 2 --no-offload" "--scale 0.7
     else echo "FAIL  $lbl gamescope-argv"; fail=$((fail+1)); diff "$WORK/py.gs" "$WORK/cpp.gs"|head -30; fi
     pkill -f "$STUB/unshare" 2>/dev/null; pkill -f "$STUB/ffmpeg" 2>/dev/null; pkill -f "$STUB/gamescope" 2>/dev/null
 done
+CHILD_HOME=""
 
 echo "--- play: --work / --split / --work-outdir / --spare / --overlay (★ new coverage) ---"
+# ★ fleet-10's spares are all on marginal links now, which the default job path declines; the fixtures
+# below use clean x16 spares so the JOB path, the on-disk output check and the SPLIT arithmetic run.
+FAKE="$WORK/fleet-jobs.json"
 cmp_cmd "play --no-offload --work (A1: no job, no-offload reason)" \
         play --no-offload --work "$WORK/clip.mkv" -- /bin/echo HI
 cmp_cmd "play --work missing file (uniform REFUSED)" \
@@ -392,19 +528,61 @@ cmp_cmd_path "$FASTB" "play --work-outdir x/../b (C7 abspath normalisation)" \
         play --work "$WORK/clip.mkv" --work-outdir "$WORK/x/../b" -- /bin/echo HI
 cmp_cmd_path "$FASTB" "play --split (SPLIT JOB across cards)" \
         play --split --work "$WORK/clip.mkv" -- /bin/echo HI
+# ★ the INCOMPLETE arm: slices that do not add back up. BADSUB's ffmpeg writes a 5 s duration per slice,
+# so 2 slices sum to 10 s against a 60 s original — the split check must say INCOMPLETE, not ok.
+cmp_cmd_path "$BADSUB" "play --split INCOMPLETE (B3: arithmetic really checked)" \
+        play --split --work "$WORK/clip.mkv" -- /bin/echo HI
 # split with an unreadable duration -> split: REFUSED, BASENAME (C8). No ffprobe stub here, so the
 # live ffprobe fails on a text file and _media_duration returns None.
 NOPROBE="$WORK/noprobe"; mkdir -p "$NOPROBE"; cp "$FASTB/unshare" "$FASTB/gamescope" "$FASTB/ffmpeg" "$NOPROBE/"
 cmp_cmd_path "$NOPROBE" "play --split unreadable duration (C8 basename)" \
         play --split --work "$WORK/clip.mkv" -- /bin/echo HI
-# a test load that dies before the game does (B: poll the loads, do not assume they ran)
-cmp_cmd_path "$FASTB" "play test load exits early (B: EXITED EARLY)" \
-        play --offload -- sh -c 'sleep 1'
+FAKE="$FLEET"
+# a test load that runs to completion before the game does (B: COMPLETED), and one that DIES (B: DIED).
+# ★ The old case used `--offload` (not a real flag, so it fell through and never started a load) — it
+# could not fail as labelled. EARLY's ffmpeg exits 0 at once, so the load COMPLETES; DEADB's exits 1
+# at once, so the load DIED. Both use a game that outlives the load.
+FAKE="$WORK/fleet-jobs.json"
+cmp_cmd_path "$EARLY" "play --test-load completes (B: COMPLETED its bounded run)" \
+        play --test-load 1 -- sh -c 'sleep 1'
+cmp_cmd_path "$DEADB" "play --test-load dies (B: DIED, rc != 0)" \
+        play --test-load 1 -- sh -c 'sleep 1'
+FAKE="$FLEET"
+# ★ A1: `--version` and `--json` AFTER the `--` belong to the GAME, not to us.
+cmp_cmd "play -- ./game --version (A1: launches, prints no version line)" \
+        play -- /bin/echo --version
+cmp_cmd "play -- ./game --json (A1: the mark IS still printed)" \
+        play -- /bin/echo --json
 # non-ASCII card name (C1): code-point slicing + display-width padding
 FAKE="$WORK/fleet-nonascii.json"
 cmp_cmd "roles non-ASCII card name (C1)"  roles
 cmp_cmd "probe non-ASCII card name (C1)"  probe
-cmp_cmd "play non-ASCII card name tail (C1)" play --offload -- /bin/echo HI
+cmp_cmd "play non-ASCII card name tail (C1)" play -- /bin/echo HI
+FAKE="$FLEET"
+
+# ★ A4 MARGINAL RULE: a spare on a marginal link is NOT used by default and is NAMED before launch;
+# --spare naming it includes it. fleet-marginal.json's card1 is a capped x4 link.
+FAKE="$WORK/fleet-marginal.json"
+cmp_cmd_path "$FASTB" "play --work marginal card excluded (A4: NOT using + Add --spare)" \
+        play --work "$WORK/clip.mkv" -- /bin/echo HI
+cmp_cmd_path "$FASTB" "play --work --spare renderD129 (A4: marginal override)" \
+        play --spare renderD129 --work "$WORK/clip.mkv" -- /bin/echo HI
+# ★ A5 doctor: duplicate vendor:device ids -> individual-pin FAIL -> PROBLEMS FOUND (exit 1)
+FAKE="$WORK/fleet-dupe.json"
+cmp_cmd "doctor duplicate vid:did (A5: exit 1, individual-pin FAIL)" doctor
+# ★ A5: assert the THREE overall outcomes by their EXIT CODES EXPLICITLY (not merely that the port
+# agrees with Python), for the deterministic states reachable here.
+#   exit 1 — any FAIL (duplicate cards).
+run_cpp doctor >/dev/null 2>&1; crc=$?
+if [ "$crc" = "1" ]; then echo "PASS  doctor exit code 1 (any FAIL)"; pass=$((pass+1));
+else echo "FAIL  doctor exit code 1 (got $crc)"; fail=$((fail+1)); fi
+#   exit 3 — no FAIL but a CORE UNKNOWN (vulkaninfo absent -> the device pin is untestable).
+FAKE=""
+CHILD_PATH="$MINB"
+run_cpp doctor >/dev/null 2>&1; crc=$?
+if [ "$crc" = "3" ]; then echo "PASS  doctor exit code 3 (not fully verified)"; pass=$((pass+1));
+else echo "FAIL  doctor exit code 3 (got $crc)"; fail=$((fail+1)); fi
+CHILD_PATH=""
 FAKE="$FLEET"
 
 # ── PHASE 2: the live box (real binaries; gamescope stub removed) ─────────────
@@ -419,6 +597,13 @@ cmp_cmd "plan framegen (real)"   plan --workload 1440p60-framegen
 cmp_cmd "plan vram 6898 (real)"  plan --workload 1440p60-framegen --vram-mib 6898
 cmp_cmd "fg (real)"              fg --res 1440p60
 cmp_cmd "doctor (real)"          doctor
+# ★ A5: doctor in the TOOLS-ABSENT state — PATH without vulkaninfo/unshare/gamescope/lspci. It must
+# report NOT VERIFIED (exit 3) with NO FAIL lines, not a fabricated green.
+cmp_cmd_path "$MINB" "doctor tools-absent (A5: exit 3, no FAIL lines)" doctor
+#   exit 0 — ALL CHECKS PASSED (the live box has a working pin and names a display card).
+run_cpp doctor >/dev/null 2>&1; crc=$?
+if [ "$crc" = "0" ]; then echo "PASS  doctor exit code 0 (all checks passed)"; pass=$((pass+1));
+else echo "FAIL  doctor exit code 0 (got $crc)"; fail=$((fail+1)); fi
 cmp_cmd "boost (real)"           boost
 # ★ ISOLATE THE lsfg-vk CONFIG. `play --framegen` reaches _ensure_lsfg_profile, which APPENDS to
 #   ~/.config/lsfg-vk/conf.toml and copies it aside. A test run must never touch the user's own
