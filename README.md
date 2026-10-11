@@ -82,18 +82,22 @@ difference in another — but each side of those comparisons was only two runs, 
 
 ### Playing everything, Steam included, without thinking about it
 
-Run this once:
+Run this once a session:
 
 ```
 spirit enable
 ```
 
-It writes one small file in your own config directory that puts the pin in your **user session's
-environment**. From your next login, *everything* you launch inherits it — including Steam, and every
-game Steam starts when you click Play. No launch options to edit, nothing to remember. It hides your
-other cards from Vulkan apps in the session; that is the point for a game, and `spirit disable` removes
-it in one command. The tool itself still sees every card — `probe` reads the kernel, not the Vulkan
-loader — so the pin never blinds it.
+It arms your session: every app you start from then on inherits the pin, so a game Steam launches when
+you click Play is pinned with no launch options to edit and this tool nowhere in the loop. **It is
+deliberately session-only** — nothing is written for boot, so a reboot always comes back with nothing
+armed. When you trust it, `spirit enable --persist` writes it for future logins as well; `spirit disable`
+undoes either.
+
+Two limits, stated because they are real: a Steam that was **already running** when you armed it did not
+pick the pin up — its environment was fixed when it started, so restart Steam. And arming hides your
+other cards from Vulkan apps in the session, which is the point for a game and the reason it is not on
+by default.
 
 If you would rather pin a single game by hand, put the tool *inside* Steam's launch line instead:
 right-click the game → Properties → Launch Options, and paste
@@ -102,9 +106,7 @@ right-click the game → Properties → Launch Options, and paste
 "/full/path/to/spirit.py" play -- %command%
 ```
 
-Note the `--` before `%command%` — the game's own command line goes after it, untouched. Without either
-of these, a game launched from Steam starts **without** the pin, and the tool says so rather than
-reporting a normal session.
+Note the `--` before `%command%` — the game's own command line goes after it, untouched.
 
 ## How you can see it happened
 
@@ -163,7 +165,7 @@ you look at.
 ```
 curl -fsSL https://raw.githubusercontent.com/Sophia-Thickums/spiritual-successor/main/install.sh | sh
 spirit doctor
-spirit enable     # optional: pin every launch on this machine, Steam included, until you turn it off
+spirit enable     # optional: arm the pin for every launch from now on, Steam included (nothing at boot)
 ```
 
 `doctor` does not describe your machine — it tests it. It launches a real program on every card and
@@ -182,8 +184,9 @@ and a box to launch your game from. It listens on your own machine only.
 
 ```
 spirit doctor        test that it really works on your machine — run this first
-spirit enable        pin every launch on this machine, for good (Steam included); --now also applies it now
-spirit disable       remove that pin (nothing else changes)
+spirit enable        arm the pin for every launch from now on (Steam included); nothing at boot
+spirit enable --persist   same, and keep it across logins
+spirit disable       disarm it, and remove the persisted pin
 spirit --version     print the version and exit
 spirit probe         list your cards and how each one is actually wired (the GB/s column is an estimate)
 spirit roles         describe what each card is and what it could take

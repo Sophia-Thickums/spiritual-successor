@@ -199,7 +199,14 @@ cat > "$STUB/steam" <<'EOF'
 #!/bin/sh
 exit 0
 EOF
-chmod +x "$STUB/unshare" "$STUB/ffmpeg" "$STUB/ffprobe" "$STUB/vulkaninfo" "$STUB/gamescope" "$STUB/steam"
+# ★ systemctl STUBBED TO FAIL. `spirit enable` arms the user manager; a suite that actually did that
+# would mutate the machine running it. The stub exercises the arm path and its honest "refused" report
+# while never touching the real manager. Nothing else in this suite calls systemctl.
+cat > "$STUB/systemctl" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod +x "$STUB/unshare" "$STUB/ffmpeg" "$STUB/ffprobe" "$STUB/vulkaninfo" "$STUB/gamescope" "$STUB/steam" "$STUB/systemctl"
 ln -sf "$STUB/unshare"    "$NOFFMPEG/unshare"
 ln -sf "$STUB/vulkaninfo" "$NOFFMPEG/vulkaninfo"
 ln -sf "$STUB/ffmpeg"     "$NOFFPROBE/ffmpeg"
@@ -493,36 +500,43 @@ if grep -q 'play -- %command%' "$TMP/rs.out" && grep -q 'did NOT route the game'
   echo "PASS: steam message present (recipe + not-routed)"; pass=$((pass+1))
 else echo "FAIL: steam message missing from the output"; fail=$((fail+1)); cat "$TMP/rs.out"; fi
 echo
-echo "== play: the Steam path with the session-wide pin ON (spirit enable) =="
-PINON="$TMP/pinon"; mkdir -p "$PINON/.config/environment.d"
-printf 'MESA_VK_DEVICE_SELECT=1002:1234!\nDRI_PRIME=pci-0000:01:00.0\n' \
-    > "$PINON/.config/environment.d/90-spirit.conf"
-CHILD_HOME="$PINON"
-compare_steam "play -- steam with the pin ON (says it is already pinned)" \
-        "$FLEET10" play --no-offload -- steam
-CHILD_HOME=""
-if grep -q 'session-wide pin IS on' "$TMP/rs.out"; then
-  echo "PASS: steam pin-ON message present"; pass=$((pass+1))
-else echo "FAIL: steam pin-ON message missing"; fail=$((fail+1)); cat "$TMP/rs.out"; fi
+echo "== play: the Steam path with the session pin ACTIVE (carried by the ENVIRONMENT) =="
+# `pin_active` reads the ENVIRONMENT, not a file — a written file proves nothing about what is actually
+# reaching processes. The child is handed the pin the way a real armed session would.
+env SPIRIT_DEVICES="$FLEET10" MESA_VK_DEVICE_SELECT=1002:1234! DRI_PRIME=pci-0000_01_00_0 \
+    PATH="$PATHVAL" "$PYBIN" "$PY" play --no-offload -- steam > "$TMP/py.out" 2>/dev/null
+env SPIRIT_DEVICES="$FLEET10" MESA_VK_DEVICE_SELECT=1002:1234! DRI_PRIME=pci-0000_01_00_0 \
+    PATH="$PATHVAL" "$RS" play --no-offload -- steam > "$TMP/rs.out" 2>/dev/null
+if diff -q "$TMP/py.out" "$TMP/rs.out" >/dev/null && grep -q 'session pin is ACTIVE' "$TMP/rs.out"; then
+  echo "PASS: steam pin-ACTIVE message present (env-carried)"; pass=$((pass+1))
+else echo "FAIL: steam pin-ACTIVE"; fail=$((fail+1)); diff "$TMP/py.out" "$TMP/rs.out" | head -20; fi
 
 echo
-echo "== enable / disable: the session-wide pin (isolated HOME, no side effects) =="
-# The pin lives in $HOME/.config/environment.d — isolated here so a test never touches the real one and
-# both sides start from the same state. `--now` is NOT run (it would set the user manager's env).
+echo "== enable / disable: the session toggle (runner's session NEVER touched) =="
 ENHOME="$TMP/enhome"; mkdir -p "$ENHOME"; CHILD_HOME="$ENHOME"
-compare "enable writes the session-wide pin" "$FLEET10" enable
-en_reset() { mkdir -p "$ENHOME/.config/environment.d"
-             printf 'MESA_VK_DEVICE_SELECT=1002:1234!\nDRI_PRIME=pci-0000:01:00.0\n' \
-                 > "$ENHOME/.config/environment.d/90-spirit.conf"; }
-en_reset; run_side "$PYBIN" "$PY" disable >"$TMP/py.out" 2>"$TMP/py.err"; prc=$?
-en_reset; run_side "$RS" disable >"$TMP/rs.out" 2>"$TMP/rs.err"; rrc=$?
-if [ "$prc" = "$rrc" ] && diff -q "$TMP/py.out" "$TMP/rs.out" >/dev/null 2>&1; then
-  echo "PASS: disable removes the pin   (rc=$prc)"; pass=$((pass+1))
-else echo "FAIL: disable removes the pin   (py rc=$prc rs rc=$rrc)"; fail=$((fail+1))
-     diff -u "$TMP/py.out" "$TMP/rs.out" | head -20; fi
-compare "disable when it was never on" "$FLEET10" disable
+ENF="$ENHOME/.config/environment.d/90-spirit.conf"
+compare "enable refuses a fixture-derived pin (SPIRIT_DEVICES set -> exit 2)" "$FLEET10" enable
 compare "enable --bogus (exit 2, our flag only)" "$FLEET10" enable --bogus
-CHILD_HOME=""
+compare "disable --persist (exit 2; not a disable flag)" "$FLEET10" disable --persist
+# ★ ASSERT THE FILE, not just the stdout — a case that compared stdout only would pass over a file that
+# was never written. `enable` bare would ARM the runner, so `--persist` is what is exercised here.
+DEV=""
+rm -rf "$ENHOME/.config"
+run_side "$PYBIN" "$PY" enable --persist > "$TMP/py.out" 2>&1; prc=$?
+PYENF=0; grep -q '^MESA_VK_DEVICE_SELECT=' "$ENF" 2>/dev/null && grep -q '^DRI_PRIME=' "$ENF" && PYENF=1
+rm -rf "$ENHOME/.config"
+run_side "$RS" enable --persist > "$TMP/rs.out" 2>&1; rrc=$?
+RSENF=0; grep -q '^MESA_VK_DEVICE_SELECT=' "$ENF" 2>/dev/null && grep -q '^DRI_PRIME=' "$ENF" && RSENF=1
+if [ "$prc" = "$rrc" ] && [ "$PYENF" = "1" ] && [ "$RSENF" = "1" ] && diff -q "$TMP/py.out" "$TMP/rs.out" >/dev/null; then
+  echo "PASS: enable --persist WRITES the pin file (asserted on the file)"; pass=$((pass+1))
+else echo "FAIL: enable --persist (py=$prc rs=$rrc file=$PYENF/$RSENF)"; fail=$((fail+1))
+     diff -u "$TMP/py.out" "$TMP/rs.out" | head -20; fi
+rm -rf "$ENHOME/.config"; run_side "$PYBIN" "$PY" enable --persist >/dev/null 2>&1
+run_side "$PYBIN" "$PY" disable > "$TMP/py.out" 2>&1
+if [ ! -e "$ENF" ] && grep -q 'removed' "$TMP/py.out"; then
+  echo "PASS: disable removes the pin file"; pass=$((pass+1))
+else echo "FAIL: disable left the file behind"; fail=$((fail+1)); ls -l "$ENF" 2>&1; cat "$TMP/py.out"; fi
+DEV=""; CHILD_HOME=""; kill_stubs
 
 echo
 echo "== C5: a hung child must not hang THIS tool (gamescope --help, 15 s each side) =="

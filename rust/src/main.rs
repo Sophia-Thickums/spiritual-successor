@@ -466,6 +466,14 @@ fn head(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// DRI_PRIME wants udev's ID_PATH_TAG: "pci-0000_03_00_0" — a BDF's dots and colons become
+/// UNDERSCORES. The ':'/'.' spelling matches NO device and Mesa silently ignores it, falling back to
+/// the default card (MEASURED 2026-10-11, both ways on this box). A fault all three builds shared, so
+/// no differential suite could see it.
+fn dri_prime(bdf: &str) -> String {
+    format!("pci-{}", bdf.replace([':', '.'], "_"))
+}
+
 // ── which(1) ───────────────────────────────────────────────────────────────────────────
 fn which(name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
@@ -2646,7 +2654,7 @@ fn run(db: &Json, role: &str, card: &str, cmd: &[String]) -> i32 {
     let bdf = g.get("bdf").and_then(|v| v.as_str()).unwrap_or("");
     let vendor = g.get("vendor").and_then(|v| v.as_str()).unwrap_or("");
     let device = g.get("device").and_then(|v| v.as_str()).unwrap_or("");
-    let pci = format!("pci-{}", bdf);
+    let pci = dri_prime(bdf);
     let vk = format!("{}:{}!", tail2(vendor), tail2(device));
 
     println!(
@@ -3441,11 +3449,22 @@ fn is_steam_launcher(cmd: &[String]) -> bool {
     false
 }
 
-/// True when the session-wide pin is installed (`spirit enable`). The PIN FILE is the truth — it is
-/// what every process in the session inherits. Mirrors spirit.py::_persistent_pin_on.
-fn persistent_pin_on() -> bool {
-    let home = env::var("HOME").unwrap_or_default();
-    std::path::Path::new(&home).join(".config/environment.d/90-spirit.conf").exists()
+/// True when the pin is actually REACHING processes: this one already carries it, or the user manager
+/// does (which is what apps started from now on inherit). Never "a file exists". Mirrors
+/// spirit.py::_pin_active.
+fn pin_active() -> bool {
+    if env::var("MESA_VK_DEVICE_SELECT").map(|v| !v.is_empty()).unwrap_or(false) {
+        return true;
+    }
+    if which("systemctl").is_none() {
+        return false;
+    }
+    match Command::new("systemctl").args(["--user", "show-environment"]).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .any(|l| l.starts_with("MESA_VK_DEVICE_SELECT=")),
+        _ => false,
+    }
 }
 
 fn hidden_argv(cmd: &[String], main: &Json, db: &Json) -> Vec<String> {
@@ -3625,7 +3644,7 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
     let bdf = main.get("bdf").and_then(|v| v.as_str()).unwrap_or("");
     let vendor = main.get("vendor").and_then(|v| v.as_str()).unwrap_or("");
     let device = main.get("device").and_then(|v| v.as_str()).unwrap_or("");
-    let pci = format!("pci-{}", bdf);
+    let pci = dri_prime(bdf);
     let vk = format!("{}:{}!", tail2(vendor), tail2(device));
     let mut env_pins: Vec<(OsString, OsString)> = vec![
         ("DRI_PRIME".into(), pci.clone().into()),
@@ -3715,11 +3734,12 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
         // — it is a REQUEST to the Steam client, which starts the game itself, in its own environment.
         // If the session-wide pin is on, Steam inherits it and the game IS pinned; otherwise the tool
         // gives the recipe that pins it. Either way it says which case you are in.
-        if persistent_pin_on() {
-            println!("  steam: this is a Steam launch — and the session-wide pin IS on, so it is pinned.");
-            println!("         Steam and every game it starts inherit MESA_VK_DEVICE_SELECT from your");
-            println!("         session, so the game renders on the card your monitor is on, with this tool");
-            println!("         not in the loop at all. There is nothing to do here.");
+        if pin_active() {
+            println!("  steam: this is a Steam launch, and the session pin is ACTIVE — a game started from");
+            println!("         now on is pinned with this tool nowhere in the loop, because the pin reaches");
+            println!("         Steam's games through your session environment.");
+            println!("         (If Steam was ALREADY RUNNING when you armed it, restart Steam: its");
+            println!("          environment was fixed at its own start and it did not pick the pin up.)");
         } else {
             println!("  steam: this is a Steam launch — it cannot be pinned from here.");
             println!("         `steam`/`steam://` hands the request to the running Steam client and returns");
@@ -3729,9 +3749,10 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| "spirit".to_string());
             println!("             \"{}\" play -- %command%", selfp);
-            println!("         (note the `--` before %command%) — OR run");
+            println!("         (note the `--` before %command%) — OR arm the whole session with");
             println!("             spirit enable");
-            println!("         once, and every launch on this machine, Steam included, is pinned for good.");
+            println!("         which covers every launch from now on, Steam included. It dies at reboot");
+            println!("         unless you add --persist.");
         }
     }
     if is_wine_target(&cmd) {
@@ -4424,26 +4445,55 @@ fn env_d_file() -> String {
     format!("{}/.config/environment.d/90-spirit.conf", env::var("HOME").unwrap_or_default())
 }
 
-fn apply_session(sel: &str, pci: &str, on: bool) -> String {
+fn apply_session(sel: &str, pci: &str) -> String {
     if which("systemctl").is_none() {
-        return "no systemd user manager here — the file applies at your next login".to_string();
+        return "no systemd user manager here — this machine cannot be armed live".to_string();
     }
-    let args: Vec<String> = if on {
-        vec!["--user".to_string(), "set-environment".to_string(),
-             format!("MESA_VK_DEVICE_SELECT={}", sel), format!("DRI_PRIME={}", pci)]
-    } else {
-        vec!["--user".into(), "unset-environment".into(), "MESA_VK_DEVICE_SELECT".into(),
-             "DRI_PRIME".into()]
-    };
-    let _ = Command::new("systemctl").args(&args).output();
-    if on {
-        "applied to the running session (apps started now inherit it)".to_string()
-    } else {
-        "cleared from the running session (apps started now are unpinned)".to_string()
+    let selv = format!("MESA_VK_DEVICE_SELECT={}", sel);
+    let pciv = format!("DRI_PRIME={}", pci);
+    match Command::new("systemctl")
+        .args(["--user", "set-environment", &selv, &pciv])
+        .output()
+    {
+        Ok(o) if o.status.success() => "armed for apps started from now on".to_string(),
+        Ok(_) => "the session manager refused it — NOT armed".to_string(),
+        Err(_) => "could not reach the session manager — NOT armed".to_string(),
     }
 }
 
-fn enable_cmd(db: &Json, now: bool) -> i32 {
+/// Disarm — but ONLY values that are ours. A value this tool did not write is left alone.
+fn unapply_session(sel: &str, pci: &str) -> String {
+    if which("systemctl").is_none() {
+        return "no systemd user manager here — nothing to disarm".to_string();
+    }
+    let txt = match Command::new("systemctl").args(["--user", "show-environment"]).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => String::new(),
+    };
+    let selv = format!("MESA_VK_DEVICE_SELECT={}", sel);
+    let pciv = format!("DRI_PRIME={}", pci);
+    let mut ours: Vec<&str> = Vec::new();
+    if txt.lines().any(|l| l == selv.as_str()) { ours.push("MESA_VK_DEVICE_SELECT"); }
+    if txt.lines().any(|l| l == pciv.as_str()) { ours.push("DRI_PRIME"); }
+    if ours.is_empty() {
+        return "the session carries no pin this tool set — left everything alone".to_string();
+    }
+    let mut args: Vec<&str> = vec!["--user", "unset-environment"];
+    args.extend(ours.iter().copied());
+    match Command::new("systemctl").args(&args).output() {
+        Ok(_) => format!("disarmed {}", ours.join(", ")),
+        Err(_) => "could not reach the session manager — still armed".to_string(),
+    }
+}
+
+fn enable_cmd(db: &Json, persist: bool) -> i32 {
+    if env::var("SPIRIT_DEVICES").map(|v| !v.is_empty()).unwrap_or(false) {
+        // ★ A FIXTURE MUST NOT BECOME A REAL PIN. Same class as the probe's refusal to read the real
+        // box on a typo'd fixture path.
+        eprintln!("spirit enable: SPIRIT_DEVICES is set, so the cards come from a FIXTURE — \
+                   refusing to write a pin derived from it into your real session.");
+        return 2;
+    }
     let mc = match main_card(db) {
         Some(m) => m,
         None => {
@@ -4456,51 +4506,66 @@ fn enable_cmd(db: &Json, now: bool) -> i32 {
     let v = if vendor.len() >= 4 { &vendor[2..] } else { vendor.as_str() };
     let d = if device.len() >= 4 { &device[2..] } else { device.as_str() };
     let sel = format!("{}:{}!", v, d);
-    let pci = format!("pci-{}", mc.get("bdf").and_then(|v| v.as_str()).unwrap_or(""));
-    let dir = format!("{}/.config/environment.d", env::var("HOME").unwrap_or_default());
-    let _ = fs::create_dir_all(&dir);
-    let body = format!(
-        "# Spiritual Successor — session-wide GPU pin.\n\
-         # Every app you launch, INCLUDING Steam and the games it starts, inherits this,\n\
-         # so games render on the card your monitor is on with no tool in the loop.\n\
-         # Turn it off with:  spirit disable\n\
-         MESA_VK_DEVICE_SELECT={}\nDRI_PRIME={}\n", sel, pci);
-    if fs::write(env_d_file(), body).is_err() {
-        eprintln!("spirit enable: could not write {}", env_d_file());
-        return 1;
-    }
-    println!("  pinned every launch to : {} ({})", gpu_name(&mc),
+    let pci = dri_prime(mc.get("bdf").and_then(|v| v.as_str()).unwrap_or(""));
+    println!("  pin the launch to      : {} ({})", gpu_name(&mc),
              mc.get("card").and_then(|v| v.as_str()).unwrap_or(""));
-    println!("  wrote                  : {}", env_d_file());
     println!("  pin                    : MESA_VK_DEVICE_SELECT={}   DRI_PRIME={}", sel, pci);
-    if now {
-        println!("  now                    : {}", apply_session(&sel, &pci, true));
+    println!("  this session           : {}", apply_session(&sel, &pci));
+    if persist {
+        let dir = format!("{}/.config/environment.d", env::var("HOME").unwrap_or_default());
+        let _ = fs::create_dir_all(&dir);
+        let body = format!(
+            "# Spiritual Successor — session-wide GPU pin, written by `spirit enable --persist`.\n\
+             # Every app started after your next login inherits this, Steam included.\n\
+             # Remove it with:  spirit disable\n\
+             MESA_VK_DEVICE_SELECT={}\nDRI_PRIME={}\n", sel, pci);
+        let tmp = format!("{}.tmp", env_d_file());
+        let wrote = fs::write(&tmp, body).is_ok() && fs::rename(&tmp, env_d_file()).is_ok();
+        if !wrote {
+            eprintln!("spirit enable: could not write {}", env_d_file());
+            return 1;
+        }
+        println!("  future logins          : {} (removed by `spirit disable`)", env_d_file());
     }
     println!();
-    println!("  It applies to new processes. Log out and back in and it covers your whole session —");
-    println!("  Steam included, and every game Steam starts. It hides your OTHER cards from Vulkan");
-    println!("  apps in the session; that is the point for a game. If a compute job needs those cards,");
-    println!("  run `spirit disable` first. This tool itself still sees every card, always.");
+    if mc.get("integrated").map(|v| v.is_truthy()).unwrap_or(false) {
+        println!("  ★ the card driving your display is the INTEGRATED one, so this pins games to the");
+        println!("    weaker chip. On a laptop that is usually how the panel is wired, not a mistake —");
+        println!("    check `spirit roles` before you rely on it.");
+    }
+    println!("  A game you start from now on inherits the pin. A Steam that was ALREADY RUNNING does not");
+    println!("  — its environment was fixed when it started, so restart Steam, or pin one game with the");
+    println!("  launch-options recipe. Nothing here survives a reboot unless you pass --persist; that is");
+    println!("  the default on purpose, so pulling the power always lands you back in a safe state.");
     0
 }
 
-fn disable_cmd(now: bool) -> i32 {
-    if now {
-        println!("  now      : {}", apply_session("", "", false));
+fn disable_cmd(db: &Json) -> i32 {
+    match main_card(db) {
+        None => println!("  this session           : no GPU found — nothing to disarm"),
+        Some(mc) => {
+            let vendor = mc.get("vendor").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let device = mc.get("device").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let v = if vendor.len() >= 4 { &vendor[2..] } else { vendor.as_str() };
+            let d = if device.len() >= 4 { &device[2..] } else { device.as_str() };
+            let sel = format!("{}:{}!", v, d);
+            let pci = dri_prime(mc.get("bdf").and_then(|v| v.as_str()).unwrap_or(""));
+            println!("  this session           : {}", unapply_session(&sel, &pci));
+        }
     }
     let p = env_d_file();
-    if !Path::new(&p).exists() {
-        println!("  the session-wide pin was not on — nothing to remove.");
-        return 0;
+    if Path::new(&p).exists() {
+        if fs::remove_file(&p).is_err() {
+            eprintln!("spirit disable: could not remove {}", p);
+            return 1;
+        }
+        println!("  future logins          : removed {}", p);
+    } else {
+        println!("  future logins          : no persisted pin");
     }
-    if fs::remove_file(&p).is_err() {
-        eprintln!("spirit disable: could not remove {}", p);
-        return 1;
-    }
-    println!("  removed  : {}", p);
     println!();
-    println!("  `spirit play` still pins whatever it launches. This only removed the pin that covered");
-    println!("  every OTHER launch; log out and back in for it to stop covering your session.");
+    println!("  `spirit play` still pins whatever it launches. This only disarms the launches the tool");
+    println!("  was not in the loop for, and only values it set itself.");
     0
 }
 
@@ -4670,19 +4735,20 @@ fn dispatch(argv: &[String]) -> i32 {
     // `enable` / `disable` — hand-parsed, like play/run/ui, so they stay OUT of the top-level help's
     // subcommand list, which the three builds must print identically.
     if argv[0] == "enable" || argv[0] == "disable" {
-        let mut now = false;
+        let mut persist = false;
         for a in &argv[1..] {
-            if a == "--now" {
-                now = true;
+            if argv[0] == "enable" && a == "--persist" {
+                persist = true;
             } else {
-                eprintln!("usage: spirit {} [--now]", argv[0]);
+                eprintln!("{}", if argv[0] == "enable" { "usage: spirit enable [--persist]" }
+                                 else { "usage: spirit disable" });
                 return 2;
             }
         }
         if argv[0] == "disable" {
-            return disable_cmd(now);
+            return disable_cmd(&probe());
         }
-        return enable_cmd(&probe(), now);
+        return enable_cmd(&probe(), persist);
     }
 
     // `run` — hand-parsed

@@ -457,6 +457,18 @@ static string home_dir() {
     return "";
 }
 
+// DRI_PRIME wants udev's ID_PATH_TAG: "pci-0000_03_00_0" — a BDF's dots and colons become UNDERSCORES.
+// The ':'/'.' spelling matches NO device and Mesa silently ignores it, falling back to the default card
+// (MEASURED 2026-10-11, both ways on this box: glxinfo under `DRI_PRIME=pci-0000:12:00.0` reported the
+// default card; under `pci-0000_12_00_0` it reported the pinned one). The tool wrote the ignored form
+// for its whole life, in `run`, `play` and `enable` — a fault all three builds shared, so no
+// differential suite could see it.
+static string dri_prime(const string &bdf) {
+    string s = bdf;
+    for (char &c : s) if (c == ':' || c == '.') c = '_';
+    return "pci-" + s;
+}
+
 // glob.glob(<dir>/<prefix>*) — a single trailing "*", hidden names not matched by a non-'.' prefix.
 static vector<string> glob_prefix(const string &dir, const string &prefix) {
     vector<string> out;
@@ -2220,7 +2232,7 @@ static int run_cmd(const J &db, const string &role, const string &card, const ve
 
     vector<string> env = current_env();
     string bdf = sfield(*g, "bdf");
-    string pci = "pci-" + bdf;
+    string pci = dri_prime(bdf);
     set_env(env, "DRI_PRIME", pci);
     string vendor = sfield(*g, "vendor"), device = sfield(*g, "device");
     string mvs = (vendor.size() > 2 ? vendor.substr(2) : string()) + ":" +
@@ -2525,12 +2537,18 @@ static string self_exe_path() {
     return "spirit";
 }
 
-// True when the session-wide pin is installed (`spirit enable`). The PIN FILE is the truth — it is
-// what every process in the session inherits; the state file is only a note for humans. Mirrors
-// spirit.py::_persistent_pin_on.
-static bool persistent_pin_on() {
-    struct stat sb;
-    return stat((home_dir() + "/.config/environment.d/90-spirit.conf").c_str(), &sb) == 0;
+// True when the pin is actually REACHING processes: this one already carries it, or the user manager
+// does (which is what apps started from now on inherit). Never "a file exists" — the file proves only
+// that someone wrote it, and a Steam that was already running never picked it up. Mirrors
+// spirit.py::_pin_active.
+static bool pin_active() {
+    const char *own = getenv("MESA_VK_DEVICE_SELECT");
+    if (own && *own) return true;
+    if (!which("systemctl")) return false;
+    ProcResult r = run_capture_both({"systemctl", "--user", "show-environment"}, nullptr, 10);
+    if (!r.ok || r.rc != 0) return false;
+    return r.out.rfind("MESA_VK_DEVICE_SELECT=", 0) == 0
+        || r.out.find("\nMESA_VK_DEVICE_SELECT=") != string::npos;
 }
 
 // True if unprivileged user namespaces WORK here, false if they are denied, nullopt if no `unshare`.
@@ -2770,7 +2788,7 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
     }
 
     vector<string> env = current_env();
-    string pci = "pci-" + sfield(*main, "bdf");
+    string pci = dri_prime(sfield(*main, "bdf"));
     set_env(env, "DRI_PRIME", pci);
     string vendor = sfield(*main, "vendor"), device = sfield(*main, "device");
     string mvs = (vendor.size() > 2 ? vendor.substr(2) : string()) + ":" +
@@ -2844,20 +2862,22 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
         // — it is a REQUEST to the Steam client, which starts the game itself, in its own environment.
         // If the session-wide pin is on, Steam inherits it and the game IS pinned; otherwise the tool
         // gives the recipe that pins it. Either way it says which case you are in.
-        if (persistent_pin_on()) {
-            printf("  steam: this is a Steam launch — and the session-wide pin IS on, so it is pinned.\n");
-            printf("         Steam and every game it starts inherit MESA_VK_DEVICE_SELECT from your\n");
-            printf("         session, so the game renders on the card your monitor is on, with this tool\n");
-            printf("         not in the loop at all. There is nothing to do here.\n");
+        if (pin_active()) {
+            printf("  steam: this is a Steam launch, and the session pin is ACTIVE — a game started from\n");
+            printf("         now on is pinned with this tool nowhere in the loop, because the pin reaches\n");
+            printf("         Steam's games through your session environment.\n");
+            printf("         (If Steam was ALREADY RUNNING when you armed it, restart Steam: its\n");
+            printf("          environment was fixed at its own start and it did not pick the pin up.)\n");
         } else {
             printf("  steam: this is a Steam launch — it cannot be pinned from here.\n");
             printf("         `steam`/`steam://` hands the request to the running Steam client and returns\n");
             printf("         at once, so the game would start WITHOUT this tool's pin. To pin a Steam game,\n");
             printf("         set its launch options to:\n");
             printf("             \"%s\" play -- %%command%%\n", self_exe_path().c_str());
-            printf("         (note the `--` before %%command%%) — OR run\n");
+            printf("         (note the `--` before %%command%%) — OR arm the whole session with\n");
             printf("             spirit enable\n");
-            printf("         once, and every launch on this machine, Steam included, is pinned for good.\n");
+            printf("         which covers every launch from now on, Steam included. It dies at reboot\n");
+            printf("         unless you add --persist.\n");
         }
     }
     if (is_wine_target(cmd)) {
@@ -3549,21 +3569,66 @@ static void mkdir_p(const string &d) {
     }
 }
 
-static string apply_session(const string &sel, const string &pci, bool on) {
-    if (!which("systemctl"))
-        return "no systemd user manager here — the file applies at your next login";
-    vector<string> a = on
-        ? vector<string>{"systemctl", "--user", "set-environment",
-                         "MESA_VK_DEVICE_SELECT=" + sel, "DRI_PRIME=" + pci}
-        : vector<string>{"systemctl", "--user", "unset-environment",
-                         "MESA_VK_DEVICE_SELECT", "DRI_PRIME"};
-    ProcResult r = run_capture_both(a, nullptr, 10);
-    (void)r;
-    return on ? "applied to the running session (apps started now inherit it)"
-              : "cleared from the running session (apps started now are unpinned)";
+static const char *W_SEL = "MESA_VK_DEVICE_SELECT";
+static const char *W_PCI = "DRI_PRIME";
+
+// The systemd user manager's live environment as text, or "" when there is no manager to ask.
+static string manager_env_text() {
+    if (!which("systemctl")) return "";
+    ProcResult r = run_capture_both({"systemctl", "--user", "show-environment"}, nullptr, 10);
+    if (!r.ok || r.rc != 0) return "";
+    return r.out;
 }
 
-static int enable_cmd(const J &db, bool now) {
+// True when the manager's environment carries exactly K=V on a line of its own.
+static bool env_text_has(const string &txt, const string &kv) {
+    size_t i = 0;
+    while (i <= txt.size()) {
+        size_t j = txt.find('\n', i);
+        if (j == string::npos) j = txt.size();
+        if (txt.compare(i, j - i, kv) == 0) return true;
+        if (j >= txt.size()) break;
+        i = j + 1;
+    }
+    return false;
+}
+
+static string apply_session(const string &sel, const string &pci) {
+    if (!which("systemctl"))
+        return "no systemd user manager here — this machine cannot be armed live";
+    vector<string> a = {"systemctl", "--user", "set-environment",
+                        string(W_SEL) + "=" + sel, string(W_PCI) + "=" + pci};
+    ProcResult r = run_capture_both(a, nullptr, 10);
+    if (!r.ok) return "could not reach the session manager — NOT armed";
+    if (r.rc != 0) return "the session manager refused it — NOT armed";
+    return "armed for apps started from now on";
+}
+
+// Disarm — but ONLY values that are ours. A value this tool did not write is left alone.
+static string unapply_session(const string &sel, const string &pci) {
+    if (!which("systemctl")) return "no systemd user manager here — nothing to disarm";
+    string txt = manager_env_text();
+    vector<string> ours;
+    if (env_text_has(txt, string(W_SEL) + "=" + sel)) ours.push_back(W_SEL);
+    if (env_text_has(txt, string(W_PCI) + "=" + pci)) ours.push_back(W_PCI);
+    if (ours.empty()) return "the session carries no pin this tool set — left everything alone";
+    vector<string> a = {"systemctl", "--user", "unset-environment"};
+    for (auto &o : ours) a.push_back(o);
+    ProcResult r = run_capture_both(a, nullptr, 10);
+    if (!r.ok) return "could not reach the session manager — still armed";
+    string joined;
+    for (size_t k = 0; k < ours.size(); k++) { if (k) joined += ", "; joined += ours[k]; }
+    return "disarmed " + joined;
+}
+
+static int enable_cmd(const J &db, bool persist) {
+    if (getenv("SPIRIT_DEVICES")) {
+        // ★ A FIXTURE MUST NOT BECOME A REAL PIN. Same class as the probe's refusal to read the real
+        // box on a typo'd fixture path.
+        fprintf(stderr, "spirit enable: SPIRIT_DEVICES is set, so the cards come from a FIXTURE — "
+                        "refusing to write a pin derived from it into your real session.\n");
+        return 2;
+    }
     const J *mc = main_card(db);
     if (!mc) {
         fprintf(stderr, "spirit enable: no GPU found on this machine — nothing to pin.\n");
@@ -3572,46 +3637,64 @@ static int enable_cmd(const J &db, bool now) {
     string vendor = sfield(*mc, "vendor"), device = sfield(*mc, "device");
     string sel = (vendor.size() >= 4 ? vendor.substr(2) : vendor) + ":" +
                  (device.size() >= 4 ? device.substr(2) : device) + "!";
-    string pci = "pci-" + sfield(*mc, "bdf");
-    mkdir_p(home_dir() + "/.config/environment.d");
-    FILE *f = fopen(env_d_file().c_str(), "w");
-    if (!f) {
-        fprintf(stderr, "spirit enable: could not write %s\n", env_d_file().c_str());
-        return 1;
+    string pci = dri_prime(sfield(*mc, "bdf"));
+    printf("  pin the launch to      : %s (%s)\n", gpu_name(*mc).c_str(), sfield(*mc, "card").c_str());
+    printf("  pin                    : %s=%s   %s=%s\n", W_SEL, sel.c_str(), W_PCI, pci.c_str());
+    printf("  this session           : %s\n", apply_session(sel, pci).c_str());
+    if (persist) {
+        mkdir_p(home_dir() + "/.config/environment.d");
+        string tmp = env_d_file() + ".tmp";
+        FILE *f = fopen(tmp.c_str(), "w");
+        if (f) {
+            fprintf(f, "# Spiritual Successor — session-wide GPU pin, written by `spirit enable --persist`.\n");
+            fprintf(f, "# Every app started after your next login inherits this, Steam included.\n");
+            fprintf(f, "# Remove it with:  spirit disable\n");
+            fprintf(f, "%s=%s\n%s=%s\n", W_SEL, sel.c_str(), W_PCI, pci.c_str());
+            if (fclose(f) != 0) f = nullptr;
+        }
+        if (!f || rename(tmp.c_str(), env_d_file().c_str()) != 0) {
+            fprintf(stderr, "spirit enable: could not write %s\n", env_d_file().c_str());
+            return 1;
+        }
+        printf("  future logins          : %s (removed by `spirit disable`)\n", env_d_file().c_str());
     }
-    fprintf(f, "# Spiritual Successor — session-wide GPU pin.\n");
-    fprintf(f, "# Every app you launch, INCLUDING Steam and the games it starts, inherits this,\n");
-    fprintf(f, "# so games render on the card your monitor is on with no tool in the loop.\n");
-    fprintf(f, "# Turn it off with:  spirit disable\n");
-    fprintf(f, "MESA_VK_DEVICE_SELECT=%s\nDRI_PRIME=%s\n", sel.c_str(), pci.c_str());
-    fclose(f);
-    printf("  pinned every launch to : %s (%s)\n", gpu_name(*mc).c_str(), sfield(*mc, "card").c_str());
-    printf("  wrote                  : %s\n", env_d_file().c_str());
-    printf("  pin                    : MESA_VK_DEVICE_SELECT=%s   DRI_PRIME=%s\n", sel.c_str(), pci.c_str());
-    if (now) printf("  now                    : %s\n", apply_session(sel, pci, true).c_str());
     printf("\n");
-    printf("  It applies to new processes. Log out and back in and it covers your whole session —\n");
-    printf("  Steam included, and every game Steam starts. It hides your OTHER cards from Vulkan\n");
-    printf("  apps in the session; that is the point for a game. If a compute job needs those cards,\n");
-    printf("  run `spirit disable` first. This tool itself still sees every card, always.\n");
+    if (bfield(*mc, "integrated")) {
+        printf("  ★ the card driving your display is the INTEGRATED one, so this pins games to the\n");
+        printf("    weaker chip. On a laptop that is usually how the panel is wired, not a mistake —\n");
+        printf("    check `spirit roles` before you rely on it.\n");
+    }
+    printf("  A game you start from now on inherits the pin. A Steam that was ALREADY RUNNING does not\n");
+    printf("  — its environment was fixed when it started, so restart Steam, or pin one game with the\n");
+    printf("  launch-options recipe. Nothing here survives a reboot unless you pass --persist; that is\n");
+    printf("  the default on purpose, so pulling the power always lands you back in a safe state.\n");
     return 0;
 }
 
-static int disable_cmd(bool now) {
-    if (now) printf("  now      : %s\n", apply_session("", "", false).c_str());
+static int disable_cmd(const J &db) {
+    const J *mc = main_card(db);
+    if (!mc) {
+        printf("  this session           : no GPU found — nothing to disarm\n");
+    } else {
+        string vendor = sfield(*mc, "vendor"), device = sfield(*mc, "device");
+        string sel = (vendor.size() >= 4 ? vendor.substr(2) : vendor) + ":" +
+                     (device.size() >= 4 ? device.substr(2) : device) + "!";
+        string pci = dri_prime(sfield(*mc, "bdf"));
+        printf("  this session           : %s\n", unapply_session(sel, pci).c_str());
+    }
     struct stat sb;
-    if (stat(env_d_file().c_str(), &sb) != 0) {
-        printf("  the session-wide pin was not on — nothing to remove.\n");
-        return 0;
+    if (stat(env_d_file().c_str(), &sb) == 0) {
+        if (unlink(env_d_file().c_str()) != 0) {
+            fprintf(stderr, "spirit disable: could not remove %s\n", env_d_file().c_str());
+            return 1;
+        }
+        printf("  future logins          : removed %s\n", env_d_file().c_str());
+    } else {
+        printf("  future logins          : no persisted pin\n");
     }
-    if (unlink(env_d_file().c_str()) != 0) {
-        fprintf(stderr, "spirit disable: could not remove %s\n", env_d_file().c_str());
-        return 1;
-    }
-    printf("  removed  : %s\n", env_d_file().c_str());
     printf("\n");
-    printf("  `spirit play` still pins whatever it launches. This only removed the pin that covered\n");
-    printf("  every OTHER launch; log out and back in for it to stop covering your session.\n");
+    printf("  `spirit play` still pins whatever it launches. This only disarms the launches the tool\n");
+    printf("  was not in the loop for, and only values it set itself.\n");
     return 0;
 }
 
@@ -3646,17 +3729,18 @@ int main(int argc, char **argv) {
     // `enable` / `disable` — parsed by HAND, like play/run/ui, so they stay OUT of the top-level
     // help's subcommand list, which the three builds must print identically.
     if (!args.empty() && (args[0] == "enable" || args[0] == "disable")) {
-        bool now = false, bad = false;
+        bool persist = false, bad = false;
         for (size_t k = 1; k < args.size(); k++) {
-            if (args[k] == "--now") now = true;
+            if (args[0] == "enable" && args[k] == "--persist") persist = true;
             else bad = true;
         }
         if (bad) {
-            fprintf(stderr, "usage: spirit %s [--now]\n", args[0].c_str());
+            fprintf(stderr, args[0] == "enable" ? "usage: spirit enable [--persist]\n"
+                                                : "usage: spirit disable\n");
             return 2;
         }
-        if (args[0] == "disable") return disable_cmd(now);
-        return enable_cmd(probe(), now);
+        if (args[0] == "disable") return disable_cmd(probe());
+        return enable_cmd(probe(), persist);
     }
 
     // `run` parsed by hand (arbitrary command passthrough)

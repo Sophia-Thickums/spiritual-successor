@@ -420,12 +420,22 @@ def plan(db, workload, vram_mib=None):
 
 
 # ── run: route a real command to the card that should do the job ──────────────────────
+def _dri_prime(bdf):
+    """The value DRI_PRIME actually wants: udev's ID_PATH_TAG, `pci-0000_03_00_0` — the dots and colons
+    of a BDF become UNDERSCORES. The ':'/'.' spelling matches NO device and Mesa silently ignores it,
+    falling back to the default card (MEASURED 2026-10-11, both ways on this box: glxinfo under
+    `DRI_PRIME=pci-0000:12:00.0` reported the default card; under `pci-0000_12_00_0` it reported the
+    pinned one). The tool wrote the ignored form for its whole life, in `run`, `play` and `enable` —
+    a fault all three builds shared, so no differential suite could see it."""
+    return "pci-" + bdf.replace(":", "_").replace(".", "_")
+
+
 def run(db, role, card, cmd):
     g = next((x for x in db["gpus"] if x["card"] == card or x["bdf"] == card), None)
     if not g:
         print("no such card: %s" % card, file=sys.stderr); return 2
     env = dict(os.environ)
-    pci = "pci-%s" % g["bdf"]
+    pci = _dri_prime(g["bdf"])
     env["DRI_PRIME"] = pci
     # the trailing `!` is EXCLUSIVE: without it the layer merely REORDERS and the child still
     # enumerates every GPU. Measured 2026-10-09: `1002:6860` -> 4 devices visible, `1002:6860!` -> 1.
@@ -1625,7 +1635,7 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
               (g["card"], g["name"][:30], g.get("render_node") or "?"))
 
     env = dict(os.environ)
-    env["DRI_PRIME"] = "pci-%s" % main["bdf"]
+    env["DRI_PRIME"] = _dri_prime(main["bdf"])
     env["MESA_VK_DEVICE_SELECT"] = "%s:%s!" % (main["vendor"][2:], main["device"][2:])
     print("\n  pin: MESA_VK_DEVICE_SELECT=%s   DRI_PRIME=%s" %
           (env["MESA_VK_DEVICE_SELECT"], env["DRI_PRIME"]))
@@ -1691,20 +1701,22 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
         # — it is a REQUEST to the Steam client, which starts the game itself, in its own environment.
         # If the session-wide pin is on, Steam inherits it and the game IS pinned; otherwise the tool
         # gives the recipe that pins it. Either way it says which case you are in.
-        if _persistent_pin_on():
-            print("  steam: this is a Steam launch — and the session-wide pin IS on, so it is pinned.")
-            print("         Steam and every game it starts inherit MESA_VK_DEVICE_SELECT from your")
-            print("         session, so the game renders on the card your monitor is on, with this tool")
-            print("         not in the loop at all. There is nothing to do here.")
+        if _pin_active():
+            print("  steam: this is a Steam launch, and the session pin is ACTIVE — a game started from")
+            print("         now on is pinned with this tool nowhere in the loop, because the pin reaches")
+            print("         Steam's games through your session environment.")
+            print("         (If Steam was ALREADY RUNNING when you armed it, restart Steam: its")
+            print("          environment was fixed at its own start and it did not pick the pin up.)")
         else:
             print("  steam: this is a Steam launch — it cannot be pinned from here.")
             print("         `steam`/`steam://` hands the request to the running Steam client and returns")
             print("         at once, so the game would start WITHOUT this tool's pin. To pin a Steam game,")
             print("         set its launch options to:")
             print("             \"%s\" play -- %%command%%" % os.path.abspath(__file__))
-            print("         (note the `--` before %command%) — OR run")
+            print("         (note the `--` before %command%) — OR arm the whole session with")
             print("             spirit enable")
-            print("         once, and every launch on this machine, Steam included, is pinned for good.")
+            print("         which covers every launch from now on, Steam included. It dies at reboot")
+            print("         unless you add --persist.")
     if _is_wine_target(cmd):
         print("  wall: Proton/Wine detected — skipping the mount namespace (Wine refuses to run as")
         print("        root, and `unshare -r` makes us root); the exclusive pin still applies.")
@@ -2120,94 +2132,166 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
     return 0 if rc == 0 else rc
 
 
-# ── MAKE IT STAY ON: a session-wide pin, on until you turn it off ─────────────────────
-# The tool's promise is "your game gets the card your monitor is on." That holds for anything
-# launched through `spirit play`. This makes it hold for EVERYTHING you launch — including a game
-# you start by clicking Play in Steam — by putting the pin in the USER SESSION's environment, where
-# every process you start inherits it. Nothing privileged: one small file in your own config
-# directory, and one command removes it. The tool still sees every card, because `probe` reads
-# sysfs, not the Vulkan loader — so the pin never blinds the tool's own view of the machine.
+# ── THE TOGGLE: arm the pin for this session, or write it for future logins ───────────
+# `spirit play` pins whatever it launches. These extend that to the launches the tool is NOT in the
+# loop for. ★ THE DEFAULT IS SESSION-ONLY AND DIES AT REBOOT, deliberately: a machine you cannot get
+# back to a known state by pulling the power is a machine you are afraid of. `--persist` is the opt-in
+# for "I trust this now, keep it". Either way the tool still sees every card, because `probe` reads
+# sysfs, not the Vulkan loader.
 _ENV_D_DIR = os.path.join(os.path.expanduser("~"), ".config", "environment.d")
 _ENV_D_FILE = os.path.join(_ENV_D_DIR, "90-spirit.conf")
+_WSEL = "MESA_VK_DEVICE_SELECT"
+_WPCI = "DRI_PRIME"
+
+
+def _pin_values(g):
+    return ("%s:%s!" % (g["vendor"][2:], g["device"][2:]), _dri_prime(g["bdf"]))
+
+
+def _manager_env():
+    """The systemd user manager's environment as a dict, or None when there is no manager."""
+    sc = shutil.which("systemctl")
+    if not sc:
+        return None
+    try:
+        r = subprocess.run([sc, "--user", "show-environment"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    env = {}
+    for line in r.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            env[k] = v
+    return env
+
+
+def _pin_active():
+    """True when the pin is actually REACHING processes: this one already carries it, or the user
+    manager does (which is what apps started from now on inherit). Never 'a file exists' — a file
+    proves only that someone wrote it, and a Steam that was already running never picked it up."""
+    if os.environ.get(_WSEL):
+        return True
+    env = _manager_env()
+    return bool(env and env.get(_WSEL))
 
 
 def _persistent_pin_on():
-    """True when the session-wide pin is installed. The PIN FILE is the truth — it is what every
-    process in the session inherits."""
-    return os.path.exists(_ENV_D_FILE)
+    """The pin is written for future logins AND the file really carries one — an empty, truncated or
+    hand-edited file must not read as 'the pin is on'."""
+    try:
+        with open(_ENV_D_FILE) as f:
+            return any(l.startswith(_WSEL + "=") for l in f)
+    except OSError:
+        return False
 
 
-def enable(db, now=False):
-    main_card = _main_card(db)
-    if main_card is None:
+def enable(db, persist=False):
+    if os.environ.get("SPIRIT_DEVICES"):
+        # ★ A FIXTURE MUST NOT BECOME A REAL PIN. With SPIRIT_DEVICES set the cards come from a
+        # fixture; writing a pin derived from it into the real user session would arm a machine for
+        # hardware that is not there. Same class as the probe's refusal to read the real box on a
+        # typo'd fixture path.
+        print("spirit enable: SPIRIT_DEVICES is set, so the cards come from a FIXTURE — refusing to "
+              "write a pin derived from it into your real session.", file=sys.stderr)
+        return 2
+    mc = _main_card(db)
+    if mc is None:
         print("spirit enable: no GPU found on this machine — nothing to pin.", file=sys.stderr)
         return 1
-    sel = "%s:%s!" % (main_card["vendor"][2:], main_card["device"][2:])
-    pci = "pci-%s" % main_card["bdf"]
-    try:
-        os.makedirs(_ENV_D_DIR)
-    except OSError:
-        pass
-    try:
-        with open(_ENV_D_FILE, "w") as f:
-            f.write("# Spiritual Successor — session-wide GPU pin.\n"
-                    "# Every app you launch, INCLUDING Steam and the games it starts, inherits this,\n"
-                    "# so games render on the card your monitor is on with no tool in the loop.\n"
-                    "# Turn it off with:  spirit disable\n"
-                    "MESA_VK_DEVICE_SELECT=%s\n"
-                    "DRI_PRIME=%s\n" % (sel, pci))
-    except OSError as exc:
-        print("spirit enable: could not write %s (%s)" % (_ENV_D_FILE, exc), file=sys.stderr)
-        return 1
-    print("  pinned every launch to : %s (%s)" % (_gpu_name(main_card), main_card["card"]))
-    print("  wrote                  : %s" % _ENV_D_FILE)
-    print("  pin                    : MESA_VK_DEVICE_SELECT=%s   DRI_PRIME=%s" % (sel, pci))
-    if now:
-        print("  now                    : %s" % _apply_session(sel, pci, True))
+    sel, pci = _pin_values(mc)
+    print("  pin the launch to      : %s (%s)" % (_gpu_name(mc), mc["card"]))
+    print("  pin                    : %s=%s   %s=%s" % (_WSEL, sel, _WPCI, pci))
+    print("  this session           : %s" % _apply_session(sel, pci))
+    if persist:
+        try:
+            os.makedirs(_ENV_D_DIR)
+        except OSError:
+            pass
+        tmp = _ENV_D_FILE + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                f.write("# Spiritual Successor — session-wide GPU pin, written by `spirit enable --persist`.\n"
+                        "# Every app started after your next login inherits this, Steam included.\n"
+                        "# Remove it with:  spirit disable\n"
+                        "%s=%s\n%s=%s\n" % (_WSEL, sel, _WPCI, pci))
+            os.replace(tmp, _ENV_D_FILE)      # atomic: a full disk never leaves a half-written pin
+        except OSError:
+            print("spirit enable: could not write %s" % _ENV_D_FILE, file=sys.stderr)
+            return 1
+        print("  future logins          : %s (removed by `spirit disable`)" % _ENV_D_FILE)
     print()
-    print("  It applies to new processes. Log out and back in and it covers your whole session —")
-    print("  Steam included, and every game Steam starts. It hides your OTHER cards from Vulkan")
-    print("  apps in the session; that is the point for a game. If a compute job needs those cards,")
-    print("  run `spirit disable` first. This tool itself still sees every card, always.")
+    if mc.get("integrated"):
+        print("  ★ the card driving your display is the INTEGRATED one, so this pins games to the")
+        print("    weaker chip. On a laptop that is usually how the panel is wired, not a mistake —")
+        print("    check `spirit roles` before you rely on it.")
+    print("  A game you start from now on inherits the pin. A Steam that was ALREADY RUNNING does not")
+    print("  — its environment was fixed when it started, so restart Steam, or pin one game with the")
+    print("  launch-options recipe. Nothing here survives a reboot unless you pass --persist; that is")
+    print("  the default on purpose, so pulling the power always lands you back in a safe state.")
     return 0
 
 
-def disable(now=False):
-    if now:
-        print("  now      : %s" % _apply_session("", "", False))
-    if not os.path.exists(_ENV_D_FILE):
-        print("  the session-wide pin was not on — nothing to remove.")
-        return 0
-    try:
-        os.remove(_ENV_D_FILE)
-    except OSError as exc:
-        print("spirit disable: could not remove %s (%s)" % (_ENV_D_FILE, exc), file=sys.stderr)
-        return 1
-    print("  removed  : %s" % _ENV_D_FILE)
+def disable(db):
+    mc = _main_card(db)
+    if mc is None:
+        print("  this session           : no GPU found — nothing to disarm")
+    else:
+        sel, pci = _pin_values(mc)
+        print("  this session           : %s" % _unapply_session(sel, pci))
+    if os.path.exists(_ENV_D_FILE):
+        try:
+            os.remove(_ENV_D_FILE)
+        except OSError:
+            print("spirit disable: could not remove %s" % _ENV_D_FILE, file=sys.stderr)
+            return 1
+        print("  future logins          : removed %s" % _ENV_D_FILE)
+    else:
+        print("  future logins          : no persisted pin")
     print()
-    print("  `spirit play` still pins whatever it launches. This only removed the pin that covered")
-    print("  every OTHER launch; log out and back in for it to stop covering your session.")
+    print("  `spirit play` still pins whatever it launches. This only disarms the launches the tool")
+    print("  was not in the loop for, and only values it set itself.")
     return 0
 
 
-def _apply_session(sel, pci, on):
-    """Best-effort live apply through the systemd user manager, so the change reaches newly started
-    apps without a re-login. Where systemd is absent this is a no-op and the file still applies at the
-    next login — said plainly, never silently."""
+def _apply_session(sel, pci):
+    """Arm the running session through the systemd user manager. Apps started from now on inherit it;
+    a process that is ALREADY running — Steam included — does not. No manager: said plainly, never
+    pretended."""
     sc = shutil.which("systemctl")
     if not sc:
-        return "no systemd user manager here — the file applies at your next login"
+        return "no systemd user manager here — this machine cannot be armed live"
     try:
-        if on:
-            subprocess.run([sc, "--user", "set-environment",
-                            "MESA_VK_DEVICE_SELECT=%s" % sel, "DRI_PRIME=%s" % pci],
+        r = subprocess.run([sc, "--user", "set-environment",
+                            "%s=%s" % (_WSEL, sel), "%s=%s" % (_WPCI, pci)],
                            capture_output=True, timeout=10)
-            return "applied to the running session (apps started now inherit it)"
-        subprocess.run([sc, "--user", "unset-environment", "MESA_VK_DEVICE_SELECT", "DRI_PRIME"],
-                       capture_output=True, timeout=10)
-        return "cleared from the running session (apps started now are unpinned)"
     except (OSError, subprocess.SubprocessError):
-        return "could not reach the session manager — the file change still applies at next login"
+        return "could not reach the session manager — NOT armed"
+    if r.returncode != 0:
+        return "the session manager refused it — NOT armed"
+    return "armed for apps started from now on"
+
+
+def _unapply_session(sel, pci):
+    """Disarm — but ONLY values that are ours. A value this tool did not write is left alone. A
+    manager that is present but refuses to answer is an EMPTY environment, not a missing manager —
+    the ports draw that line the same way, and a divergence here is exactly what the suite exists
+    to catch."""
+    sc = shutil.which("systemctl")
+    if not sc:
+        return "no systemd user manager here — nothing to disarm"
+    env = _manager_env() or {}
+    ours = [k for k, v in ((_WSEL, sel), (_WPCI, pci)) if env.get(k) == v]
+    if not ours:
+        return "the session carries no pin this tool set — left everything alone"
+    try:
+        subprocess.run([sc, "--user", "unset-environment"] + ours,
+                       capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return "could not reach the session manager — still armed"
+    return "disarmed %s" % ", ".join(ours)
 
 
 def main():
@@ -2235,14 +2319,14 @@ def main():
     # subcommand list and the top-level help stays byte-identical across the three builds.
     if argv and argv[0] in ("enable", "disable"):
         rest = argv[1:]
-        bad = [a for a in rest if a != "--now"]
-        if bad:
-            print("usage: spirit %s [--now]" % argv[0], file=sys.stderr)
+        allowed = ("--persist",) if argv[0] == "enable" else ()
+        if [a for a in rest if a not in allowed]:
+            print("usage: spirit enable [--persist]" if argv[0] == "enable" else "usage: spirit disable",
+                  file=sys.stderr)
             return 2
-        now = "--now" in rest
         if argv[0] == "disable":
-            return disable(now)
-        return enable(probe(), now)
+            return disable(probe())
+        return enable(probe(), "--persist" in rest)
 
     # `run` needs to pass an arbitrary command through untouched (it may contain -i, --flags, `--`).
     # argparse's REMAINDER mangles option-like args, so parse `run` by hand.

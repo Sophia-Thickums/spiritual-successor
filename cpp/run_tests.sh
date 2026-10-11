@@ -109,7 +109,14 @@ cat > "$STUB/steam" <<'EOF'
 #!/bin/sh
 exit 0
 EOF
-chmod +x "$STUB/unshare" "$STUB/ffmpeg" "$STUB/ffprobe" "$STUB/vulkaninfo" "$STUB/gamescope" "$STUB/steam"
+# ★ systemctl STUBBED TO FAIL. `spirit enable` arms the user manager; a suite that actually did that
+# would mutate the machine running it. A stub that always fails exercises the arm path and its honest
+# "refused" report while never touching the real manager. Nothing else in the suite calls systemctl.
+cat > "$STUB/systemctl" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod +x "$STUB/unshare" "$STUB/ffmpeg" "$STUB/ffprobe" "$STUB/vulkaninfo" "$STUB/gamescope" "$STUB/steam" "$STUB/systemctl"
 
 # ── auxiliary stub sets (★ new coverage) ──────────────────────────────────────
 # FASTB: same stubs but ffmpeg writes a REAL output file and exits at once, so a --work job finishes the
@@ -543,37 +550,40 @@ if grep -q 'play -- %command%' "$WORK/cpp.out" && grep -q 'did NOT route the gam
     echo "PASS  steam message present (recipe + not-routed)"; pass=$((pass+1))
 else echo "FAIL  steam message missing from the output"; fail=$((fail+1)); cat "$WORK/cpp.out"; fi
 # ★ BOTH STEAM CASES ABOVE RUN WITH THE SESSION PIN OFF (isolated HOME above), or a dev box that has
-# just run `spirit enable` would flip the message and make the case depend on ambient state. The pin-ON
-# branch gets its OWN case below, with the pin file present.
-echo "--- play: the Steam path with the session-wide pin ON (spirit enable) ---"
-PINON="$WORK/pinon"; mkdir -p "$PINON/.config/environment.d"
-printf 'MESA_VK_DEVICE_SELECT=1002:1234!\nDRI_PRIME=pci-0000:01:00.0\n' \
-    > "$PINON/.config/environment.d/90-spirit.conf"
-CHILD_HOME="$PINON"
-cmp_steam "play -- steam with the pin ON (says it is already pinned)" \
-        play --no-offload -- steam
-CHILD_HOME=""
-if grep -q 'session-wide pin IS on' "$WORK/cpp.out"; then
-    echo "PASS  steam pin-ON message present"; pass=$((pass+1))
-else echo "FAIL  steam pin-ON message missing"; fail=$((fail+1)); cat "$WORK/cpp.out"; fi
+# just armed it would flip the message and make the case depend on ambient state.
+echo "--- play: the Steam path with the session pin ACTIVE (carried by the ENVIRONMENT) ---"
+# `pin_active` reads the ENVIRONMENT, not a file — a written file proves nothing about what is
+# actually reaching processes. So the child is handed the pin the way a real armed session would.
+env SPIRIT_DEVICES="$FAKE" MESA_VK_DEVICE_SELECT=1002:1234! DRI_PRIME=pci-0000_01_00_0 \
+    timeout 60 "$PYTHON" "$PYSPIRIT" play --no-offload -- steam > "$WORK/py.out" 2>/dev/null
+env SPIRIT_DEVICES="$FAKE" MESA_VK_DEVICE_SELECT=1002:1234! DRI_PRIME=pci-0000_01_00_0 \
+    timeout 60 "$CPP" play --no-offload -- steam > "$WORK/cpp.out" 2>/dev/null
+if diff -q "$WORK/py.out" "$WORK/cpp.out" >/dev/null && grep -q 'session pin is ACTIVE' "$WORK/cpp.out"; then
+    echo "PASS  steam pin-ACTIVE message present (env-carried)"; pass=$((pass+1))
+else echo "FAIL  steam pin-ACTIVE"; fail=$((fail+1)); diff "$WORK/py.out" "$WORK/cpp.out" | head -20; fi
 
-echo "--- enable / disable: the session-wide pin (isolated HOME, no side effects) ---"
-# The pin lives in $HOME/.config/environment.d — isolated here so a test never touches the real one,
-# and so the state is the same for both sides. `--now` is NOT run (it would set the env in the user
-# manager of whatever box is running the suite).
+echo "--- enable / disable: the session toggle (runner's session NEVER touched) ---"
 ENHOME="$WORK/enhome"; mkdir -p "$ENHOME"; CHILD_HOME="$ENHOME"
-cmp_cmd "enable writes the session-wide pin" enable
-en_reset() { mkdir -p "$ENHOME/.config/environment.d"
-             printf 'MESA_VK_DEVICE_SELECT=1002:1234!\nDRI_PRIME=pci-0000:01:00.0\n' \
-                 > "$ENHOME/.config/environment.d/90-spirit.conf"; }
-# disable must start from the SAME state on each side, or the second side finds the file already gone
-en_reset; run_py  disable > "$WORK/py.out" 2>"$WORK/py.err"; pyrc=$?
-en_reset; run_cpp disable > "$WORK/cpp.out" 2>"$WORK/cpp.err"; crc=$?
-if [ "$pyrc" = "$crc" ] && diff -q "$WORK/py.out" "$WORK/cpp.out" >/dev/null 2>&1; then
-    echo "PASS  disable removes the pin"; pass=$((pass+1))
-else echo "FAIL  disable removes the pin (py=$pyrc cpp=$crc)"; fail=$((fail+1)); diff "$WORK/py.out" "$WORK/cpp.out"; fi
-cmp_cmd "disable when it was never on" disable
+ENF="$ENHOME/.config/environment.d/90-spirit.conf"
+cmp_cmd "enable refuses a fixture-derived pin (SPIRIT_DEVICES set -> exit 2)" enable
 cmp_cmd "enable --bogus (exit 2, our flag only)" enable --bogus
+cmp_cmd "disable --persist (exit 2; not a disable flag)" disable --persist
+# ★ `enable` ALONE cannot be exercised here: with SPIRIT_DEVICES set it refuses (above); without it it
+# would ARM the machine running the suite. `--persist` on the real box exercises the WRITE (the
+# systemctl stub keeps the manager untouched). ★ ASSERT THE FILE, not just the stdout — the earlier
+# version of this case compared stdout only and would have passed over a file that was never written.
+FAKE=""
+rm -rf "$ENHOME/.config"; run_py  enable --persist > "$WORK/py.out" 2>&1; pyrc=$?
+rm -rf "$ENHOME/.config"; run_cpp enable --persist > "$WORK/cpp.out" 2>&1; crc=$?
+if [ "$pyrc" = "$crc" ] && diff -q "$WORK/py.out" "$WORK/cpp.out" >/dev/null \
+   && grep -q '^MESA_VK_DEVICE_SELECT=' "$ENF" 2>/dev/null && grep -q '^DRI_PRIME=' "$ENF"; then
+    echo "PASS  enable --persist WRITES the pin file (asserted on the file)"; pass=$((pass+1))
+else echo "FAIL  enable --persist (py=$pyrc cpp=$crc)"; fail=$((fail+1)); diff "$WORK/py.out" "$WORK/cpp.out" | head -20; fi
+run_py  disable > "$WORK/py.out" 2>&1
+if [ ! -e "$ENF" ] && grep -q 'removed' "$WORK/py.out"; then
+    echo "PASS  disable removes the pin file"; pass=$((pass+1))
+else echo "FAIL  disable left the file behind"; fail=$((fail+1)); ls -l "$ENF" 2>&1; cat "$WORK/py.out"; fi
+FAKE="$FLEET"
 CHILD_HOME=""
 
 echo "--- play --scale / --framegen: stdout + exact gamescope argv (gamescope stubbed) ---"
