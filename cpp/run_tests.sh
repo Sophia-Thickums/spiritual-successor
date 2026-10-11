@@ -149,6 +149,10 @@ cmp_cmd "play --framegen 7"     play --framegen 7 -- /bin/echo HI
 cmp_cmd "play --scale abc"      play --scale abc -- /bin/echo HI
 cmp_cmd "play --scale (novalue)" play --scale
 cmp_cmd "play (no cmd)"         play
+cmp_cmd "ui -h"                 ui -h
+cmp_cmd "ui --help"             ui --help
+cmp_cmd "play --help"           play --help
+cmp_cmd "play -h"               play -h
 
 echo "--- run: the environment it sets (child = env) ---"
 for card in card0 card3 card6 card8; do

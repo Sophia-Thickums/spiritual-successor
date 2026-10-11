@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/Sophia-Thickums/spiritual-successor/main/install.sh | sh
 #
-# It downloads one Python file (no dependencies) and makes a tiny wrapper. Nothing else.
+# It downloads two Python files and makes one tiny wrapper. Nothing else — no packages, no root.
 set -e
 
 DIR="${SPIRIT_HOME:-$HOME/.local/share/spirit}"
@@ -15,6 +15,8 @@ command -v python3 >/dev/null 2>&1 || { echo "python3 is required (3.8 or newer)
 mkdir -p "$DIR" "$BIN"
 echo "Downloading spirit…"
 curl -fsSL "$BASE/spirit.py" -o "$DIR/spirit.py"
+# The local page. `spirit ui` looks for this beside spirit.py, so it belongs in the same folder.
+curl -fsSL "$BASE/spirit_ui.py" -o "$DIR/spirit_ui.py"
 
 printf '#!/bin/sh\nexec python3 "%s/spirit.py" "$@"\n' "$DIR" > "$BIN/spirit"
 chmod +x "$BIN/spirit"
@@ -28,4 +30,5 @@ case ":$PATH:" in
 esac
 echo
 echo "Now run:    spirit doctor"
-echo "Then try:   spirit play -- ./yourgame"
+echo "Then try:   spirit ui          (a local page, if you would rather click than type)"
+echo "       or:  spirit play -- ./yourgame"

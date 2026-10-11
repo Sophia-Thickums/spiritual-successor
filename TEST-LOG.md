@@ -948,3 +948,79 @@ you say which, and never quote its figure as the card's temperature.
   ambient makes the thermal half conservative, and the power/score comparison is unaffected.
 - Superposition's own "ASUS RX 9070/9070 XT **512 MB**" and "RAM 30GB" lines are still mis-detects; ignore
   its hardware block. It does correctly enumerate all four cards by name (it calls the MI25 a "PRO V320").
+
+
+---
+
+# ★★★ CONTROL ULTIMATE EDITION LAUNCHED, AND ALL THREE BUILDS ARE NOW ACTUALLY EQUAL (2026-10-11, 15:10-15:30)
+
+## THE LAST EMPTY ROW IN THE MATRIX IS FILLED
+`spirit play --no-offload --framegen 2 -- <the Proton launcher> 870780 Control/Control_DX12.exe`
+
+| what | result |
+|---|---|
+| Proton | `Upgrading prefix from None to GE-Proton11-7` — **the FIRST-EVER prefix for appid 870780**, created and built |
+| walls | `★ ISOLATED: the app will see ONLY 1002:7550!` and `★ SECOND WALL: drm_isolate` — both held |
+| frame gen | lsfg-vk `Hooked new Vulkan device creation` → `Initializing lsfg-vk instance` — **a Vulkan device existed**, which is the point at which RE6 died |
+| witness | **4,822 images presented to the compositor in 93.5 s = 51.6 /s** |
+| exit | rc=0, game started and exited cleanly |
+
+**★ THE HONEST LIMIT, and it matters: there is no frame-gen-OFF control for this run, so 51.6 /s
+CANNOT be claimed as a doubling.** The witness counts images leaving for the compositor; it does not
+know how many the game rendered. A 2x claim needs the off/on pair on the same title. `spirit play
+--no-offload -- Control_DX12.exe` (no `--framegen`) is the missing half.
+
+**This also proves the first-launch fix end to end.** The `compatdata/870780` directory existed but was
+EMPTY — no `pfx`. That is the exact case that used to die inside Proton with a bare
+`FileNotFoundError: .../pfx.lock`. It did not this time.
+
+## THE FIRST-LAUNCH FIX, PROVEN BOTH DIRECTIONS (unit, on the real Control path)
+```
+BEFORE: exists=True  contents=[]
+removed the empty dir (it had no pfx — the exact first-ever-launch case)
+--- call 1 ---
+  prefix: FIRST-EVER LAUNCH of appid 870780 — created ~/.steam/steam/steamapps/compatdata/870780
+--- call 2 ---  (silent — correct: it is idempotent)
+```
+
+## ★ THE WITNESS, REBUILT FROM SOURCE AND RE-PROVEN
+`present-counter/build.sh` was run on a clean copy, so the installed layer is demonstrably buildable by
+a stranger from the published source. Then it was re-proven, both directions:
+
+| frame gen | app rendered | images presented | ratio |
+|---|---|---|---|
+| **OFF** (`DISABLE_LSFGVK=1`) | 300 | **300** | **1.000** |
+| **ON at 4x** | 300 | **1200** | **4.000** |
+
+The counter file is a fixed-width zero-padded decimal, e.g. `00000000000000000300`.
+
+## ★ ALL THREE BUILDS ARE NOW EQUAL — AND IT IS TESTED, NOT ASSERTED
+The witness (arming, the exit panel, and the `boost` status line), the first-launch compatdata fix, and
+`play --help` existed only in the Python build. They are now in all three.
+
+| harness | before tonight | after |
+|---|---|---|
+| `cpp/run_tests.sh` (C++ vs Python, ~69 cases, fake fleet + live box) | 44 passed, **21 failed** | **69 passed, 0 failed** |
+| `rust/test.sh` (Rust vs Python, ~52 cases) | — | **52 passed, 0 failed** |
+
+Run by hand, not by the process that wrote the code. `make clean && make` is warning-free under
+`-Wall -Wextra`. Both harnesses gained `play --help`, `play -h`, `ui -h` and `ui --help` cases.
+
+## THE GUI
+`spirit_ui.py` — one file, 563 lines, **standard library only** (the "no dependencies" promise holds).
+It serves a page on **127.0.0.1 only** and takes a random token in the URL so that a page you merely
+have open in another tab cannot launch anything. Verified: no token → **403**, wrong token → **403**,
+right token → **200**; `ss` shows `127.0.0.1:PORT` and not the wildcard address.
+
+One copy of the page is shared by all three builds; each finds it and hands off, with the same lookup
+order and the same failure line. `spirit ui` was added to all three, byte-identically.
+
+## THE STRANGER'S PATH, ACTUALLY WALKED
+Fetched `install.sh` from the live remote, ran it into a sandbox, ran `spirit doctor` from the installed
+copy: 8 × PASS, 1 × UNKNOWN (the lsfg-vk lane, which is unknown until a game runs), **OVERALL: READY**.
+
+## REPO HYGIENE
+Raw telemetry (16 `.jsonl`, ~3.2 MB) moved to `evidence/` with an index saying what each file is and
+which claim it backs; one-off scripts moved to `experiments/`; editor backups moved out of the tree
+entirely. The repo root is now: README, LICENSE, install.sh, TEST-LOG, spirit.py, spirit_ui.py, and the
+`cpp/`, `rust/`, `present-counter/`, `evidence/`, `experiments/` directories.

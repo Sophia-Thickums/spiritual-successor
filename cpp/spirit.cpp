@@ -35,6 +35,8 @@
 #include <optional>
 #include <poll.h>
 #include <pwd.h>
+#include <regex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
@@ -1387,6 +1389,57 @@ static string lossless_dir() {
     return home_dir() + "/.local/share/Steam/steamapps/common/Lossless Scaling";
 }
 
+// ★ THE WITNESS — our own Vulkan layer, installed system-wide, INERT unless SPIRIT_PRESENT_COUNT
+// names a file. It counts vkQueuePresentKHR calls from BELOW lsfg-vk, so it sees the images frame
+// generation added. Nothing else can: the game's own counter counts frames IT rendered, an overlay
+// sits above the layer, and the compositor's scan-out counter reports the display refresh.
+static const string COUNTER_LAYER =
+    "/usr/share/vulkan/implicit_layer.d/VkLayer_SPIRIT_present_counter.json";
+static const string COUNTER_LIB = "/usr/local/lib/libspirit_present_counter.so";
+
+// (state, detail) for the present counter. READY / PARTIAL / ABSENT — never a silent pass.
+static std::pair<string, string> counter_state() {
+    struct stat sb;
+    if (stat(COUNTER_LAYER.c_str(), &sb) != 0)
+        return {"ABSENT",
+                "the present counter layer is not installed, so frame-gen output can only "
+                "be ASSERTED, not measured"};
+    if (stat(COUNTER_LIB.c_str(), &sb) != 0)
+        return {"PARTIAL", "manifest is present but " + COUNTER_LIB + " is missing"};
+    return {"READY", "present counter installed — frame-gen output is measurable"};
+}
+
+// The counter file is a fixed-width decimal the layer rewrites on every present.
+static long long read_counter(const string &path) {
+    FILE *f = fopen(path.c_str(), "r");
+    if (!f) return 0;
+    string data;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) data.append(buf, n);
+    fclose(f);
+    string raw = trim(data);
+    if (raw.empty()) return 0;
+    try {
+        size_t idx = 0;
+        long long v = std::stoll(raw, &idx, 10);
+        if (idx != raw.size()) return 0;
+        return v;
+    } catch (...) { return 0; }
+}
+
+// tempfile.gettempdir(): TMPDIR/TEMP/TMP if it names an existing directory, else /tmp.
+static string temp_dir() {
+    for (const char *v : {"TMPDIR", "TEMP", "TMP"}) {
+        const char *p = getenv(v);
+        if (p && *p) {
+            struct stat sb;
+            if (stat(p, &sb) == 0 && S_ISDIR(sb.st_mode)) return p;
+        }
+    }
+    return "/tmp";
+}
+
 static const J *main_card(const J &db); // defined below (play section)
 
 // (state, detail). READY / ABSENT / PARTIAL / UNKNOWN — never a silent pass.
@@ -1568,6 +1621,11 @@ static int boost_cmd(const J &db) {
     printf("  FRAME GENERATION — interpolated frames. The big multiplier, and the one that needs\n");
     printf("  software we do not ship: lsfg-vk, which requires owning Lossless Scaling.\n");
     printf("    lsfg-vk   : %-11s %s\n", ls_state.c_str(), ls_detail.c_str());
+    auto cs = counter_state();
+    printf("    witness   : %-11s %s\n", cs.first.c_str(), cs.second.c_str());
+    printf("                (our own present counter, below the frame-gen layer — the only\n");
+    printf("                 instrument that can see an INSERTED frame; without it a frame-gen\n");
+    printf("                 claim is an assertion, not a measurement)\n");
     printf("\n");
     if (gs_state == "READY")
         printf("  ⇒ Upscaling is available NOW:   spirit play --scale 0.7 -- <your game>\n");
@@ -1934,6 +1992,92 @@ static bool is_wine_target(const vector<string> &cmd) {
     return false;
 }
 
+// The Steam install that has a `steamapps` directory, or nullopt. Never guessed from a path shape.
+static std::optional<string> steam_root() {
+    for (const string &c : {home_dir() + "/.steam/steam", home_dir() + "/.local/share/Steam"}) {
+        struct stat sb;
+        if (stat((c + "/steamapps").c_str(), &sb) == 0 && S_ISDIR(sb.st_mode)) return c;
+    }
+    return std::nullopt;
+}
+
+// os.makedirs(path, exist_ok=True): create path and every missing parent.
+static bool mkdirs(const string &path) {
+    if (path.empty()) return false;
+    for (size_t i = 1; i <= path.size(); i++) {
+        if (i == path.size() || path[i] == '/') {
+            string sub = path.substr(0, i);
+            if (sub.empty()) continue;
+            struct stat sb;
+            if (stat(sub.c_str(), &sb) == 0) {
+                if (!S_ISDIR(sb.st_mode)) return false;
+            } else if (mkdir(sub.c_str(), 0777) != 0 && errno != EEXIST) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// The Steam appid that owns this launch, resolved through the manifest's `installdir`.
+// NOT PARSED OFF THE PATH SPELLING: `appmanifest_<appid>.acf` carries `"installdir" "<folder>"`,
+// and that is what is matched. Returns nullopt rather than a guess.
+static std::optional<string> appid_for_cmd(const vector<string> &cmd) {
+    auto steam = steam_root();
+    if (!steam) return std::nullopt;
+    string apps = *steam + "/steamapps";
+    std::set<string> wanted;
+    std::regex rx("steamapps/common/([^/]+)/");
+    for (const string &a : cmd) {
+        std::smatch m;
+        if (std::regex_search(a, m, rx)) wanted.insert(m[1].str());
+    }
+    if (wanted.empty()) return std::nullopt;
+    vector<string> mfs;
+    for (string &f : glob_prefix(apps, "appmanifest_"))
+        if (f.size() > 4 && f.compare(f.size() - 4, 4, ".acf") == 0) mfs.push_back(f);
+    std::sort(mfs.begin(), mfs.end());
+    std::regex ird("\"installdir\"\\s*\"([^\"]+)\"");
+    for (const string &mf : mfs) {
+        FILE *f = fopen(mf.c_str(), "r");
+        if (!f) continue;
+        string txt;
+        { char buf[4096]; size_t n; while ((n = fread(buf, 1, sizeof(buf), f)) > 0) txt.append(buf, n); }
+        fclose(f);
+        std::smatch im;
+        if (std::regex_search(txt, im, ird) && wanted.count(im[1].str())) {
+            string b = base_of(mf);
+            const size_t pfx = strlen("appmanifest_"), sfx = strlen(".acf");
+            return b.substr(pfx, b.size() - pfx - sfx);
+        }
+    }
+    return std::nullopt;
+}
+
+// Create `steamapps/compatdata/<appid>/` when it is absent, before a Proton launch. Proton's
+// setup_prefix() takes a lock file INSIDE compatdata/<appid>/, so a first-ever launch dies with a
+// bare FileNotFoundError it cannot recover from. One makedirs is the whole fix; a no-op otherwise.
+static void ensure_compatdata(const vector<string> &cmd) {
+    if (!is_wine_target(cmd)) return;
+    auto appid = appid_for_cmd(cmd);
+    if (!appid) return;
+    auto steam = steam_root();
+    if (!steam) return;
+    string d = *steam + "/steamapps/compatdata/" + *appid;
+    struct stat sb;
+    if (stat((d + "/pfx").c_str(), &sb) == 0 && S_ISDIR(sb.st_mode)) return; // real prefix present
+    bool made = !(stat(d.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode));
+    if (!mkdirs(d)) {
+        printf("  prefix: could not create %s (%s)\n", d.c_str(), strerror(errno));
+        return;
+    }
+    if (made) {
+        printf("  prefix: FIRST-EVER LAUNCH of appid %s — created %s\n", appid->c_str(), d.c_str());
+        printf("          (Proton's own prefix setup crashes on a missing compatdata dir; it cannot\n");
+        printf("           create the directory it needs, because its lock file lives inside it)\n");
+    }
+}
+
 // [build] the game argv with the OTHER cards' /dev/dri nodes hidden behind a mount namespace.
 // KEEP THE NAMESPACE INSIDE ANY OUTER WRAPPER: `unshare -r` maps our uid to root, so the
 // ROOT-OWNED /tmp/.X11-unix presents as the overflow uid inside — a nested gamescope then dies
@@ -2074,9 +2218,28 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
         }
     }
 
+    // ★ ARM THE WITNESS. Only meaningful with frame gen on; harmless otherwise, and we say so
+    // plainly if it is missing rather than reporting a frame-gen claim we could not measure.
+    string fg_count_path;
+    if (framegen && *framegen != 0) {
+        auto cst = counter_state();
+        if (cst.first == "READY") {
+            fg_count_path = temp_dir() + "/spirit-presents-" + std::to_string(getpid()) + ".txt";
+            unlink(fg_count_path.c_str());
+            set_env(env, "SPIRIT_PRESENT_COUNT", fg_count_path);
+            printf("  witness: counting images presented to the compositor (summary at exit)\n");
+        } else {
+            printf("  witness: UNAVAILABLE — %s\n", cst.second.c_str());
+        }
+    }
+
     if (is_wine_target(cmd)) {
         printf("  wall: Proton/Wine detected — skipping the mount namespace (Wine refuses to run as\n");
         printf("        root, and `unshare -r` makes us root); the exclusive pin still applies.\n");
+        // ★ Before the launch, make sure Proton has somewhere to put its prefix. A first-ever
+        // launch otherwise dies inside Proton with a bare FileNotFoundError on a lock file in a
+        // directory Proton cannot create. Cheap, idempotent, and it speaks only when it mattered.
+        ensure_compatdata(cmd);
     }
 
     vector<pid_t> procs;
@@ -2188,7 +2351,8 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
         for (auto &c : inner) gs.push_back(c);
         inner = gs;
     }
-    time_t t_game = time(nullptr);
+    struct timespec t_game_ts;
+    clock_gettime(CLOCK_MONOTONIC, &t_game_ts);
     int rc = spawn_wait(inner, env, false);
     // A TEST LOAD IS A LOAD AND DIES WITH THE GAME. A JOB IS NOT: killing a half-finished transcode
     // leaves a truncated file and calls it done. Jobs are WAITED FOR, then each output is checked
@@ -2229,7 +2393,13 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
     } else {
         printf("\n  game exited (rc=%d) — test load stopped\n", rc);
     }
-    double elapsed = difftime(time(nullptr), t_game);
+    // Real-valued, ever-so-slightly-positive wall delta, with the same 1e-6 floor as the Python.
+    // The WITNESS panel divides by this; an integer clock would give a division by zero (nan).
+    struct timespec t_end_ts;
+    clock_gettime(CLOCK_MONOTONIC, &t_end_ts);
+    double elapsed = (double)(t_end_ts.tv_sec - t_game_ts.tv_sec) +
+                     (double)(t_end_ts.tv_nsec - t_game_ts.tv_nsec) / 1e9;
+    if (elapsed < 1e-6) elapsed = 1e-6;
 
     // ★ THE TAIL — what the OTHER cards actually did. A feature you cannot see is indistinguishable
     // from one that is broken, and the loads are silent by design (ffmpeg's output goes to /dev/null).
@@ -2255,18 +2425,114 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
             }
         }
     }
+
+    if (!fg_count_path.empty()) {
+        long long n = read_counter(fg_count_path);
+        printf("\n  ── WITNESS ─────────────────────────────────────────────────────────\n");
+        printf("  images presented to the compositor : %lld\n", n);
+        printf("  wall time                          : %.1f s\n", elapsed);
+        printf("  presented rate                     : %.1f /s\n", (double)n / elapsed);
+        printf("  ★ This is the number frame generation moves, and the ONLY number it moves.\n");
+        printf("    The game's own FPS counter cannot see it — that counts frames the GAME\n");
+        printf("    rendered, which frame gen does not change. Expect the game's figure to be\n");
+        printf("    LOWER with frame gen on: it is now paying for the interpolation.\n");
+        printf("    Honest limit: an image handed to the compositor is not proof it was scanned\n");
+        printf("    out, and no counter can tell you whether the interpolated frames look right.\n");
+    }
     return rc == 0 ? 0 : rc;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // help / arg parsing
 // ─────────────────────────────────────────────────────────────────────────────
+// ★ `play` is hand-parsed (it has to pass an arbitrary game command through untouched), so argparse
+// never sees `play --help` — the flag used to fall through to `rest` and be EXECUTED as the game.
+// Printed here, byte-for-byte, so all three builds can share it.
+static const char *PLAY_USAGE = R"PLAY(usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] [--work FILE [--work-outdir DIR] [--split]] [--spare NODE,...] -- <game command...>
+
+Play a game on the strongest card, with every other card doing real work beside it.
+
+options:
+  -h, --help            show this help message and exit
+  --no-offload          run the game alone; no other card does work
+  --scale F             render at F of native and let gamescope upscale it (0.3-1.0)
+  --framegen N          frame generation at Nx, via lsfg-vk (2, 3 or 4)
+  --overlay             show MangoHud over the game, via mangoapp
+  --work FILE           transcode FILE on the spare cards while you play (a real job)
+  --work-outdir DIR     where a job's output goes (default: beside FILE)
+  --split               divide ONE job across the spare cards instead of one job each
+  --spare NODE,...      only use these render nodes, e.g. renderD130,renderD131
+
+  A job is not stopped with the game. Every output is checked on disk afterwards: a
+  half-finished transcode reported as done is the failure this tool exists not to make.)PLAY";
+
+// ★ `ui` — the local page. ONE Python file, shared by all three builds rather than three
+// reimplementations of an HTTP server; this build finds it and hands off. Same lookup order and the
+// same failure line in every build, so `spirit ui` behaves identically whoever compiled what.
+static const char *UI_USAGE = R"UI(usage: spirit ui [-h] [--port PORT] [--no-open] [--print-url]
+
+Open a local page for this tool: your cards and what each one is for, whether
+upscaling and frame generation are available here, and a box to launch your game.
+
+It listens on 127.0.0.1 only, so nothing outside this machine can reach it.
+
+options:
+  -h, --help        show this help message and exit
+  --port PORT       serve on this port instead of a free one
+  --no-open         do not open a browser
+  --print-url       print the URL and keep running)UI";
+
+// Beside the running program, then up to four directories above it (a C++ binary in `cpp/` or a Rust
+// one in `rust/target/release/`), then where install.sh puts it. Mirrors spirit.py's `_ui_path`.
+static std::optional<string> ui_path() {
+    vector<string> cands;
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) {
+        buf[n] = '\0';
+        string self(buf);
+        size_t sl = self.find_last_of('/');
+        if (sl != string::npos) {
+            string d = self.substr(0, sl);
+            cands.push_back(d + "/spirit_ui.py");
+            for (int i = 0; i < 4; i++) {
+                size_t p = d.find_last_of('/');
+                if (p == string::npos || p == 0) break;
+                d = d.substr(0, p);
+                cands.push_back(d + "/spirit_ui.py");
+            }
+        }
+    }
+    if (const char *h = getenv("HOME"))
+        cands.push_back(string(h) + "/.local/share/spirit/spirit_ui.py");
+    struct stat sb;
+    for (const string &c : cands)
+        if (stat(c.c_str(), &sb) == 0 && S_ISREG(sb.st_mode)) return c;
+    return std::nullopt;
+}
+
+static int ui_cmd(const vector<string> &args) {
+    for (const string &a : args)
+        if (a == "-h" || a == "--help") { printf("%s\n", UI_USAGE); return 0; }
+    std::optional<string> p = ui_path();
+    if (!p) {
+        fprintf(stderr, "spirit ui: spirit_ui.py was not found. Run install.sh, or put spirit_ui.py "
+                        "beside spirit.py.\n");
+        return 1;
+    }
+    vector<string> av;
+    av.push_back("python3");
+    av.push_back(*p);
+    for (const string &a : args) av.push_back(a);
+    return spawn_wait(av, current_env(), false);
+}
+
 static void print_help() {
     printf("usage: spirit [-h] {probe,roles,plan,doctor,origin,boost,fg} ...\n\n");
     printf("Spiritual Successor — put every GPU to work\n");
-    printf("commands: probe · roles · plan · doctor · origin · fg · boost · run · play  (`run` and `play` take a command after `--`)\n\n");
+    printf("commands: probe · roles · plan · doctor · fg · boost · run · play · ui  (`run` and `play` take a command after `--`)\n\n");
     printf("positional arguments:\n");
-    printf("  {probe,roles,plan,doctor,boost,fg}\n\n");
+    printf("  {probe,roles,plan,doctor,origin,boost,fg}\n\n");
     printf("options:\n");
     printf("  -h, --help            show this help message and exit\n");
 }
@@ -2316,7 +2582,7 @@ static int arg_error(const string &cmd, const string &msg) {
 }
 // argparse raises "unrecognized arguments" on the TOP-LEVEL parser.
 static int unrec_error(const string &msg) {
-    fprintf(stderr, "usage: spirit [-h] {probe,roles,plan,doctor,boost,fg} ...\n");
+    fprintf(stderr, "usage: spirit [-h] {probe,roles,plan,doctor,origin,boost,fg} ...\n");
     fprintf(stderr, "spirit: error: %s\n", msg.c_str());
     return 2;
 }
@@ -2350,6 +2616,20 @@ static bool parse_py_float(const string &s, double &out) {
 
 int main(int argc, char **argv) {
     vector<string> args(argv + 1, argv + argc);
+
+    // ★ THE MARK, ON EVERY RUN. Python calls origin() at the very top of main(), before the `run`
+    // and `play` hand-parse branches. Skipped only when any argv element is `--json` (a machine is
+    // reading) or `origin` (which prints it properly). A tampered build cannot silence the warning.
+    {
+        bool skip = false;
+        for (const string &a : args) if (a == "--json" || a == "origin") skip = true;
+        if (!skip) origin_cmd(false);
+    }
+
+    if (!args.empty() && args[0] == "ui") {
+        vector<string> rest(args.begin() + 1, args.end());
+        return ui_cmd(rest);
+    }
 
     // `run` parsed by hand (arbitrary command passthrough)
     if (!args.empty() && args[0] == "run") {
@@ -2421,6 +2701,11 @@ int main(int argc, char **argv) {
                 framegen = (int)v; i += 2;
             }
             else if (args[i] == "--overlay") { overlay = true; i += 1; }
+            else if (args[i] == "-h" || args[i] == "--help") {
+                // ★ Without this, `play --help` fell through to `rest` and was executed as the game.
+                printf("%s\n", PLAY_USAGE);
+                return 0;
+            }
             else if (args[i] == "--") { rest.assign(args.begin() + i + 1, args.end()); break; }
             else { rest.assign(args.begin() + i, args.end()); break; }
         }
@@ -2449,13 +2734,7 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    // ★ THE MARK, ON EVERY RUN. Skipped only for --json (a machine is reading) and for `origin`
-    // itself, which prints it properly. A tampered build cannot silence the warning inside it.
-    {
-        bool is_json = false;
-        for (const string &a : args) if (a == "--json") is_json = true;
-        if (!is_json && cmd != "origin") origin_cmd(false);
-    }
+    // (the origin mark is printed at the top of main, exactly as the Python does.)
 
     // global -h / --help inside a subcommand: argparse prints that subcommand's help
     for (size_t k = 1; k < args.size(); k++)

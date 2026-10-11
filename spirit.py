@@ -1009,6 +1009,79 @@ def _spawn_hidden(cmd, env, main, db):
     return subprocess.call(_hidden_argv(cmd, main, db), env=env)
 
 
+def _ui_path():
+    """Where spirit_ui.py lives, looked for the same way in all three builds.
+
+    ★ ONE COPY OF THE PAGE. The GUI is a single Python file shared by every build rather than three
+    reimplementations of an HTTP server — a second copy of the same page is a second copy to keep in
+    step. So each build searches for it: beside the running program, then up to four directories above
+    it (a C++ binary in `cpp/` or a Rust one in `rust/target/release/`), then beside spirit.py itself,
+    then where install.sh puts it.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = [os.path.join(here, "spirit_ui.py")]
+    up = here
+    for _ in range(4):
+        up = os.path.dirname(up)
+        cands.append(os.path.join(up, "spirit_ui.py"))
+    cands.append(os.path.join(os.path.expanduser("~"), ".local", "share", "spirit", "spirit_ui.py"))
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+UI_USAGE = """usage: spirit ui [-h] [--port PORT] [--no-open] [--print-url]
+
+Open a local page for this tool: your cards and what each one is for, whether
+upscaling and frame generation are available here, and a box to launch your game.
+
+It listens on 127.0.0.1 only, so nothing outside this machine can reach it.
+
+options:
+  -h, --help        show this help message and exit
+  --port PORT       serve on this port instead of a free one
+  --no-open         do not open a browser
+  --print-url       print the URL and keep running"""
+
+
+def ui(argv):
+    """`spirit ui` — hand off to the page. Same lookup and same failure line in all three builds."""
+    if "-h" in argv or "--help" in argv:
+        print(UI_USAGE)
+        return 0
+    path = _ui_path()
+    if not path:
+        sys.stderr.write(
+            "spirit ui: spirit_ui.py was not found. Run install.sh, or put spirit_ui.py beside "
+            "spirit.py.\n")
+        return 1
+    return subprocess.call([sys.executable or "python3", path] + list(argv))
+
+
+# ★ `play` is hand-parsed (it has to pass an arbitrary game command through untouched), so argparse
+# never sees `play --help` — the flag used to fall through to `rest` and be EXECUTED as the game.
+# The exec failed harmlessly, but a stranger typing `spirit play --help` got a launch attempt
+# instead of help. Printed here, byte-for-byte, so all three builds can share it.
+PLAY_USAGE = """usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] [--work FILE [--work-outdir DIR] [--split]] [--spare NODE,...] -- <game command...>
+
+Play a game on the strongest card, with every other card doing real work beside it.
+
+options:
+  -h, --help            show this help message and exit
+  --no-offload          run the game alone; no other card does work
+  --scale F             render at F of native and let gamescope upscale it (0.3-1.0)
+  --framegen N          frame generation at Nx, via lsfg-vk (2, 3 or 4)
+  --overlay             show MangoHud over the game, via mangoapp
+  --work FILE           transcode FILE on the spare cards while you play (a real job)
+  --work-outdir DIR     where a job's output goes (default: beside FILE)
+  --split               divide ONE job across the spare cards instead of one job each
+  --spare NODE,...      only use these render nodes, e.g. renderD130,renderD131
+
+  A job is not stopped with the game. Every output is checked on disk afterwards: a
+  half-finished transcode reported as done is the failure this tool exists not to make."""
+
+
 def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
          work=None, work_outdir=None, split=False, only_spares=None):
     if not cmd:
@@ -1290,6 +1363,9 @@ def main():
     # stray line would break it. A tampered build cannot silence the warning below.
     if "--json" not in argv and "origin" not in argv:
         origin()
+    if argv and argv[0] == "ui":
+        return ui(argv[1:])
+
     # `run` needs to pass an arbitrary command through untouched (it may contain -i, --flags, `--`).
     # argparse's REMAINDER mangles option-like args, so parse `run` by hand.
     if argv and argv[0] == "run":
@@ -1352,6 +1428,10 @@ def main():
                 i += 2
             elif argv[i] == "--overlay":
                 overlay = True; i += 1
+            elif argv[i] in ("-h", "--help"):
+                # ★ Without this, `play --help` fell through to `rest` and was executed as the game.
+                print(PLAY_USAGE)
+                return 0
             elif argv[i] == "--":
                 rest = argv[i + 1:]; break
             else:
@@ -1368,7 +1448,7 @@ def main():
     ap = argparse.ArgumentParser(
         prog="spirit",
         description="Spiritual Successor — put every GPU to work\n"
-                    "commands: probe · roles · plan · doctor · fg · boost · run · play  "
+                    "commands: probe · roles · plan · doctor · fg · boost · run · play · ui  "
                     "(`run` and `play` take a command after `--`)",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd")

@@ -1,64 +1,78 @@
 # Spiritual Successor
 
-**Your game gets one GPU. Your other cards get a job — one you actually name.**
+**Your game gets one card. Your other cards get a job.**
 
-Your game runs on the card your monitor is plugged into. Every other card in the machine can do **real
-work** at the same time, on its own encoder, while you play:
+Your game runs on the card your monitor is plugged into. Every other card in the machine can be doing
+real work at the same time — encoding video, on its own chip:
 
 ```
 spirit play --work lecture.mp4 -- ./yourgame
 ```
 
-That is a real job with a real output — a transcoded file you can open, written by a card that is not
-the one running your game. Measured on the test machine: three mismatched cards, two of them from 2017, ran a
-240-second 1080p transcode while the gaming card sat at **0–2% and 25 W**. Three valid files came out.
+That is a real job with a real file at the end of it. Measured on the test machine: three mismatched
+cards, two of them from 2017, transcoded 240 seconds of 1080p while the gaming card sat at **0–2% and
+25 W**. Three files came out.
 
-**Give no `--work` and the spare cards run a synthetic test load instead** — ffmpeg's own generated test
-pattern, thrown away. That proves the cards can be *driven*; it is a load, not a job, and it produces
-nothing. The tool says so on screen rather than letting you assume otherwise.
-
-Two cards, four cards, ten cards, or just the graphics built into your processor sitting next to a real
-card. Different makers, different ages, different speeds. That is the normal case, not a complication.
+Different makers, different ages, different speeds. Two cards, four cards, or the graphics built into
+your processor sitting next to a real card. That is the normal case, not a complication.
 
 Linux. No root. No dependencies.
 
-**Three implementations of the same tool.** Python (`spirit.py`), C++ (`cpp/`, plain `make`), and Rust
-(`rust/`, `cargo build --release`). All three are held to byte-identical output — not claimed, tested.
+Three builds of the same tool: Python, C++, Rust. All three produce identical output — tested, not
+claimed.
+
+---
 
 ## What this is not
 
-- **Not SLI and not CrossFire.** Those tried to make several cards behave like one faster card. This
-  does not do that.
-- **Lossless Scaling is not included, in any form.** It is not shipped and it is not copied. If you
-  happen to own it, this tool can drive it — see "More frames" below.
-- **The spare cards do not add frames to your game.** Moving pixels across cards per frame is dead by
-  arithmetic — a 1440p frame is 14.7 MB and an `x1` card needs 17 ms to move one. What *can* raise your
-  presented frame rate is frame generation, if you own Lossless Scaling; the tool drives it and then
-  **measures** the result rather than claiming one. See "More frames" below.
-- **It does not turn a mid-range card into a 5090.** Nothing does.
-- **Not Nvidia.** This is Linux, and the pinning uses Mesa, so AMD and Intel work today. Nvidia's driver
-  does not give the same control.
+- **Not Lossless Scaling.** That scales one frame up and invents frames between them. This tool does
+  neither — it moves work *off your game's card* onto the others. If you own Lossless Scaling, this
+  tool can *drive* it (see **More frames**), but it does not include it, copy it, or reimplement it.
+- **Not SLI or CrossFire.** Those tried to make several cards behave like one faster card. They needed
+  matched cards, a bridge, and games rewritten to support them. This needs none of that.
+- **Not PRIME, DRI_PRIME, or "multi-GPU".** Every one of those moves your game's *rendering* to the big
+  card so that a smaller card can run the display. This is the opposite: your game keeps the card it
+  should have, and the other cards go and do something else entirely.
+- **Not a way to make your game faster.** Your spare cards do not add frames to it. The win is the work
+  they do while you play.
+- **Not Nvidia.** The pinning is Mesa-based, so AMD and Intel work today. Nvidia's driver does not give
+  the same control.
+
+---
 
 ## What it does
 
 ```
-spirit play -- ./yourgame                                  # your game, pinned correctly
-spirit play --work lecture.mp4 -- ./yourgame               # + a real job on the other cards
+spirit play -- ./yourgame                        # your game, on the right card
+spirit play --work lecture.mp4 -- ./yourgame     # plus a real job on the others
 ```
 
 1. Finds the card your monitor is plugged into.
-2. Launches the game so it can only see that card.
-3. Runs a job on every other card. With `--work FILE` that is a real transcode on their own encoders,
-   to a real file. Without it, the cards run a synthetic test load so you can watch them being driven
-   — that is a load, not a job, and the tool prints exactly that.
+2. Launches the game so that it can only see that card.
+3. Runs a job on every other card — a real transcode on that card's own encoder, written to a real file.
 
-## The trap this closes
+Without `--work`, the other cards run a test load instead. That proves they can be driven. It produces
+nothing, and the tool says so rather than letting you assume otherwise.
 
-Leave a game alone and it picks a card for itself — and it can pick the wrong one. Observed on the test machine:
-a game with no pinning picked a slow card on an external dock instead of the fast one. It ran at a crawl,
-it got that slow card hot, and the fast card sat idle the whole time.
+## How you can see it happened
 
-Your game should use the card it should, and only that card. That is the fix.
+When your game exits, the tool prints what each other card actually did:
+
+```
+  ── THE TAIL ───────────────────────────────────────────────────────────
+  renderD129   Instinct MI25 (2017)   REAL JOB  lecture.part1.mkv  (279 MB, 300.0 s)
+  renderD130   Vega FE (2017)         REAL JOB  lecture.part2.mkv  (279 MB, 300.0 s)
+  renderD131   Radeon 610M            REAL JOB  lecture.part3.mkv  (286 MB, 300.0 s)
+```
+
+If you use frame generation, it also prints the one number frame generation actually moves — and it
+measures that itself, from *below* the frame-gen layer, with a small Vulkan layer it ships
+(`present-counter/`). No game counter and no overlay can see those frames; the game's own number goes
+**down**, because it is now paying for the interpolation. On the test machine the same 300 frames of
+work produced **300** presented images with frame generation off and **1200** with it on at 4x.
+
+What that does not tell you is whether the invented frames *look right*. No counter can. That one you
+look at.
 
 ## Install
 
@@ -67,10 +81,17 @@ curl -fsSL https://raw.githubusercontent.com/Sophia-Thickums/spiritual-successor
 spirit doctor
 ```
 
-`doctor` does not describe your machine — it tests it. It launches a real program on each card and checks
-that it can see it, read it, and pin work to it. If something is wrong, it says so.
+`doctor` does not describe your machine — it tests it. It launches a real program on every card and
+checks that the card can be seen, read, and pinned. Give it a minute.
 
-If you would rather do it by hand: download `spirit.py`, put it anywhere on your PATH, run it.
+There is also a small local page if you would rather not use a terminal:
+
+```
+spirit ui
+```
+
+It shows your cards, what each one is for, whether upscaling and frame generation are available here,
+and a box to launch your game from. It listens on your own machine only.
 
 ## Commands
 
@@ -79,112 +100,43 @@ spirit doctor        test that it really works on your machine — run this firs
 spirit probe         list your cards, and how fast each can actually talk
 spirit roles         give every card a job — or say plainly why it cannot have one
 spirit play -- CMD   run a game, with your other cards working underneath
-spirit plan --workload ...                             can this job run on this card?
 spirit boost         what extra frames this machine can give you, right now
-spirit fg --res 1440p60                               can a spare card carry frame generation?
-spirit run --role encode --card card2 -- ffmpeg ...   hand one job to one card
+spirit ui            the same thing as a local page, if you would rather click than type
 ```
 
-## More frames: two ways
+## More frames — two things people mix up
 
-**1. Upscaling — render below native and scale up.** Fewer pixels rendered is real, immediate frames.
+**Upscaling** renders fewer pixels and scales the picture back up. Free frames, on any card, in any
+Vulkan game.
 
 ```
 spirit play --scale 0.7 -- ./yourgame
 ```
 
-That renders at 70% of your monitor's resolution and scales it back up with FSR 1.0, through gamescope.
-On a 2560x1440 display that means rendering 1792x1008 — 49% of the pixels. It works on any Vulkan game,
-with no per-game setup.
+On a 2560x1440 screen that renders 1792x1008 — 49% of the pixels. It runs through gamescope, which you
+need installed. Handing work to the other cards cost the game about 1–2% in one title and nothing
+measurable in another.
 
-**2. Frame generation — extra frames, interpolated.** The bigger multiplier, and it needs software this
-tool does not ship: `lsfg-vk`, which requires owning Lossless Scaling. If you have both, the tool drives it:
+**Frame generation** invents frames between the real ones. It needs `lsfg-vk`, which needs you to own
+Lossless Scaling. If you have both, the tool drives it:
 
 ```
 spirit play --framegen 2 -- ./yourgame
 ```
 
-Two honest notes. **Run `spirit boost` first** — it reports what is and is not available on your machine,
-and says exactly what is missing when something is. And frame generation invents frames, so it can look
-wrong on fast movement; that is the technology, not this tool. If it looks off, turn it off.
-
-Combined: `spirit play --scale 0.7 --framegen 2 -- ./yourgame`
-
-### How you can tell it actually happened
-
-Frame generation inserts frames *below* your game, so your game's own FPS counter cannot see them — it
-counts the frames the game rendered, and that number goes **down**, because the game is now paying for
-the interpolation. An overlay cannot see them either: it sits above the frame-gen layer.
-
-So this tool carries its own witness. `present-counter/` is a small Vulkan layer (MIT, about 230 lines of
-C) that counts the images actually handed to the compositor, from *below* the frame-gen layer. Build it
-once with `present-counter/build.sh`. It is completely inert until `spirit play --framegen` arms it, and
-then a run ends like this:
-
-```
-  ── WITNESS ──────────────────────────────────────────
-  images presented to the compositor : 1200
-  wall time                          : 7.3 s
-  presented rate                     : 165.0 /s
-```
-
-On the test machine the same 300 frames of work produced **300** presented images with frame generation
-off, and **1200** with it on at 4x — a ratio of exactly 1.000 and exactly 4.000.
-
-**What that proves:** the frame-gen layer multiplied the presented rate, measured downstream of it, by a
-counter the game cannot influence. **What it does not prove:** that every image was then scanned out, or
-that the interpolated frames look right. No counter can tell you that last part. That one you look at.
-
-## Questions from the group post
-
-**Do the cards have to match?** No. An RX 580 next to a Vega 7, a new card next to the one built into
-your CPU — the tool asks what each card can do and gives it that.
-
-**Is this SLI or CrossFire?** No — and that is why it is called *Spiritual Successor*.
-
-SLI and CrossFire tried to turn two cards into one faster card. They needed matching cards, a bridge, and
-games rewritten to support them. Almost none were, and the idea died.
-
-The goal never died with it: more than one card in a machine, all of them earning their slot. That goal is
-the one this is named after. It just needs a different mechanism — one card plays the game whole, and the
-others do real work beside it, with no game needing to know this exists.
-
-**Is this Lossless Scaling?** No. That scales a frame; this moves work onto other cards.
-
-**Will it work on my laptop, integrated graphics plus a dedicated card?** Very likely. Run
-`spirit doctor` — it answers for your machine instead of guessing.
-
-**What about my 2080 with my 4070?** Not today. That is Nvidia, and the pinning is Mesa based. AMD and
-Intel work now.
-
-**Will my game stutter?** Handing work to the other cards cost the main card about 1–2% in one game and
-nothing measurable in another. In a full open-world session the player reported no stutter.
-
-## What is true, and what is not
-
-Everything here was measured on the test machine. Where it could not be measured, this file says so.
-
-- **The spare cards do not add frames.** The win there is the work they do alongside your game. Extra
-  *presented* frames come from upscaling and from frame generation — and the tool measures those instead
-  of asserting them.
-- **Frame generation is available — but it is not part of Spiritual Successor and it is not shipped with
-  it.** It comes from `lsfg-vk`, which requires you to own Lossless Scaling. `spirit boost` tells you
-  whether it is available on your machine. Spiritual Successor does not bundle it and does not
-  reimplement it.
-- **Upscaling is ours and it is tested.** `--scale` is a real FPS gain, measured on a real game, and it
-  costs your game nothing but the resolution you chose to give up.
-- **Two things that look real and are not, here so they do not fool you.** A busy second card does not make
-  the main card *faster* — it looked real, and a real game killed it. And the first run of any game is
-  slow while it builds its shader cache, which looks exactly like a gain. Warm up before you compare.
+Run `spirit boost` first: it tells you what is and is not available on your machine, and says what is
+missing when something is. Frame generation can look wrong on fast movement — that is the technology,
+not this tool.
 
 ## Who this is for
 
-Anyone with more than one graphics chip and a budget. If you have ever wanted a cheap second card to do
-something instead of sitting there, this is for you.
+Anyone with more than one graphics chip. If you have an old card in a drawer and a slot to put it in,
+this turns it back into something useful instead of a paperweight. Same for the graphics built into
+your CPU, which sits idle the whole time you play.
 
-## Bugs, ideas, and disagreements
+## Telling me it went wrong
 
-Email **sophia.wanders@proton.me**. Tell me your cards, the game or the job, what you expected, and what
+Email **sophia.wanders@proton.me**. Tell me your cards, the game or the job, what you expected and what
 actually happened. A wall of detail beats a one-line report.
 
 ---
@@ -192,22 +144,22 @@ actually happened. A wall of detail beats a one-line report.
 <details>
 <summary>For the technical reader — what is underneath</summary>
 
-- **Links, not specs.** `lspci` and friends report the link between a GPU and the chip it sits behind, not
-  the link to the CPU. A card on a dock or a chipset slot can read `x16` while its real host link is `x1`.
-  `spirit probe` reports the **minimum negotiated width along the sysfs chain**, which is the truth. On the
-  dev box: RX 9070 XT `x16 Gen5` (54.9 GB/s), Instinct MI25 `x4 Gen3` (3.19), Vega FE `x1 Gen3` (0.87).
-- **Never split the frame.** A 1440p frame is 14.7 MB; at 60 fps an `x1` card needs 17 ms to move it, which
-  is more than the whole frame budget. Per-pixel, per-frame work across these links is dead by arithmetic.
-  Cross the wire once, or at frame rate — never per pixel.
-- **The pin is load-bearing.** `MESA_VK_DEVICE_SELECT=<vid:did>!` — the trailing `!` is the exclusive flag.
-  Without it the loader only *reorders* and a child still sees every GPU; with it, a child sees exactly one.
-  Measured: an unpinned UE5 game rendered on the docked MI25 while the main card sat at 0% busy.
-- **Two walls.** The exclusive pin, plus a mount namespace that hides the other cards' `/dev/dri` nodes from
-  the game. `spirit doctor` proves both, per card, on your machine.
-- **No 2-card or 4-card assumptions.** `spirit roles` placed 9 of 10 cards on a made-up 10-card machine; the
-  tenth had nowhere to plug a monitor, and the tool says so.
-
-Raw measurement logs sit beside this file.
+- **Links, not specs.** `lspci` and friends report the link between a GPU and the chip it sits behind,
+  not the link to the CPU. A card on a dock or a chipset slot can read `x16` while its real host link is
+  `x1`. `spirit probe` reports the **minimum negotiated width along the sysfs chain**, which is the
+  truth. On the dev box: RX 9070 XT `x16 Gen5` (54.9 GB/s), Instinct MI25 `x4 Gen3` (3.19), Vega FE
+  `x1 Gen3` (0.87).
+- **Never split the frame.** A 1440p frame is 14.7 MB; at 60 fps an `x1` card needs 17 ms to move one,
+  which is more than the whole frame budget. Per-pixel, per-frame work across these links is dead by
+  arithmetic. Cross the wire once per job, or at frame rate — never per pixel.
+- **The pin is load-bearing.** `MESA_VK_DEVICE_SELECT=<vid:did>!` — the trailing `!` is the exclusive
+  flag. Without it the loader only *reorders* and a child still sees every GPU; with it, a child sees
+  exactly one. Measured: an unpinned UE5 game rendered on the docked card while the main card sat at 0%.
+- **Two walls.** The exclusive pin, plus a mount namespace that hides the other cards' `/dev/dri` nodes
+  from the game. `spirit doctor` proves both, per card, on your machine. Proton titles skip the
+  namespace, because Wine refuses to run as root.
+- **No 2-card or 4-card assumptions.** `spirit roles` placed 9 of 10 cards on a made-up 10-card machine;
+  the tenth had nowhere to plug a monitor, and the tool said so.
 
 </details>
 
