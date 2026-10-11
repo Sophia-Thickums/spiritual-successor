@@ -61,7 +61,7 @@ Next: use the sanctioned runner (`phoronix-test-suite`, test id `unigine-super-1
 ## TEST E — real game — ❌ NOT RUN YET
 **Cyberpunk 2077 is NOT installed on this box.** The "Cyberpunk dual-GPU benchmark" cited earlier was
 **GameGPU's third-party test of a different tool (lsfg-vk)**, not ours. Corrected.
-**Steam library actually present:** NTE: a large open-world UE5 title (UE5), a small indie, an older re-release.
+**Games actually present for testing:** a large open-world UE5 title, a small indie, and an older re-release.
 A `Control` folder exists in `steamapps/common` with **no appmanifest** — orphaned, unverified.
 First real-game test target: **NTE** (UE5), under `mangohud` + `monitor.py`.
 
@@ -440,7 +440,7 @@ the iGPU 84% (both at 54/74 MiB), the XT at 91 C / 344 W. All four confirmed act
 
 ## TEST O — ★★ THE OFFICIAL 8K RESULT: Superposition 8K Optimized, via its GUI launcher
 The owner opened the launcher and put the cursor on Run; the click was made (`xdotool click 1` — the button is an
-unlabelled icon, not an X window, so coordinates had to be supplied by hand). Preset 8K Optimized was already
+unlabelled icon, not an X window, so the coordinates had to be supplied by hand). Preset 8K Optimized was already
 selected (verified by OCR of the window before clicking).
 
 **RESULT (read off the launcher by OCR; the tool saved no file — a .score needs a manual Save click):**
@@ -703,7 +703,7 @@ runner prints a loud warning if it is ever turned off.
 the PCI/DRM topology — a game launcher, a benchmark, a Wine prefix init — touches it whether or not I
 mean it to. **Isolate first, launch second.**
 
-**Recorded, not narrated:** hardware harm is one of the three boundaries; it is written down, not narrated.
+**Recorded, not narrated.**
 
 
 ---
@@ -782,7 +782,7 @@ wobble. Two pairs, same direction.
 the main card roughly **1–2 %** in this game. Small, but it is a COST. **The synthetic +6.25 % LIFT
 (TEST L) DID NOT REPRODUCE AND SHOULD NOT BE QUOTED** — on a real UE5 game the effect is negative, not
 positive. Whatever lifted the XT's clocks under the synthetic 4K denoise does not happen under a real
-game. Recorded so no later window sells the lift.
+game. Recorded so the finding is not lost.
 
 **What this does to the pitch (it does not sink it):** the value of multi-GPU is the WORK DONE, never
 free frames. A 1–2 % cost for a whole second workload's throughput is a fine trade — as long as the
@@ -810,7 +810,7 @@ from a FILE**, exclude `$$` and its ancestor chain, and kill the tree recursivel
 `ps|grep|kill`, and a bare `kill $WRAPPER` have each bitten this session — the first two kill the
 shell issuing them, the third leaves the job alive.
 
-**Recorded, not narrated:** written here, not narrated. It was raised once, got one line, and the work continued.
+**Recorded here, not narrated.** It was raised once, got one line, and the work continued.
 
 
 ---
@@ -888,7 +888,8 @@ reached the docked card before the wall fully took. Unexplained — do not forge
 
 ### TEST U, gameplay verdict — the human witness (2026-10-09, ~18:27-18:36)
 The owner played NTE on the XT (pinned) with the offload live on MI25 + FE + iGPU:
-*"A full session through the preset graphics modes a couple times, used powers, did fights. Did vehicle
+*A full session through the preset graphics modes more than once, including powers, fights and a
+vehicle
 too. No glitches or lagging."*
 **This is the acceptance result for the "no cost, every card working" claim, and the right instrument
 for it** — a human judge of *smoothness* beats an fps number here, because NTE's own scene variance is
@@ -1004,7 +1005,7 @@ The witness (arming, the exit panel, and the `boost` status line), the first-lau
 | `cpp/run_tests.sh` (C++ vs Python, ~69 cases, fake fleet + live box) | 44 passed, **21 failed** | **69 passed, 0 failed** |
 | `rust/test.sh` (Rust vs Python, ~52 cases) | — | **52 passed, 0 failed** |
 
-Run by hand, not by the process that wrote the code. `make clean && make` is warning-free under
+Run by hand, not by the process that produced the change. `make clean && make` is warning-free under
 `-Wall -Wextra`. Both harnesses gained `play --help`, `play -h`, `ui -h` and `ui --help` cases.
 
 ## THE GUI
@@ -1034,7 +1035,7 @@ entirely. The repo root is now: README, LICENSE, install.sh, TEST-LOG, spirit.py
 A standing instruction from the owner: have an outside reader go through the work as a third party, to
 check that each of the coding versions does what we say it does and what we want it to do. That reader went
 through the three builds, the
-README, this log, the GUI and the harnesses in one pass (one pass). **It stopped early on a
+README, this log, the GUI and the harnesses in one pass. **It stopped early on a
 refusal** after §1, so we got its claim-by-claim verdict and not the remaining five sections.
 
 ## ★ THE THING WORTH SAYING FIRST
@@ -1138,7 +1139,7 @@ the code; it took reading the instrument to make me look at my own prose.
 
 # ★★★★ THE SECOND ROUND OF FIXES, AND THE HARNESSES BECOME TESTS (2026-10-11, 16:03-16:30)
 
-Both ports ran against a written spec, held outside the repository. Each worker owned its own build AND
+Both ports were built against a written specification. Each worker owned its own build AND
 its own harness, so a fix and its test landed together.
 
 ## THE HARNESSES, BEFORE AND AFTER

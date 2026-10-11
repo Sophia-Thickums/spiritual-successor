@@ -1777,7 +1777,7 @@ static int boost_cmd(const J &db) {
 // ─────────────────────────────────────────────────────────────────────────────
 // doctor
 // ─────────────────────────────────────────────────────────────────────────────
-// What a child sees with the exclusive device-select applied to ONE card (outside review).
+// What a child sees with the exclusive device-select applied to ONE card (.
 struct IsoResult {
     int rc = 0;
     int count = 0;
@@ -1832,7 +1832,7 @@ static vector<string> connector_names(const string &card) {
     return names;
 }
 
-// ★ READ `enabled`, NOT `status` (outside review). `status` says what is PLUGGED IN — the same predicate
+// ★ READ `enabled`, NOT `status` (. `status` says what is PLUGGED IN — the same predicate
 // the role engine used to pick the main card, so it could never disagree. `enabled` says what is
 // DRIVING a display, which can: a second card with an enabled output is a cross-GPU present.
 static vector<string> enabled_connectors(const string &card) {
@@ -1864,14 +1864,14 @@ static int doctor(const J &db, bool as_json) {
     // (exit 3). Only PASS and N/A -> ALL CHECKS PASSED (exit 0), with the N/A count printed so nobody
     // reads N/A as a pass. A bare green verdict is never printed over an UNKNOWN.
     //
-    // ★ EXIT 3, NOT 2 (outside review). argparse usage errors and the SPIRIT_DEVICES refusals both exit
+    // ★ EXIT 3, NOT 2 (. argparse usage errors and the SPIRIT_DEVICES refusals both exit
     // 2, so 2 could not distinguish "not fully verified" from "you typed it wrong".
     vector<J> checks;
     const J *ga = gpus_arr(db);
     const J *main = main_card(db);          // nullptr when this machine has no GPUs at all (1a.15)
 
     if (!ga || ga->arr.empty()) {
-        // ★ NO CARDS IS NOT A CRASH (outside review). With nothing to test, the honest verdict is a FAIL.
+        // ★ NO CARDS IS NOT A CRASH (. With nothing to test, the honest verdict is a FAIL.
         J c = J::object();
         c.put("check", J::str("gpus"));
         c.put("verdict", J::str("FAIL"));
@@ -2023,7 +2023,7 @@ static int doctor(const J &db, bool as_json) {
             checks.push_back(std::move(c));
         }
 
-        // C. TELEMETRY. ★ NOTHING IN THIS TOOL READS A CARD'S LIVE LOAD (blocking item 4).
+        // C. TELEMETRY. ★ NOTHING IN THIS TOOL READS A CARD'S LIVE LOAD ( blocking item 4).
         //    By the four verdicts' own definition that makes it N/A for EVERY kind of card — a check on
         //    a dependency that does not exist. Kept as N/A, per card, so it is printed and counted.
         for (auto &g : ga->arr) {
@@ -2036,7 +2036,7 @@ static int doctor(const J &db, bool as_json) {
             checks.push_back(std::move(c));
         }
 
-        // D. DISPLAY CARD. ★ READS `enabled`, NOT `status` (blocking item 1). A second
+        // D. DISPLAY CARD. ★ READS `enabled`, NOT `status` ( a blocking finding). A second
         //    card with an enabled output is a cross-GPU present, the real risk. Read independently of
         //    the engine, as before.
         {
@@ -2110,7 +2110,7 @@ static int doctor(const J &db, bool as_json) {
 
         // F. UPSCALING — a path that needs OPTIONAL software. ABSENT (and present but without FSR) is
         //    DETERMINED, and nothing depends on it unless the user asks for --scale, so N/A, not UNKNOWN
-        //    (blocking item 3).
+        //    ( blocking item 3).
         {
             auto gs = gamescope_state();
             J c = J::object();
@@ -2921,7 +2921,7 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                 printf("         It writes no file. It only shows these cards can be driven.\n");
                 printf("         For real work: spirit play --work <file> [--split] -- <game>\n");
             } else {
-                // ★ NO ENCODABLE SPARE IS SAID, NOT SILENT (blocking item 9).
+                // ★ NO ENCODABLE SPARE IS SAID, NOT SILENT ( blocking item 9).
                 no_load_reason = "no spare card on this machine can be driven (see the SKIPPED lines above)";
                 printf("  test-load: no load started — %s\n", no_load_reason.c_str());
             }
@@ -2941,7 +2941,7 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
         no_job_reason = "--no-offload was given, so no card was asked to do anything";
         printf("  work: no job started — %s\n", no_job_reason.c_str());
     } else if (want_load && !do_offload) {
-        // ★ THE THREE SILENT / FALSE TEST-LOAD CASES (blocking item 9). Each names why no
+        // ★ THE THREE SILENT / FALSE TEST-LOAD CASES ( blocking item 9). Each names why no
         // load started, so a --test-load that began nothing never asserts a load ran.
         no_load_reason = "--no-offload was given, so no card was asked to do anything";
         printf("  test-load: no load started — %s\n", no_load_reason.c_str());
@@ -3073,7 +3073,7 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
             if (load_started)
                 printf("\n  game exited (rc=%d) — the bounded test load ended with the session\n", rc);
             else
-                // ★ DO NOT SAY "test load stopped" WHEN NONE STARTED (blocking item 9).
+                // ★ DO NOT SAY "test load stopped" WHEN NONE STARTED ( blocking item 9).
                 printf("\n  game exited (rc=%d) — NO TEST LOAD WAS STARTED (%s). The game ran normally.\n",
                        rc, no_load_reason.empty() ? "nothing was given the load" : no_load_reason.c_str());
         } else {
@@ -3124,7 +3124,7 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                        ok ? jo.second.c_str() : "FAILED — no file");
             }
         } else if (want_load && !load_started) {
-            // ★ NOTHING RAN, AND WE SAY SO (blocking item 9). The old tail had no branch for
+            // ★ NOTHING RAN, AND WE SAY SO ( blocking item 9). The old tail had no branch for
             // "a load was asked for and none started", so it printed nothing at all here.
             std::map<string, string> names;
             for (auto *g : spares) names[base_of(sfield(*g, "render_node"))] = gpu_name(*g);
@@ -3162,7 +3162,7 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                         printf("  %-12s %-22s   (%.0f s of session; bounded to %ds by the wall clock)\n",
                                "", "", elapsed, cap);
                     } else if (it->second == 0) {
-                        // ★ NORMAL COMPLETION IS NOT A FAULT (blocking item 9). The load is
+                        // ★ NORMAL COMPLETION IS NOT A FAULT ( blocking item 9). The load is
                         // DESIGNED to run for `cap` seconds and then stop; a clean rc 0 means it did
                         // exactly that. It used to be reported as "EXITED EARLY ... it did NOT run".
                         printf("  %-12s %s SYNTHETIC TEST LOAD — COMPLETED its %ds bounded run, as designed\n",

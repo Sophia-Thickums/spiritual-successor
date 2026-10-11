@@ -27,7 +27,7 @@ Copyright 2026 Sophia Marie DeClue. MIT.
 """
 import os, sys, json, glob, re, shutil, subprocess, argparse, tempfile, time, threading
 
-# ★ FORCE UTF-8 ON OUR OWN STREAMS (outside review). Python encodes `— ★ ─ … ⇒ └` with the LOCALE's
+# ★ FORCE UTF-8 ON OUR OWN STREAMS (. Python encodes `— ★ ─ … ⇒ └` with the LOCALE's
 # codec, so under a non-UTF-8 locale (e.g. LC_ALL=en_US.ISO-8859-1) every banner raises
 # UnicodeEncodeError while the C++ and Rust builds write raw UTF-8. Forcing UTF-8 here is what makes
 # the three builds produce the same bytes. reconfigure() is 3.7+; the guard keeps 3.8-compatibility
@@ -77,7 +77,7 @@ def _speed(p):
 
 
 def _fmt_float(x):
-    """THE FLOAT-OUTPUT RULE for all three builds (outside review).
+    """THE FLOAT-OUTPUT RULE for all three builds (.
 
     Shortest round-trip decimal, always with a `.0` on integral values: 54.4 -> "54.4", 1.0 -> "1.0".
     Python's `repr(float)` already IS shortest round-trip and already prints `1.0`, so this is the
@@ -478,12 +478,12 @@ def _pinned_isolation(vid, did):
     Returns None if the child could not be run at all, else a dict:
         {"rc": int, "count": int, "ids": [(vendor, device), ...]}
 
-    ★ THE ID LIST IS THE POINT (outside review). A count proves the pin CHANGED something, not that it
+    ★ THE ID LIST IS THE POINT (. A count proves the pin CHANGED something, not that it
     SELECTED the right card — two identical cards share a vendor:device id, so a correct pin to either
     still counts 1. `vulkaninfo --summary` prints vendorID/deviceID per device, so the surviving device
     can be matched to the vid:did that was pinned, which turns "changed something" into "selected that
     model". The return code is kept separate too: a nonzero rc is a LOADER failure, not "sees more than
-    one device" (outside review), and a count of 0 gets its own verdict as well.
+    one device" (, and a count of 0 gets its own verdict as well.
     """
     if not shutil.which("vulkaninfo"):
         return None
@@ -529,7 +529,7 @@ def _enabled_connectors(card):
 
     ★ `status` says what is PLUGGED IN; `enabled` says what is DRIVING a display. The old display-card
     check read `status`, the same predicate the role engine used to pick the main card, so it could
-    never disagree (outside review). `enabled` can: a second card with an enabled output is a cross-GPU
+    never disagree (. `enabled` can: a second card with an enabled output is a cross-GPU
     present, which is the real risk.
     """
     out = []
@@ -559,14 +559,14 @@ def doctor(db, as_json=False):
     pass. A bare green verdict is never printed over an UNKNOWN.
 
     ★ EXIT 3, NOT 2. argparse usage errors and the SPIRIT_DEVICES refusals both exit 2, so 2 could not
-    distinguish "not fully verified" from "you typed it wrong" (outside review).
+    distinguish "not fully verified" from "you typed it wrong" (.
     """
     checks = []
     gpus = db["gpus"]
-    main = _main_card(db)          # None when this machine has no GPUs at all (outside review)
+    main = _main_card(db)          # None when this machine has no GPUs at all (
 
     if not gpus:
-        # ★ NO CARDS IS NOT A CRASH (outside review). `_main_card` used to be `max([])`, which raised
+        # ★ NO CARDS IS NOT A CRASH (. `_main_card` used to be `max([])`, which raised
         # ValueError with a traceback before a single check ran — and `boost` crashed the same way.
         # With nothing to test, the honest verdict is a FAIL: this tool needs a GPU and found none.
         checks.append({"check": "gpus", "verdict": "FAIL", "core": True,
@@ -592,7 +592,7 @@ def doctor(db, as_json=False):
                                "detail": "no PCIe link attributes were readable along the chain"})
 
         # B. ROUTING ISOLATION. This is the load-bearing pin, so the check is CORE and it MATCHES THE
-        #    PINNED ID (1a.10, 1b.18): a count alone proves the pin CHANGED something, not
+        #    PINNED ID ( 1a.10, 1b.18): a count alone proves the pin CHANGED something, not
         #    that it selected the right card. A nonzero return code (a loader failure), a count of 0 (the
         #    pin matched nothing) and a count above 1 (still sees more than one) are kept as SEPARATE
         #    states — none of them is "sees more than one device" except the last.
@@ -657,7 +657,7 @@ def doctor(db, as_json=False):
             checks.append({"check": "individual-pin", "verdict": "PASS",
                            "detail": "every card has its own vendor:device id, so a pin can name one"})
 
-        # C. TELEMETRY. ★ NOTHING IN THIS TOOL READS A CARD'S LIVE LOAD (blocking item 4).
+        # C. TELEMETRY. ★ NOTHING IN THIS TOOL READS A CARD'S LIVE LOAD ( blocking item 4).
         #    `mem_info_vram_used` feeds only `vram_used_mib` in `probe --json`; THE TAIL, `play` and
         #    `roles` never read it. By the four verdicts' own definition that makes it N/A for EVERY kind
         #    of card — a check on a dependency that does not exist, which also produced a spurious FAIL on
@@ -668,7 +668,7 @@ def doctor(db, as_json=False):
                            "detail": "this tool reads a card's TOTAL VRAM (probe) but never its live load, "
                                      "so no memory counter is required here"})
 
-        # D. DISPLAY CARD. ★ READS `enabled`, NOT `status` (blocking item 1). `status` is
+        # D. DISPLAY CARD. ★ READS `enabled`, NOT `status` ( a blocking finding). `status` is
         #    what is PLUGGED IN — the very predicate the role engine uses to choose the main card, so the
         #    old check could only PASS or N/A. `enabled` is what is DRIVING a display, so this check can
         #    genuinely disagree: a second card with an enabled output is a cross-GPU present, the real
@@ -716,7 +716,7 @@ def doctor(db, as_json=False):
 
         # F. UPSCALING — the tool advertises a path that needs OPTIONAL software. ABSENT (and present but
         #    without FSR) is DETERMINED, and nothing depends on it unless the user asks for --scale, so it
-        #    belongs in N/A, not UNKNOWN (blocking item 3). A machine without gamescope must
+        #    belongs in N/A, not UNKNOWN ( blocking item 3). A machine without gamescope must
         #    not sit in "not fully verified" forever for a feature it never asked for.
         gs_state, gs_detail = _gamescope_state()
         gs_verdict = {"READY": "PASS", "ABSENT": "N/A", "PARTIAL": "N/A"}.get(gs_state, "UNKNOWN")
@@ -749,9 +749,9 @@ def doctor(db, as_json=False):
         overall = "PROBLEMS FOUND"
         code = 1
     elif core_unknowns:
-        # ★ A CORE CHECK THAT IS UNKNOWN IS NOT "WORKS" (blocking item 8). With no
+        # ★ A CORE CHECK THAT IS UNKNOWN IS NOT "WORKS" ( blocking item 8). With no
         #    vulkaninfo the pin is untested, and "WORKS" would be a conclusion doctor never reached.
-        #    ★ EXIT 3, NOT 2 (blocking item 6): argparse usage errors and the SPIRIT_DEVICES
+        #    ★ EXIT 3, NOT 2 ( blocking item 6): argparse usage errors and the SPIRIT_DEVICES
         #    refusals already exit 2, so a script could not tell "not fully verified" from "you typed it
         #    wrong". 3 is distinct from both.
         overall = "NOT VERIFIED — a core check could not be determined (%d)" % len(core_unknowns)
@@ -1017,7 +1017,7 @@ def _ensure_lsfg_profile(multiplier):
 
 
 def boost(db):
-    # ★ NO CARDS IS NOT A CRASH (blocking item 7). `_native_res` -> `_main_card` used to
+    # ★ NO CARDS IS NOT A CRASH ( blocking item 7). `_native_res` -> `_main_card` used to
     # reach `max([])` here and raise ValueError with a traceback. A machine with no GPU has nothing to
     # boost, and it is told so.
     if not (db.get("gpus") or []):
@@ -1076,7 +1076,7 @@ def _gpu_name(g):
 def _main_card(db):
     """The card that feeds the monitor MUST render (the monitor law). Fallback: the top scorer.
 
-    ★ RETURNS None ON A MACHINE WITH NO GPUs (blocking item 7). It used to be `max([])`,
+    ★ RETURNS None ON A MACHINE WITH NO GPUs ( blocking item 7). It used to be `max([])`,
     which raised ValueError with a traceback in both `doctor` and `boost`. Every caller must handle
     None — a machine with no cards is a real (if rare) shape, not a crash.
     """
@@ -1119,7 +1119,7 @@ def _marginal(g):
     ask for that. A card on a narrow link is usable — it is just not a default we assume on their behalf.
     `--spare <node>` includes it, and this is SAID, not done quietly.
 
-    ★ `capped_by_topology` IS NOT A PROXY FOR "BEHIND AN EXTERNAL BRIDGE" (blocking item 12).
+    ★ `capped_by_topology` IS NOT A PROXY FOR "BEHIND AN EXTERNAL BRIDGE" ( a blocking finding2).
     It fires whenever the card's OWN bridge reports wider than the host gives — which is the NORMAL case
     for every modern AMD card, because Vega, Navi and RDNA all contain an internal PCIe switch. An x8 or
     x4 slot then read as "marginal" and was excluded by default, which is most of the "old card in a
@@ -1186,7 +1186,7 @@ def _start_work(node, src, outdir, seg=None, va="radeonsi"):
     stem = os.path.splitext(os.path.basename(src))[0] or "job"
     tag = os.path.basename(node) + ("" if not seg else "_part%d" % (seg[2] + 1))
     out = os.path.join(outdir, "%s.%s.mp4" % (stem, tag))
-    # ★ DELETE THE TARGET BEFORE STARTING (blocking item 11). `ffmpeg -y` plus "nothing
+    # ★ DELETE THE TARGET BEFORE STARTING ( a blocking finding1). `ffmpeg -y` plus "nothing
     # takes a process's exit code for an answer" means: if ffmpeg dies before it opens its output (a
     # VAAPI init failure, say), the file from a PREVIOUS identical run is still on disk — and it was
     # then reported as a REAL JOB with the old size and duration, and under --split a stale part could
@@ -1493,7 +1493,7 @@ options:
 
 def _terminate_live(procs):
     """SIGTERM every still-running process in `procs`. Used by the parent-side wall-clock timer that
-    bounds a test load in WALL time, not just media time (blocking item 10)."""
+    bounds a test load in WALL time, not just media time ( a blocking finding0)."""
     for p in procs:
         if p.poll() is None:
             try:
@@ -1627,7 +1627,7 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
     no_job_reason = None     # set when --work was asked for but nothing could be started
     no_load_reason = None    # set when --test-load was asked for but nothing could be started
     load_started = False     # True once at least one bounded test load is actually running
-    load_timer = None        # parent-side WALL-CLOCK termination for the test loads (blocking item 10)
+    load_timer = None        # parent-side WALL-CLOCK termination for the test loads (a blocking finding0)
     job_start_time = None    # when the jobs were spawned — a target older than this is STALE (item 11)
 
     # ★ REFUSE --overlay BEFORE ANYTHING IS SPAWNED (fix 2026-10-11, outside review). This check used
@@ -1696,7 +1696,7 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                 print("          (the job needs a directory it can write to; check the path)")
                 return 1
             targets = list(encoders)
-            job_start_time = time.time()   # anything older than this is a STALE output (blocking item 11)
+            job_start_time = time.time()   # anything older than this is a STALE output (a blocking finding1)
             if split and len(targets) > 1:
                 # ★ SPLIT, NOT REPLICATE. Each card gets a slice of the ONE input, and the pieces have
                 # to add back up to the original. This is the only shape that shows a job being
@@ -1723,7 +1723,7 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                 job_expect = total
             else:
                 if split:
-                    # ★ NOT ABOUT "RENDER NODES" (blocking item 12). A single eligible card
+                    # ★ NOT ABOUT "RENDER NODES" ( a blocking finding2). A single eligible card
                     # here means the OTHER spares were excluded — marginal (a narrow host link) or not
                     # encodable — and the lines above already name which and why. Replication is a
                     # different claim from division, and it is named as such.
@@ -1748,7 +1748,7 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                 proc_nodes.append(node)
             if procs:
                 load_started = True
-                # ★ A PARENT-SIDE WALL CLOCK, NOT JUST `-t` (blocking item 10). `-t` after
+                # ★ A PARENT-SIDE WALL CLOCK, NOT JUST `-t` ( a blocking finding0). `-t` after
                 # `-i` bounds MEDIA time and `-re` paces the INPUT; a spare that cannot encode 1080p60
                 # in real time (an old card) falls behind, and wall time then runs past the cap without
                 # bound. This timer terminates the loads at `cap` seconds of WALL time, and `-t` stays
@@ -1760,7 +1760,7 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                 print("         It writes no file. It only shows these cards can be driven.")
                 print("         For real work: spirit play --work <file> [--split] -- <game>")
             else:
-                # ★ NO ENCODABLE SPARE IS SAID, NOT SILENT (blocking item 9). This used to
+                # ★ NO ENCODABLE SPARE IS SAID, NOT SILENT ( blocking item 9). This used to
                 # fall straight to the exit message with nothing but SKIPPED lines before it.
                 no_load_reason = "no spare card on this machine can be driven (see the SKIPPED lines above)"
                 print("  test-load: no load started — %s" % no_load_reason)
@@ -1780,7 +1780,7 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
         no_job_reason = "--no-offload was given, so no card was asked to do anything"
         print("  work: no job started — %s" % no_job_reason)
     elif want_load and not do_offload:
-        # ★ THE THREE SILENT / FALSE TEST-LOAD CASES (blocking item 9). Before this, a
+        # ★ THE THREE SILENT / FALSE TEST-LOAD CASES ( blocking item 9). Before this, a
         # --test-load that started nothing printed nothing before launch and then "test load stopped"
         # at exit, which asserted a load had run. Each case now names why no load started.
         no_load_reason = "--no-offload was given, so no card was asked to do anything"
@@ -1824,7 +1824,7 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
         print("  Nothing was launched. The cards listed above did no work and have been stopped.")
         sys.stdout.flush()
     finally:
-        # ★ DISARM THE WALL-CLOCK TIMER FIRST (blocking item 10). It terminates the test loads at `cap`
+        # ★ DISARM THE WALL-CLOCK TIMER FIRST (a blocking finding0). It terminates the test loads at `cap`
         # seconds; once we are tearing down there is nothing left for it to do, and leaving it armed
         # could fire on a later, unrelated run in the same process.
         if load_timer:
@@ -1868,7 +1868,7 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
     if work and procs:
         print("\n  game exited (rc=%s) — the job ran to completion (not stopped with the game)" % rc)
         print("  ── JOB OUTPUT " + "─" * 56)
-        # ★ A FILE IS EVIDENCE ONLY IF THIS RUN WROTE IT (blocking item 11). `-y` overwrites,
+        # ★ A FILE IS EVIDENCE ONLY IF THIS RUN WROTE IT ( a blocking finding1). `-y` overwrites,
         # so a stale output from an identical earlier run, or a partial file left by an ffmpeg that died
         # before opening its output, would otherwise be reported as a REAL JOB. Two independent
         # conditions now have to hold: the file was written after the job started, AND the child exited 0.
@@ -1923,7 +1923,7 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
             if load_started:
                 print("\n  game exited (rc=%s) — the bounded test load ended with the session" % rc)
             else:
-                # ★ DO NOT SAY "test load stopped" WHEN NONE STARTED (blocking item 9).
+                # ★ DO NOT SAY "test load stopped" WHEN NONE STARTED ( blocking item 9).
                 print("\n  game exited (rc=%s) — NO TEST LOAD WAS STARTED (%s). The game ran normally."
                       % (rc, no_load_reason or "nothing was given the load"))
         else:
@@ -1957,7 +1957,7 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                 print("  %-12s %-22s REAL JOB  %s"
                       % (node, names.get(node, "?"), out if ok else "FAILED — no file from this run"))
         elif want_load and not load_started:
-            # ★ NOTHING RAN, AND WE SAY SO (blocking item 9). The old tail had no branch for
+            # ★ NOTHING RAN, AND WE SAY SO ( blocking item 9). The old tail had no branch for
             # "a load was asked for and none started", so it printed nothing at all here.
             for g in spares:
                 node = os.path.basename(g.get("render_node") or "")
@@ -1984,7 +1984,7 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                         print("  %-12s %-22s   (%.0f s of session; bounded to %ss by the wall clock)"
                               % ("", "", elapsed, test_load))
                     elif rc_early == 0:
-                        # ★ NORMAL COMPLETION IS NOT A FAULT (blocking item 9). The load is
+                        # ★ NORMAL COMPLETION IS NOT A FAULT ( blocking item 9). The load is
                         # DESIGNED to run for `cap` seconds and then stop; a clean rc 0 means it did
                         # exactly that. It used to be reported as "EXITED EARLY ... it did NOT run".
                         print("  %-12s %-22s SYNTHETIC TEST LOAD — COMPLETED its %ss bounded run, as designed"
@@ -2147,7 +2147,7 @@ def main():
     ap.add_argument("--version", action="version", version="spirit " + VERSION)
     sub = ap.add_subparsers(dest="cmd")
     # ★ allow_abbrev ON THE PARENT DOES NOT REACH THE SUBPARSERS (found 2026-10-11; my first attempt at
-    # this was inert and BOTH builders caught it). argparse builds each subparser with its own
+    # this was inert and both builders caught it). argparse builds each subparser with its own
     # default, so `spirit probe --js` kept working while the C++ and Rust builds rejected it — a
     # divergence created *by the fix for a divergence*. It has to be passed to every subparser, which is
     # what _sp does, so a new subcommand cannot silently opt out.
