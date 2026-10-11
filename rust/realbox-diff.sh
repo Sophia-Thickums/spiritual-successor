@@ -3,7 +3,7 @@
 # The framegen case writes ~/.config/lsfg-vk/conf.toml, so it is run with the conf
 # reset to a pristine snapshot before EACH side, and the pristine conf is restored at exit.
 set -u
-SRC="~/Desktop/Sophia Life/WORLD/work/MULTIGPU-GAMING/spiritual-successor"
+SRC="${SRC:-$(cd "$(dirname "$0")/.." && pwd)}"
 PY="$SRC/spirit.py"
 RS="$SRC/rust/target/release/spirit"
 CONF="$HOME/.config/lsfg-vk/conf.toml"

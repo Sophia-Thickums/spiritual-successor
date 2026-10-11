@@ -379,7 +379,7 @@ the number to watch if a real game runs longer than a benchmark. Worth a `hotcar
 ---
 
 ## TEST N — ★★ THE MULTI-GPU CAPABILITY, DEMONSTRATED (not two cards: FOUR, at once)
-the owner's question: the project is about MULTIPLES, not a second card. Status, tested:
+The owner's question: the project is about MULTIPLES, not a second card. Status, tested:
 
 **All four cards can hardware-encode** (measured, 1080p60 H.264, `vainfo` absent but VAAPI works):
 `MI25 198 fps · iGPU 174 fps · FE 133 fps · XT 300 fps`.
@@ -439,7 +439,7 @@ the iGPU 84% (both at 54/74 MiB), the XT at 91 C / 344 W. All four confirmed act
 ---
 
 ## TEST O — ★★ THE OFFICIAL 8K RESULT: Superposition 8K Optimized, via its GUI launcher
-the owner opened the launcher and put the cursor on Run; I clicked it (`xdotool click 1` — the button is an
+The owner opened the launcher and put the cursor on Run; the click was made (`xdotool click 1` — the button is an
 unlabelled icon, not an X window, so coordinates had to be supplied by hand). Preset 8K Optimized was already
 selected (verified by OCR of the window before clicking).
 
@@ -477,7 +477,7 @@ budgeting `spirit plan --vram-mib` now enforces.
 ---
 
 ## TEST P — ★★★ THE 8K RESULT WITH THE WHOLE MACHINE ENGAGED (the premise, closed at 8K)
-Same official benchmark, same 8K Optimized preset, driven the same way (cursor from the owner, click by
+Same official benchmark, same 8K Optimized preset, driven the same way (cursor placed by hand, click by
 `xdotool`), but with a real VAAPI H.264 encode running on ALL THREE other cards for the entire pass.
 
 ```
@@ -513,7 +513,7 @@ the benchmark's built-in GPU/temperature numbers are worthless for this build. O
 
 ## TEST Q — FIRST GAME TEST (NTE): capture worked, result INCONCLUSIVE — and why
 Protocol: NTE (UE10, 100 GB, the only real game installed — Control is a 577 MB stub) launched with
-`MANGOHUD=1 MANGOHUD_CONFIG=fps_logging,output_folder=/tmp/mangologs,autostart_log=1`. the owner played while
+`MANGOHUD=1 MANGOHUD_CONFIG=fps_logging,output_folder=/tmp/mangologs,autostart_log=1`. The owner played while
 I alternated the 3-card offload **OFF 45 s / ON 45 s**, 5 cycles. Monitor + frame log throughout.
 
 **The capture worked.** 45,382 frames over 281 s. Two traps cost time and are both now known:
@@ -579,12 +579,13 @@ Also confirmed a fourth time: all three secondary cards did real work during the
 
 ## TEST R — BUILDING THE FRAME-GEN HANDOFF: my hypothesis was FALSIFIED, and the real wall found
 **Goal:** the frame-gen/upscale pass must run on a SECOND card, so a rendered frame has to reach that
-card. that project's bridge measured 41.4 ms per 64 MiB and blamed its own `vkQueueWaitIdle` per copy. I built
+card. One of our earlier cross-GPU handoff bridges measured 41.4 ms per 64 MiB and blamed its own
+`vkQueueWaitIdle` per copy. I built
 the pipelined version (`bridge_pipelined.c`) — bounded ring, 8 copies in flight, drained only at the end.
 
 **RESULT: pipelining changed NOTHING.**
 ```
-serialized (the earlier bridge)    41.367 ms/copy    0.76 GB/s per direction
+serialized (earlier bridge)  41.367 ms/copy    0.76 GB/s per direction
 pipelined (8 in flight) 41.371 ms/copy    0.76 GB/s per direction
 ```
 **Hypothesis FALSIFIED.** The per-copy stall was never the bottleneck.
@@ -595,7 +596,7 @@ the imported buffer; the first pass FAILED on every target and fell back. The to
 B landing type 2 heap 0 (15615 MiB)  !! NOT DEVICE-LOCAL !!
 ```
 On RADV the dma_buf import lands in a **host-visible aperture heap**, so the B-side read walks **system
-RAM**, not the PCIe peer link. (that project's source carries a long comment about this exact bug on the FE.)
+RAM**, not the PCIe peer link. (That project's source carries a long comment about this exact bug.)
 
 **What it costs, per target (XT as the renderer, 64 MiB buffer, pipelined):**
 ```
@@ -791,10 +792,10 @@ claims say that, and never the other thing.
 ---
 
 ## ⚠ INCIDENT 2 — 2026-10-09 (~15:36–15:40) — I KEPT OPENING WUKONG AFTER I SAID I HAD STOPPED IT
-**What happened:** I killed the Wukong A-B-B-A chain and told the owner it was stopped. It was not. I had
+**What happened:** I killed the Wukong A-B-B-A chain and reported it as stopped. It was not. I had
 killed the *wrapper* shell the terminal tool started (`bash -lic …`, pid 9475) and the wine PIDs I could
 see — but the actual runner (`bash ab_real_game.sh`, **pid 9489**, a child that survived its parent) kept
-going, launched B2 at 15:38:22, and would have run A2 after. From the owner's side the benchmark kept opening
+going, launched B2 at 15:38:22, and would have run A2 after. From the outside the benchmark kept opening
 itself; it had to be stopped by hand.
 
 **Why the first kill missed:** killing a process is not killing a *job*. The tool's wrapper and the
@@ -809,7 +810,7 @@ from a FILE**, exclude `$$` and its ancestor chain, and kill the tree recursivel
 `ps|grep|kill`, and a bare `kill $WRAPPER` have each bitten this session — the first two kill the
 shell issuing them, the third leaves the job alive.
 
-**Recorded, not narrated:** written here, not narrated. the owner raised it; it gets one line, then the work.
+**Recorded, not narrated:** written here, not narrated. It was raised once, got one line, and the work continued.
 
 
 ---
@@ -857,8 +858,8 @@ that made the warmup visible.
 
 ---
 
-## TEST U — ★ NTE ON THE RIGHT CARD, ALL FOUR WORKING (2026-10-09 eve). the owner's law + the device-pin lesson
-**THE OWNER'S DESIGN LAW (standing):** *main is the 9070 XT — a game should ALWAYS default to the most
+## TEST U — ★ NTE ON THE RIGHT CARD, ALL FOUR WORKING (2026-10-09 eve). the design law + the device-pin lesson
+**THE DESIGN LAW (standing):** *main is the 9070 XT — a game should ALWAYS default to the most
 powerful card, and offload the rest to the other cards.* That is exactly what `spirit`'s monitor law +
 the exclusive pin exist to enforce.
 
@@ -885,8 +886,8 @@ NTE: 10,692 MiB / 90 C) — the "no cost, every card working" demonstration, on 
 reached the docked card before the wall fully took. Unexplained — do not forget it.
 
 
-### TEST U, gameplay verdict — THE OWNER, the human witness (2026-10-09, ~18:27-18:36)
-the owner played NTE on the XT (pinned) with the offload live on MI25 + FE + iGPU:
+### TEST U, gameplay verdict — the human witness (2026-10-09, ~18:27-18:36)
+The owner played NTE on the XT (pinned) with the offload live on MI25 + FE + iGPU:
 *"A full session through the preset graphics modes a couple times, used powers, did fights. Did vehicle
 too. No glitches or lagging."*
 **This is the acceptance result for the "no cost, every card working" claim, and the right instrument
@@ -902,9 +903,9 @@ was the pin, not the offload.**
 
 ## TEST P — SUPERPOSITION 8K OPTIMIZED, RE-RUN ON THE 250 W CAP (2026-10-10, 19:01:30–19:04:27)
 
-**Why this run happened and what it is:** the owner asked for Superposition. Its CLI is already falsified
+**Why this run happened and what it is:** Superposition was asked for. Its CLI is already falsified
 here (TEST H, TEST M part 4 — four variants, every one forced back to 1600x900), so the **GUI launcher
-is the only path and it cannot be driven headlessly**; the owner drove it by hand and saved the score to the
+is the only path and it cannot be driven headlessly**; it was driven by hand and the score saved to the
 desktop. **This is a CONTROL, not a frame-gen result** — Superposition's Linux build is OpenGL and lsfg-vk
 is a Vulkan layer, so frame generation cannot engage. What it measures is the cost of the power cap.
 
@@ -943,7 +944,7 @@ you say which, and never quote its figure as the card's temperature.
 - **n=1 on each side.** The two Avg figures differ by 0.77 fps (1.4%), which is inside plausible
   run-to-run noise for this benchmark — so the defensible claim is **"the score did not meaningfully
   move"**, not a precise 1.4% figure.
-- **Ambient differed and it favours the OLD number:** the 10-09 run had an a fan blowing into the
+- **Ambient differed and it favours the OLD number:** the 10-09 run had a fan blowing into the
   case at full blast (recorded then); today's did not. Lower power AND a 9 °C lower peak under worse
   ambient makes the thermal half conservative, and the power/score comparison is unaffected.
 - Superposition's own "ASUS RX 9070/9070 XT **512 MB**" and "RAM 30GB" lines are still mis-detects; ignore
@@ -1030,8 +1031,9 @@ entirely. The repo root is now: README, LICENSE, install.sh, TEST-LOG, spirit.py
 
 # ★★★★ THE OUTSIDE REVIEW — WHAT IT FOUND, AND WHAT IT COST (2026-10-11, 15:30-15:50)
 
-the owner's gate, verbatim: *"We will also verify all things through the outside reader, as a third party, that each of the
-coding versions do what we say they do and what we want them to do."* the outside reader read the three builds, the
+A standing instruction from the owner: have an outside reader go through the work as a third party, to
+check that each of the coding versions does what we say it does and what we want it to do. That reader went
+through the three builds, the
 README, this log, the GUI and the harnesses in one pass (one pass). **It stopped early on a
 refusal** after §1, so we got its claim-by-claim verdict and not the remaining five sections.
 
@@ -1136,7 +1138,7 @@ the code; it took reading the instrument to make me look at my own prose.
 
 # ★★★★ THE SECOND ROUND OF FIXES, AND THE HARNESSES BECOME TESTS (2026-10-11, 16:03-16:30)
 
-Both ports ran against a written spec (`../the port spec`). Each worker owned its own build AND
+Both ports ran against a written spec, held outside the repository. Each worker owned its own build AND
 its own harness, so a fix and its test landed together.
 
 ## THE HARNESSES, BEFORE AND AFTER
