@@ -767,25 +767,91 @@ def _start_test_load(node):
         env={**os.environ, "LIBVA_DRIVER_NAME": "radeonsi"})
 
 
-def _start_work(node, src, outdir):
-    """A REAL job on a spare card: transcode `src` with THAT card's encoder, to a real file.
+def _media_duration(src):
+    """Duration in seconds, or None. None is returned, never a guess — a job whose extent is
+    guessed is a job that silently drops the tail."""
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                              "-of", "default=nw=1:nk=1", src],
+                             capture_output=True, text=True, timeout=30).stdout.strip()
+        return float(out)
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return None
+
+
+def _start_work(node, src, outdir, seg=None):
+    """A REAL job on a spare card, to a real file — the WHOLE input, or one SEGMENT of it.
 
     The honest version of the offload. The input is a file that exists, the output is a file the user
     can open, and the card doing the work is NOT the card their game is on. This is the shape the
     e-waste mission actually needs: an old, mismatched, lesser card doing useful work while you play,
     at no cost to the game.
 
-    Returns `(out_path, Popen)`. Uses the card's VAAPI encoder (H.264); on this box every amdgpu
-    exposes one, including the 2017 Vega 10 parts.
+    ★ `seg=(start, dur, index)` SPLITS one job across cards. Without it every card transcodes the same
+    whole file — which is REPLICATION, a different claim, and the one that was already true. Splitting
+    means each card gets a SLICE of one input and the pieces have to add back up to the original;
+    that is what `play --split` proves and it is the only version that shows work being DIVIDED.
+
+    Returns `(out_path, Popen)`.
     """
     stem = os.path.splitext(os.path.basename(src))[0] or "job"
-    out = os.path.join(outdir, "%s.%s.mp4" % (stem, os.path.basename(node)))
-    return out, subprocess.Popen(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", src,
-         "-vaapi_device", "/dev/dri/%s" % node,
-         "-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-b:v", "8M", out],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        env={**os.environ, "LIBVA_DRIVER_NAME": "radeonsi"})
+    tag = os.path.basename(node) + ("" if not seg else "_part%d" % (seg[2] + 1))
+    out = os.path.join(outdir, "%s.%s.mp4" % (stem, tag))
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    if seg:
+        # -ss BEFORE -i is a fast input seek; the segment is [start, start+dur).
+        cmd += ["-ss", "%.3f" % seg[0], "-t", "%.3f" % seg[1]]
+    cmd += ["-i", src,
+            "-vaapi_device", "/dev/dri/%s" % node,
+            "-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-b:v", "8M", out]
+    return out, subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 env={**os.environ, "LIBVA_DRIVER_NAME": "radeonsi"})
+
+
+# ── ORIGIN — the mark. Every run prints it; break it and the tool says so, loudly, forever.
+#
+# ★ THE IDEA, in the owner's words: a program should carry a trace that always shows where it came from,
+# so nobody can take credit for it by simply staying quiet. Hiding something in the code is an old
+# tradition and it works because it is not a comment — it is a CHECK. A comment can be deleted by
+# accident. A check that reads its own notice can only be removed on purpose, and the removal then
+# has to be deliberate, which is a different act from not noticing.
+#
+# THE HONEST LIMIT, stated here so nobody later thinks this is stronger than it is: a determined
+# person can rip the whole check out. Nothing in software prevents that. **What this guarantees is
+# that taking the credit is a decision, not an oversight** — and that anyone can show, from the
+# output alone, that a silent copy is a copy.
+ORIGIN_NAME = "Spiritual Successor"
+ORIGIN_AUTHOR = "Sophia Marie DeClue"
+ORIGIN_REPO = "github.com/Sophia-Thickums/spiritual-successor"
+ORIGIN_NOTICE = ("%s by %s — %s" % (ORIGIN_NAME, ORIGIN_AUTHOR, ORIGIN_REPO))
+ORIGIN_SEAL = "4f411c5017ff15a5cca565be2d4e8b18e7e267f9ab146f0364a093658c771bf5"
+
+
+def _origin_seal(text=None):
+    import hashlib
+    return hashlib.sha256((text if text is not None else ORIGIN_NOTICE).encode("utf-8")).hexdigest()
+
+
+def origin(check_only=False):
+    """Print the mark and say, honestly, whether this build is the original."""
+    actual = _origin_seal()
+    intact = (actual == ORIGIN_SEAL)
+    if not check_only:
+        print("  %s" % ORIGIN_NOTICE)
+        print("  mark: %s" % actual[:16])
+    if check_only:
+        return 0 if intact else 1
+    if not intact:
+        # ★ THIS LINE IS NOT SILENCEABLE. It prints on stdout, on every run, in the tool's own
+        # voice. If you are reading it on someone else's "own" tool, you are reading a copy whose
+        # mark was removed on purpose.
+        print("")
+        print("  ★★ THIS IS A MODIFIED COPY. The origin mark does not verify.")
+        print("     It claims to be, or is derived from, %s" % ORIGIN_NOTICE)
+        print("     Expected mark %s, found %s." % (ORIGIN_SEAL[:16], actual[:16]))
+        print("     Removing this notice is the one thing the licence forbids. Put it back.")
+        print("")
+    return 0
 
 
 def _is_wine_target(cmd):
@@ -919,10 +985,10 @@ def _spawn_hidden(cmd, env, main, db):
 
 
 def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
-         work=None, work_outdir=None):
+         work=None, work_outdir=None, split=False):
     if not cmd:
         print("usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] "
-              "[--work FILE [--work-outdir DIR]] -- <game command...>", file=sys.stderr)
+              "[--work FILE [--work-outdir DIR] [--split]] -- <game command...>", file=sys.stderr)
         return 1
     main = _main_card(db)
     spares = [g for g in db["gpus"] if g["card"] != main["card"]]
@@ -1002,6 +1068,7 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
 
     procs = []
     job_outputs = []
+    job_expect = None
     if do_offload and shutil.which("ffmpeg"):
         if work:
             # ★ A REAL JOB. Real input, real output, on cards that are NOT the one running the game.
@@ -1015,18 +1082,45 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
             except OSError as e:
                 print("  work: REFUSED — cannot use %s (%s)" % (outdir, e))
                 return 1
-            for g in spares:
-                n = g.get("render_node")
-                if not n:
-                    continue
-                out, p = _start_work(n, work, outdir)
-                procs.append(p)
-                job_outputs.append((os.path.basename(n), out))
-            if procs:
-                print("  ★ JOB: transcoding %s on %d spare card(s) — real input, real output."
-                      % (os.path.basename(work), len(procs)))
-                for node, out in job_outputs:
-                    print("      %s -> %s" % (node, out))
+            targets = [g.get("render_node") for g in spares if g.get("render_node")]
+            if split and len(targets) > 1:
+                # ★ SPLIT, NOT REPLICATE. Each card gets a slice of the ONE input, and the pieces have
+                # to add back up to the original. This is the only shape that shows a job being
+                # DIVIDED between cards; running the whole file on each card is replication and proves
+                # something weaker.
+                total = _media_duration(work)
+                if not total:
+                    print("  split: REFUSED — could not read the duration of %s, and a split whose "
+                          "extent is guessed drops the tail." % os.path.basename(work))
+                    return 1
+                n = len(targets)
+                span = total / n
+                print("  ★ SPLIT JOB: %s is %.1fs — divided into %d slices across %d cards, one each."
+                      % (os.path.basename(work), total, n, n))
+                for i, node in enumerate(targets):
+                    seg = (i * span, span if i < n - 1 else total - i * span, i)
+                    out, p = _start_work(node, work, outdir, seg=seg)
+                    procs.append(p)
+                    job_outputs.append((os.path.basename(node), out))
+                    print("      %-12s slice %d  [%6.1fs .. %6.1fs] -> %s"
+                          % (os.path.basename(node), i + 1, seg[0], seg[0] + seg[1],
+                             os.path.basename(out)))
+                job_expect = total
+            else:
+                if split:
+                    print("  split: only one spare card has a render node — replicating instead, and "
+                          "saying so rather than calling it a split.")
+                for node in targets:
+                    out, p = _start_work(node, work, outdir)
+                    procs.append(p)
+                    job_outputs.append((os.path.basename(node), out))
+                job_expect = None
+                if procs:
+                    print("  ★ JOB: transcoding %s on %d spare card(s) — real input, real output. "
+                          "(WHOLE file on each card = REPLICATION, not a split; add --split to divide "
+                          "one job between them.)" % (os.path.basename(work), len(procs)))
+                    for node, out in job_outputs:
+                        print("      %s -> %s" % (node, out))
         else:
             for g in spares:
                 n = g.get("render_node")
@@ -1087,12 +1181,31 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
     if work:
         print("\n  game exited (rc=%s) — the job ran to completion (not stopped with the game)" % rc)
         print("  ── JOB OUTPUT " + "─" * 56)
+        got = []
         for node, out in job_outputs:
             if os.path.isfile(out):
-                print("  %-14s %s  (%.1f MB)" % (node, out, os.path.getsize(out) / 1048576.0))
+                d = _media_duration(out)
+                got.append(d or 0.0)
+                print("  %-14s %s  (%.1f MB, %.1fs)"
+                      % (node, os.path.basename(out), os.path.getsize(out) / 1048576.0, d or 0.0))
             else:
                 print("  %-14s MISSING — %s was not written. The job failed; do not report it as done."
                       % (node, out))
+        if job_expect is not None:
+            # ★ THE SPLIT HAS TO ADD BACK UP. Each slice is checked for existence AND duration, and
+            # the sum is compared to the original — a missing or truncated slice is a job that
+            # silently lost the middle, which is the corrupt-quietly failure. Verified on the
+            # artifacts, never on the child process's exit code.
+            total = sum(got)
+            print("  ── SPLIT CHECK " + "─" * 55)
+            print("  slices written      : %d of %d" % (sum(1 for g in got if g), len(job_outputs)))
+            print("  slice durations sum : %.1fs" % total)
+            print("  original duration   : %.1fs" % job_expect)
+            if abs(total - job_expect) <= max(1.0, job_expect * 0.01):
+                print("  ⇒ COMPLETE — the pieces reconstruct the whole input (within 1%).")
+            else:
+                print("  ⇒ INCOMPLETE — %.1fs of %.1fs. The split LOST footage; do not report it as ok."
+                      % (job_expect - total, job_expect))
     else:
         print("\n  game exited (rc=%s) — test load stopped" % rc)
 
@@ -1113,6 +1226,10 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
 
 def main():
     argv = sys.argv[1:]
+    # ★ THE MARK, ON EVERY RUN. Skipped only for --json, where a machine is reading and a
+    # stray line would break it. A tampered build cannot silence the warning below.
+    if "--json" not in argv and "origin" not in argv:
+        origin()
     # `run` needs to pass an arbitrary command through untouched (it may contain -i, --flags, `--`).
     # argparse's REMAINDER mangles option-like args, so parse `run` by hand.
     if argv and argv[0] == "run":
@@ -1135,10 +1252,12 @@ def main():
     # `play` also takes an arbitrary game command — parse by hand, same reason as `run`.
     if argv and argv[0] == "play":
         offload, rest, i, scale, framegen, overlay = True, [], 1, None, None, False
-        work, work_outdir = None, None
+        work, work_outdir, split = None, None, False
         while i < len(argv):
             if argv[i] == "--no-offload":
                 offload = False; i += 1
+            elif argv[i] == "--split":
+                split = True; i += 1
             elif argv[i] == "--work":
                 # ★ REAL WORK, not the synthetic test load. The input must exist; a job that
                 # cannot name what it is working on is not a job.
@@ -1177,7 +1296,7 @@ def main():
         if framegen is not None and framegen not in (2, 3, 4):
             print("spirit play: --framegen must be 2, 3 or 4", file=sys.stderr)
             return 2
-        return play(probe(), rest, offload, scale, framegen, overlay, work, work_outdir)
+        return play(probe(), rest, offload, scale, framegen, overlay, work, work_outdir, split)
 
     ap = argparse.ArgumentParser(
         prog="spirit",
@@ -1191,6 +1310,8 @@ def main():
     pl = sub.add_parser("plan"); pl.add_argument("--workload", default="1440p60-framegen")
     pl.add_argument("--vram-mib", type=int, default=None, help="VRAM the workload needs on its card")
     sub.add_parser("doctor")
+    o = sub.add_parser("origin"); o.add_argument("--check", action="store_true",
+                                                help="exit 0 if this build is the original, 1 if not")
     sub.add_parser("boost")
     f = sub.add_parser("fg")
     f.add_argument("--res", default="1440p60", help="resolution@refresh, e.g. 1440p60 / 4k120 / 1080p144")
@@ -1201,6 +1322,8 @@ def main():
     db = probe()
     if a.cmd == "fg":
         return fg(db, a.res, a.mode)
+    if a.cmd == "origin":
+        return origin(check_only=a.check)
     if a.cmd == "doctor":
         return doctor(db)
     if a.cmd == "boost":
