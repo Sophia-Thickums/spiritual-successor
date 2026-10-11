@@ -1024,3 +1024,53 @@ Raw telemetry (16 `.jsonl`, ~3.2 MB) moved to `evidence/` with an index saying w
 which claim it backs; one-off scripts moved to `experiments/`; editor backups moved out of the tree
 entirely. The repo root is now: README, LICENSE, install.sh, TEST-LOG, spirit.py, spirit_ui.py, and the
 `cpp/`, `rust/`, `present-counter/`, `evidence/`, `experiments/` directories.
+
+
+---
+
+# ★★★★ THE OUTSIDE REVIEW — WHAT IT FOUND, AND WHAT IT COST (2026-10-11, 15:30-15:50)
+
+the owner's gate, verbatim: *"We will also verify all things through the outside reader, as a third party, that each of the
+coding versions do what we say they do and what we want them to do."* the outside reader read the three builds, the
+README, this log, the GUI and the harnesses in one pass (one pass). **It stopped early on a
+refusal** after §1, so we got its claim-by-claim verdict and not the remaining five sections.
+
+## ★ THE THING WORTH SAYING FIRST
+**Every finding below was invisible to our own test suite, by construction.** The harnesses compare the
+three builds TO EACH OTHER. A fault all three share is therefore not merely untested — it is
+un-testable by that instrument, and it reads green forever. This is the same law as `I cannot be my own
+witness`, one level up: **parity is not correctness, and a differential harness cannot audit a claim.**
+
+## WHAT IT FOUND, VERIFIED IN THE CODE BEFORE ACTING ON ANY OF IT
+
+| # | finding | verified how | fix |
+|---|---|---|---|
+| 1 | **THE TAIL PRINTED A FALSE STATEMENT.** It said every spare was "alive for N s of the session", using the GAME's elapsed time; **nothing ever polled the children** (`grep -c "\.poll()" spirit.py` = **0**). An ffmpeg that died at second zero was reported as having run the whole session. | code read + the count | poll each child BEFORE terminating; `ran for the whole session` only when it is true, else `EXITED EARLY (rc=…)… it did NOT run for the session` |
+| 2 | **AMD'S VIDEO DRIVER WAS HANDED TO NON-AMD CARDS.** Both launch sites hard-coded `LIBVA_DRIVER_NAME=radeonsi`. With `--work` the job failed and printed MISSING; the test load failed **SILENTLY** (ffmpeg's output goes to /dev/null). Made "different makers" and "AMD and Intel work today" untrue for the spare cards — the half of the machine the tool exists for. | code read at both sites | driver chosen from each card's own kernel driver (`amdgpu`→radeonsi, `i915`/`xe`→iHD); a card with no known VAAPI encoder is **named as SKIPPED**, never silently idle |
+| 3 | `--work-outdir` **lied in its own help text**: promised "beside FILE", did the current directory. All three builds. | quote vs code | code now does what the text always said |
+| 4 | The README claimed the game's FPS goes **down** with frame gen on; the code's own cited measurement says **23 on / 23 off, identical**. | README vs the comment above `COUNTER_LAYER` | rewritten to what was actually measured: fell ~9% on one title, did not move on another |
+| 5 | **The README's sample output could not be produced by the program** — wrong filename shape, wrong extension, wrong block. | generated the real output from the code | replaced with the verbatim real thing, produced by running it |
+| 6 | The lsfg-vk config backup was rewritten **on every run**, so a second multiplier overwrote the user's original with the already-modified file. | code read | backed up once, only if absent |
+| 7 | The second wall failed **silently** (`\|\| true`), so a game could still see every card while the run looked identical to a good one. | code read | a failed bind now says so on stderr, at the moment it happens |
+| 8 | `"AMD and Intel work today"` / `"No root"` / `"No dependencies"` overclaimed. | code read | each narrowed to what is true: the witness wants root and is optional; ffmpeg/gamescope/`unshare` are driven if present |
+
+## WHAT THE PORT TURNED UP THAT THE REVIEW DID NOT — three more, all found by diffing
+- **Rust silently swallowed a failed `mkdir` on the job path** (`let _ =`), then launched anyway, so a job ran into a directory that did not exist and surfaced later as MISSING — where Python and C++ both REFUSE. Now all three refuse, same words, rc=1.
+- **The `★ SPLIT JOB:` line printed `<stem>.mp4`** in C++ and Rust — so a `.mkv` input announced itself as `clip.mkv.mp4`. Python printed the real basename. Now all three print the basename.
+- **The `── SPLIT CHECK` rule had 56 dashes in Rust and 55 in Python** (C++ had been fixed). Rust now COMPUTES the rule rather than hard-coding it, so it cannot drift again.
+- And in both, the OS error text interpolated into the REFUSED branches is now gone — for the same reason as the compatdata branch: each language spells its own runtime's error differently, so including it makes a branch the three builds can never agree on.
+
+## ★ AND THE HARNESS ITSELF WAS FLAKY — WHICH MEANS OUR "TESTED" CLAIM WAS NOT ONE
+The C++ suite failed **1 run in 4** with `FAIL probe (real)`. Cause: the live probe prints an
+`[idle now: x16 GenN]` suffix that comes and goes with the card's own low-power link state between two
+invocations milliseconds apart. **It is a live measurement of the MACHINE, not a property of a build** —
+and the `--json` comparison already stripped the same field (`idle_degraded`) for exactly this reason,
+while the text comparison did not. Now stripped there too.
+**A suite that fails at random is not evidence of anything.** Four consecutive clean runs after the fix,
+where it used to fail one in four. Rust 52/0 and C++ 69/0, the C++ one run four times.
+
+## THE CLAIM THAT SURVIVES, AND THE ONE THAT DOES NOT
+- **Survives, and is now true where it was not:** the three builds produce identical output, and the
+  full `--split --work` path was diffed byte-for-byte across all three rather than assumed.
+- **Does not survive:** *"tested"* never meant the claims were checked. It meant the builds agreed.
+  Those are different sentences and only the first one was ever earned.

@@ -1567,10 +1567,20 @@ static std::pair<std::optional<string>, string> ensure_lsfg_profile(int multipli
              "override_present_mode = true\npacing_mode = \"vsync\"\nperformance_mode = false\n"
              "preserve_swapchain_image_count = false\n",
              multiplier, name.c_str());
-    // shutil.copy2(LSFG_CONF, LSFG_CONF + ".bak-spirit") then append the block
-    FILE *src = fopen(conf.c_str(), "rb");
+    // ★ KEEP THE USER'S ORIGINAL, ONCE (fix 2026-10-11, from the outside review). This copied
+    // unconditionally, so a SECOND multiplier overwrote the backup with the already-modified file —
+    // and the user's original lsfg-vk config was then gone for good. A backup that is rewritten on
+    // every use is not a backup; it is a copy of the last thing we did.
     string bak = conf + ".bak-spirit";
+    struct stat bst;
+    bool need_backup = (stat(bak.c_str(), &bst) != 0);   // shutil.copy2 only if not exists
+    FILE *src = need_backup ? fopen(conf.c_str(), "rb") : nullptr;
     FILE *dst = src ? fopen(bak.c_str(), "wb") : nullptr;
+    if (need_backup && (!src || !dst)) {
+        if (src) fclose(src);
+        if (dst) fclose(dst);
+        return {std::nullopt, "could not write the profile (" + string(strerror(errno)) + ")"};
+    }
     if (src && dst) {
         char buf[8192];
         size_t n;
@@ -1578,19 +1588,16 @@ static std::pair<std::optional<string>, string> ensure_lsfg_profile(int multipli
         while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
             if (fwrite(buf, 1, n, dst) != n) { okc = false; break; }
         fclose(src); fclose(dst);
-        if (okc) {
-            FILE *af = fopen(conf.c_str(), "a");
-            if (af) {
-                size_t len = strlen(mb);
-                bool wok = (fwrite(mb, 1, len, af) == len);
-                fclose(af);
-                if (wok)
-                    return {name, "added profile " + py_repr(name) + " (backup: " + bak + ")"};
-            }
-        }
-    } else {
-        if (src) fclose(src);
-        if (dst) fclose(dst);
+        if (!okc)
+            return {std::nullopt, "could not write the profile (" + string(strerror(errno)) + ")"};
+    }
+    FILE *af = fopen(conf.c_str(), "a");
+    if (af) {
+        size_t len = strlen(mb);
+        bool wok = (fwrite(mb, 1, len, af) == len);
+        fclose(af);
+        if (wok)
+            return {name, "added profile " + py_repr(name) + " (backup: " + bak + ")"};
     }
     return {std::nullopt, "could not write the profile (" + string(strerror(errno)) + ")"};
 }
@@ -1893,12 +1900,27 @@ static int origin_cmd(bool check_only) {
     return 0;
 }
 
+// ★ THE ENCODER DRIVER IS NOT ALWAYS radeonsi (fix 2026-10-11, found by the outside review).
+// `LIBVA_DRIVER_NAME=radeonsi` was hard-coded at both launch sites, so a spare card that is not AMD
+// was handed AMD's VAAPI driver. With a test load it failed SILENTLY, because ffmpeg's own output goes
+// to /dev/null. The driver is now chosen from the card's OWN kernel driver, and a card with no VAAPI
+// encoder we know of is SKIPPED AND SAID OUT LOUD rather than quietly doing nothing.
+// Returns (driver, reason): (driver, "") if this card can encode, ("", why not) otherwise.
+static std::pair<string, string> va_driver(const J &g) {
+    string d = sfield(g, "driver");
+    for (char &c : d) c = (char)tolower((unsigned char)c);
+    if (d == "amdgpu") return {"radeonsi", ""};
+    if (d == "i915")   return {"iHD", ""};
+    if (d == "xe")     return {"iHD", ""};
+    return {"", "no VAAPI encoder this tool knows of (kernel driver: " + (d.empty() ? string("unknown") : d) + ")"};
+}
+
 // A SYNTHETIC load: ffmpeg's OWN generated test pattern (testsrc2), piped to /dev/null. The encoder
 // really runs — that is why the counters move — but the input is a test card and the output is
 // discarded. A LOAD proves a card can be DRIVEN; a JOB produces something. --work is the job.
-static pid_t start_test_load(const string &node) {
+static pid_t start_test_load(const string &node, const string &va) {
     vector<string> env = current_env();
-    set_env(env, "LIBVA_DRIVER_NAME", "radeonsi");
+    set_env(env, "LIBVA_DRIVER_NAME", va);
     vector<string> argv = {"ffmpeg", "-hide_banner", "-loglevel", "error",
                            "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=60",
                            "-vaapi_device", "/dev/dri/" + node,
@@ -1916,6 +1938,46 @@ static string stem_of(const string &path) {
     string b = (sl == string::npos) ? path : path.substr(sl + 1);
     size_t dot = b.rfind('.');
     return (dot == string::npos) ? b : b.substr(0, dot);
+}
+
+// os.path.abspath: join to cwd when relative, then normalise (collapse "//", ".", "..").
+static string abspath(const string &p) {
+    string path = p;
+    bool abs = !path.empty() && path[0] == '/';
+    if (!abs) {
+        char cwd[4096];
+        if (getcwd(cwd, sizeof(cwd))) path = string(cwd) + "/" + path;
+    }
+    vector<string> parts;
+    size_t i = 0;
+    while (i < path.size()) {
+        size_t j = path.find('/', i);
+        if (j == string::npos) j = path.size();
+        string comp = path.substr(i, j - i);
+        if (comp == "." || comp.empty()) {
+            // skip
+        } else if (comp == "..") {
+            if (!parts.empty()) parts.pop_back();
+        } else {
+            parts.push_back(comp);
+        }
+        i = j + 1;
+    }
+    string out = (path.size() && path[0] == '/') ? "/" : "";
+    for (size_t k = 0; k < parts.size(); k++) {
+        if (k) out += "/";
+        out += parts[k];
+    }
+    if (out.empty()) out = ".";
+    return out;
+}
+
+// os.path.dirname.
+static string dir_name(const string &path) {
+    size_t sl = path.rfind('/');
+    if (sl == string::npos) return "";
+    if (sl == 0) return "/";
+    return path.substr(0, sl);
 }
 
 // Duration in seconds, or -1. -1 is returned, never a guess: a split whose extent is guessed drops
@@ -1936,9 +1998,9 @@ static double media_duration(const string &src) {
 // Without it every card transcodes the same whole file, which is REPLICATION, a weaker claim.
 static std::pair<string, pid_t> start_work(const string &node, const string &src,
                                            const string &outdir, const string &stem,
-                                           long long seg, double ss, double dur) {
+                                           long long seg, double ss, double dur, const string &va) {
     vector<string> env = current_env();
-    set_env(env, "LIBVA_DRIVER_NAME", "radeonsi");
+    set_env(env, "LIBVA_DRIVER_NAME", va);
     char tag[256];
     if (seg >= 0) snprintf(tag, sizeof(tag), "%s_part%lld", node.c_str(), seg + 1);
     else          snprintf(tag, sizeof(tag), "%s", node.c_str());
@@ -2099,8 +2161,10 @@ static vector<string> hidden_argv(const vector<string> &cmd, const J &main, cons
     if (!hide.empty() && which("unshare")) {
         string script =
             "hide=\"$1\"; shift; for n in $hide; do "
-            "[ -e \"/dev/dri/$n\" ] && mount --bind /dev/null \"/dev/dri/$n\" 2>/dev/null || true; "
-            "done; exec \"$@\"";
+            "if [ -e \"/dev/dri/$n\" ]; then "
+            "mount --bind /dev/null \"/dev/dri/$n\" 2>/dev/null || "
+            "echo \"  wall: could NOT hide /dev/dri/$n - the game can still see this card\" >&2; "
+            "fi; done; exec \"$@\"";
         vector<string> argv = {"unshare", "-rm", "sh", "-c", script, "sh", join(hide, " ")};
         for (auto &c : cmd) argv.push_back(c);
         return argv;
@@ -2247,14 +2311,32 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
     }
 
     vector<pid_t> procs;
+    vector<string> proc_nodes;                        // parallel to procs — which card each load went to
+    std::map<string, int> died_early;                 // render node -> rc, loads already gone at game exit
     vector<std::pair<string, string>> job_outputs;   // (node, out path)
     double job_expect = -1.0;
-    if (do_offload && which("ffmpeg")) {
-        vector<string> targets;
-        for (auto *g : spares) {
-            string n = sfield(*g, "render_node");
-            if (!n.empty()) targets.push_back(n);
+    // ★ WHICH SPARES CAN ACTUALLY ENCODE, decided from each card's own kernel driver, before anything
+    // is launched. A card we cannot drive is left out and NAMED — the alternative is an ffmpeg that
+    // dies instantly with its output going to /dev/null, which looks exactly like a card doing work.
+    struct Skip { string node, name, why; };
+    vector<std::pair<string, string>> encoders;       // (render_node, va_driver)
+    vector<Skip> skipped;                             // (node_or_card, name, reason)
+    for (auto *g : spares) {
+        string node = sfield(*g, "render_node");
+        auto vd = va_driver(*g);
+        if (!vd.first.empty() && !node.empty()) {
+            encoders.push_back({base_of(node), vd.first});
+        } else {
+            Skip s;
+            s.node = node.empty() ? sfield(*g, "card") : base_of(node);
+            s.name = gpu_name(*g);
+            s.why  = vd.second.empty() ? "no render node" : vd.second;
+            skipped.push_back(s);
         }
+    }
+    if (do_offload && which("ffmpeg")) {
+        for (auto &s : skipped)
+            printf("  spare: SKIPPED %s (%s) — %s\n", s.node.c_str(), s.name.c_str(), s.why.c_str());
         if (!work.empty()) {
             // A REAL JOB. Real input, real output, on cards that are NOT the one running the game.
             struct stat st;
@@ -2263,38 +2345,48 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                        "        test load is what runs when you do not give one.\n", work.c_str());
                 return 1;
             }
-            if (work_outdir.empty()) work_outdir = ".";
-            mkdir(work_outdir.c_str(), 0755);
+            // ★ BESIDE THE INPUT, which is what --work-outdir's own help text has always promised.
+            // It used to default to the CURRENT DIRECTORY. (Found by the outside review, 2026-10-11.)
+            if (work_outdir.empty()) work_outdir = dir_name(abspath(work));
+            if (!mkdirs(work_outdir)) {
+                // ★ NO strerror() HERE, deliberately — see the compatdata branch. Each language spells
+                // its own runtime's error differently, so interpolating it makes this a branch the three
+                // builds cannot agree on. Same words in every build instead.
+                printf("  work: REFUSED — cannot use %s\n", work_outdir.c_str());
+                printf("          (the job needs a directory it can write to; check the path)\n");
+                return 1;
+            }
             string stem = stem_of(work);
-            if (split && targets.size() > 1) {
+            if (split && encoders.size() > 1) {
                 double total = media_duration(work);
                 if (total <= 0.0) {
                     printf("  split: REFUSED — could not read the duration of %s, and a split whose\n"
                            "         extent is guessed drops the tail.\n", stem.c_str());
                     return 1;
                 }
-                size_t n = targets.size();
+                size_t n = encoders.size();
                 double span = total / (double)n;
                 printf("  ★ SPLIT JOB: %s is %.1fs — divided into %zu slices across %zu cards, one each.\n",
-                       (stem + ".mp4").c_str(), total, n, n);
+                       base_of(work).c_str(), total, n, n);
                 for (size_t i = 0; i < n; i++) {
                     double ss = (double)i * span;
                     double dur = (i < n - 1) ? span : (total - ss);
-                    auto r = start_work(targets[i], work, work_outdir, stem, (long long)i, ss, dur);
-                    if (r.second > 0) procs.push_back(r.second);
-                    job_outputs.push_back({targets[i], r.first});
-                    printf("      %-12s slice %zu  [%6.1fs .. %6.1fs] -> %s\n", targets[i].c_str(), i + 1,
-                           ss, ss + dur, base_of(r.first).c_str());
+                    auto r = start_work(encoders[i].first, work, work_outdir, stem, (long long)i, ss,
+                                        dur, encoders[i].second);
+                    if (r.second > 0) { procs.push_back(r.second); proc_nodes.push_back(encoders[i].first); }
+                    job_outputs.push_back({encoders[i].first, r.first});
+                    printf("      %-12s slice %zu  [%6.1fs .. %6.1fs] -> %s\n", encoders[i].first.c_str(),
+                           i + 1, ss, ss + dur, base_of(r.first).c_str());
                 }
                 job_expect = total;
             } else {
                 if (split)
                     printf("  split: only one spare card has a render node — replicating instead, and\n"
                            "         saying so rather than calling it a split.\n");
-                for (const string &n : targets) {
-                    auto r = start_work(n, work, work_outdir, stem, -1, 0.0, 0.0);
-                    if (r.second > 0) procs.push_back(r.second);
-                    job_outputs.push_back({n, r.first});
+                for (auto &e : encoders) {
+                    auto r = start_work(e.first, work, work_outdir, stem, -1, 0.0, 0.0, e.second);
+                    if (r.second > 0) { procs.push_back(r.second); proc_nodes.push_back(e.first); }
+                    job_outputs.push_back({e.first, r.first});
                 }
                 if (!procs.empty()) {
                     printf("  ★ JOB: transcoding %s on %d spare card(s) — real input, real output. "
@@ -2305,9 +2397,9 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                 }
             }
         } else {
-            for (const string &n : targets) {
-                pid_t p = start_test_load(n);
-                if (p > 0) procs.push_back(p);
+            for (auto &e : encoders) {
+                pid_t p = start_test_load(e.first, e.second);
+                if (p > 0) { procs.push_back(p); proc_nodes.push_back(e.first); }
             }
             if (!procs.empty()) {
                 printf("  cards: %d spare card(s) running a SYNTHETIC TEST LOAD\n", (int)procs.size());
@@ -2364,6 +2456,22 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
     if (!work.empty()) {
         for (pid_t p : procs) { int st; waitpid(p, &st, 0); }
     } else {
+        // ★ ASK EACH LOAD WHETHER IT IS STILL ALIVE, BEFORE KILLING IT (fix 2026-10-11, from the
+        // outside review). THE TAIL used to say every spare was "alive for N s of the session", using
+        // the GAME's elapsed time — and nothing ever polled the children. An ffmpeg that died at second
+        // zero was therefore reported as having run the whole session. A check that can only agree with
+        // you is a mirror, not a check: this one never asked the question, so it could not fail.
+        died_early.clear();
+        for (size_t i = 0; i < procs.size(); i++) {
+            int st = 0;
+            pid_t r = waitpid(procs[i], &st, WNOHANG);
+            if (r == procs[i]) {
+                int code = 0;
+                if (WIFEXITED(st)) code = WEXITSTATUS(st);
+                else if (WIFSIGNALED(st)) code = -WTERMSIG(st);
+                died_early[proc_nodes[i]] = code;
+            }
+        }
         for (pid_t p : procs) kill(p, SIGTERM);
     }
     if (!work.empty()) {
@@ -2376,7 +2484,7 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
             if (stat(jo.second.c_str(), &st) == 0) {
                 double d = media_duration(jo.second);
                 if (d > 0) { got += d; written++; }
-                printf("  %-14s %s  (%.1f MB, %.1fs)\n", jo.first.c_str(), stem_of(jo.second).c_str(),
+                printf("  %-14s %s  (%.1f MB, %.1fs)\n", jo.first.c_str(), base_of(jo.second).c_str(),
                        (double)st.st_size / 1048576.0, d > 0 ? d : 0.0);
             } else {
                 printf("  %-14s MISSING — %s was not written. The job failed; do not report it as done.\n",
@@ -2384,7 +2492,7 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
             }
         }
         if (job_expect > 0.0) {
-            printf("  ── SPLIT CHECK ────────────────────────────────────────────────────────\n");
+            printf("  ── SPLIT CHECK ───────────────────────────────────────────────────────\n");
             printf("  slices written      : %d of %d\n", written, (int)job_outputs.size());
             printf("  slice durations sum : %.1fs\n", got);
             printf("  original duration   : %.1fs\n", job_expect);
@@ -2420,12 +2528,32 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                        ok ? jo.second.c_str() : "FAILED — no file");
             }
         } else {
+            std::map<string, string> names;
+            for (auto *g : spares) names[base_of(sfield(*g, "render_node"))] = gpu_name(*g);
             for (auto *g : spares) {
                 string node = base_of(sfield(*g, "render_node"));
                 if (node.empty()) continue;
-                printf("  %-12s %-22s SYNTHETIC TEST LOAD — alive for %.0f s of the session,\n",
-                       node.c_str(), gpu_name(*g).c_str(), elapsed);
-                printf("  %-12s %-22s produced nothing (a job needs --work FILE)\n", "", "");
+                string nm = names.count(node) ? names[node] : "?";
+                bool is_enc = false;
+                for (auto &e : encoders) if (e.first == node) is_enc = true;
+                if (is_enc) {
+                    auto it = died_early.find(node);
+                    if (it == died_early.end()) {
+                        printf("  %-12s %-22s SYNTHETIC TEST LOAD — ran for the whole session (%.0f s),\n",
+                               node.c_str(), nm.c_str(), elapsed);
+                    } else {
+                        // ★ Say what was SEEN, not what was hoped: this one was already gone before the
+                        // game exited, so it did not run the session however long the game lasted.
+                        printf("  %-12s %-22s SYNTHETIC TEST LOAD — EXITED EARLY (rc=%d, before the game\n",
+                               node.c_str(), nm.c_str(), it->second);
+                        printf("  %-12s %-22s   exited): it did NOT run for the session.\n", "", "");
+                    }
+                    printf("  %-12s %-22s produced nothing (a job needs --work FILE)\n", "", "");
+                } else {
+                    string why = "not used";
+                    for (auto &s : skipped) if (s.node == node) { why = s.why; break; }
+                    printf("  %-12s %-22s SKIPPED — %s\n", node.c_str(), nm.c_str(), why.c_str());
+                }
             }
         }
     }

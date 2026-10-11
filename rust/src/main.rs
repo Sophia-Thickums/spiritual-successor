@@ -2118,11 +2118,18 @@ fn ensure_lsfg_profile(multiplier: i64) -> (Option<String>, String) {
         "\n[[profile]]\nactive_in = []\nflow_scale = 1.0\nmultiplier = {}\nname = \"{}\"\noverride_present_mode = true\npacing_mode = \"vsync\"\nperformance_mode = false\npreserve_swapchain_image_count = false\n",
         multiplier, name
     );
+    // ★ KEEP THE USER'S ORIGINAL, ONCE (fix 2026-10-11, from the outside review). This copied
+    // unconditionally, so a SECOND multiplier overwrote the backup with the already-modified file —
+    // and the user's original lsfg-vk config was then gone for good. A backup that is rewritten on
+    // every use is not a backup; it is a copy of the last thing we did.
     let bak = format!("{}.bak-spirit", conf);
-    let write_res: std::io::Result<()> = fs::copy(&conf, &bak).and_then(|_| {
+    let write_res: std::io::Result<()> = (|| {
+        if !Path::new(&bak).exists() {
+            fs::copy(&conf, &bak)?;
+        }
         let mut fh = fs::OpenOptions::new().append(true).open(&conf)?;
         fh.write_all(block.as_bytes())
-    });
+    })();
     if let Err(e) = write_res {
         return (None, format!("could not write the profile ({})", e));
     }
@@ -2250,6 +2257,23 @@ fn base_of(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
+/// `os.path.abspath` — absolute, lexically normalised, WITHOUT touching the filesystem.
+fn abspath(p: &str) -> String {
+    match std::path::absolute(p) {
+        Ok(a) => a.to_string_lossy().to_string(),
+        Err(_) => p.to_string(),
+    }
+}
+
+/// `os.path.dirname` — the lexical parent, "" when there is none.
+fn dirname(p: &str) -> String {
+    match p.rfind('/') {
+        None => String::new(),
+        Some(0) => "/".to_string(),
+        Some(i) => p[..i].to_string(),
+    }
+}
+
 fn stem_of(path: &str) -> String {
     let b = base_of(path);
     match b.rfind('.') {
@@ -2270,10 +2294,41 @@ fn media_duration(src: &str) -> f64 {
     }
 }
 
+// ★ THE ENCODER DRIVER IS NOT ALWAYS radeonsi (fix 2026-10-11, found by the outside review).
+// `LIBVA_DRIVER_NAME=radeonsi` was hard-coded at both launch sites, so a spare card that is not AMD was
+// handed AMD's VAAPI driver. With `--work` the job then failed and printed MISSING; with a test load it
+// failed SILENTLY, because ffmpeg's own output goes to /dev/null. That made two README claims untrue in
+// practice — "different makers, different ages" and "AMD and Intel work today" — for the one half of the
+// machine the offload is about. The driver is now chosen from the card's OWN kernel driver, and a card
+// with no VAAPI encoder we know of is SKIPPED AND SAID OUT LOUD rather than quietly doing nothing.
+const VA_DRIVERS: [(&str, &str); 3] = [("amdgpu", "radeonsi"), ("i915", "iHD"), ("xe", "iHD")];
+
+/// `(driver, None)` if this card can encode, or `(None, why not)`. Never a guess, never a default.
+fn va_driver(g: &Json) -> (Option<String>, Option<String>) {
+    let d = g
+        .get("driver")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    for (k, v) in VA_DRIVERS {
+        if d == k {
+            return (Some(v.to_string()), None);
+        }
+    }
+    let shown = if d.is_empty() { "unknown".to_string() } else { d };
+    (
+        None,
+        Some(format!(
+            "no VAAPI encoder this tool knows of (kernel driver: {})",
+            shown
+        )),
+    )
+}
+
 /// A SYNTHETIC load: ffmpeg's OWN generated test pattern (testsrc2), piped to /dev/null. The encoder
 /// really runs — that is why the counters move — but the input is a test card and the output is
 /// discarded. A LOAD proves a card can be DRIVEN; a JOB produces something. --work is the job.
-fn start_test_load(node: &str) -> std::io::Result<Child> {
+fn start_test_load(node: &str, va: &str) -> std::io::Result<Child> {
     Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -2293,7 +2348,7 @@ fn start_test_load(node: &str) -> std::io::Result<Child> {
             "null",
             "-",
         ])
-        .env("LIBVA_DRIVER_NAME", "radeonsi")
+        .env("LIBVA_DRIVER_NAME", va)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -2322,6 +2377,7 @@ fn start_work(
     seg: i64,
     ss: f64,
     dur: f64,
+    va: &str,
 ) -> std::io::Result<(String, Child)> {
     let tag = if seg >= 0 {
         format!("{}_part{}", node, seg + 1)
@@ -2351,7 +2407,7 @@ fn start_work(
     args.push(out.clone());
     let ch = Command::new("ffmpeg")
         .args(&args)
-        .env("LIBVA_DRIVER_NAME", "radeonsi")
+        .env("LIBVA_DRIVER_NAME", va)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -2536,7 +2592,11 @@ fn hidden_argv(cmd: &[String], main: &Json, db: &Json) -> Vec<String> {
         }
     }
     if !hide.is_empty() && which("unshare").is_some() {
-        let script = "hide=\"$1\"; shift; for n in $hide; do [ -e \"/dev/dri/$n\" ] && mount --bind /dev/null \"/dev/dri/$n\" 2>/dev/null || true; done; exec \"$@\"";
+        // ★ A WALL THAT FAILS SILENTLY IS NOT A WALL. This used to end every bind with `|| true`, so a
+        // failed hide said nothing at all and the game could still see the other cards while the run
+        // looked identical to a good one. It now says so, on stderr, at the moment it happens.
+        // (Found by the outside review, 2026-10-11.)
+        let script = "hide=\"$1\"; shift; for n in $hide; do if [ -e \"/dev/dri/$n\" ]; then mount --bind /dev/null \"/dev/dri/$n\" 2>/dev/null || echo \"  wall: could NOT hide /dev/dri/$n - the game can still see this card\" >&2; fi; done; exec \"$@\"";
         let mut v: Vec<String> = vec![
             "unshare".into(),
             "-rm".into(),
@@ -2737,15 +2797,30 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
     }
 
     let mut procs: Vec<Child> = Vec::new();
+    let mut proc_nodes: Vec<String> = Vec::new(); // parallel to procs — which card each test load went to
+    let mut died_early: Vec<(String, i32)> = Vec::new(); // node -> rc, loads already gone at game exit
     let mut job_outputs: Vec<(String, String)> = Vec::new();
     let mut job_expect: f64 = -1.0;
+    // ★ WHICH SPARES CAN ACTUALLY ENCODE, decided from each card's own kernel driver, before anything
+    // is launched. A card we cannot drive is left out and NAMED — the alternative is an ffmpeg that
+    // dies instantly with its output going to /dev/null, which looks exactly like a card doing work.
+    let mut encoders: Vec<(String, String)> = Vec::new(); // [(render_node, va_driver)]
+    let mut skipped: Vec<(String, String, String)> = Vec::new(); // [(render_node_or_card, name, reason)]
+    for g in &spares {
+        let node = g.get("render_node").and_then(|v| v.as_str()).unwrap_or("");
+        let (va, why) = va_driver(g);
+        if va.is_some() && !node.is_empty() {
+            encoders.push((base_of(node), va.unwrap()));
+        } else {
+            let key = if node.is_empty() { card_of(g) } else { base_of(node) };
+            skipped.push((key, gpu_name(g), why.unwrap_or_else(|| "no render node".to_string())));
+        }
+    }
     if do_offload && which("ffmpeg").is_some() {
-        let targets: Vec<String> = spares
-            .iter()
-            .filter_map(|g| g.get("render_node").and_then(|v| v.as_str()))
-            .filter(|n| !n.is_empty())
-            .map(|n| n.to_string())
-            .collect();
+        for (node, nm, why) in &skipped {
+            println!("  spare: SKIPPED {} ({}) — {}", node, nm, why);
+        }
+        let targets: Vec<(String, String)> = encoders.clone();
         if !work.is_empty() {
             // A REAL JOB. Real input, real output, on cards that are NOT the one running the game.
             if !std::path::Path::new(work).is_file() {
@@ -2756,8 +2831,32 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
                 println!("        test load is what runs when you do not give one.");
                 return 1;
             }
-            let outdir = if work_outdir.is_empty() { "." } else { work_outdir };
-            let _ = std::fs::create_dir_all(outdir);
+            // ★ BESIDE THE INPUT, which is what --work-outdir's own help text has always promised.
+            // It used to default to the CURRENT DIRECTORY, so `spirit play --work film.mkv -- game`
+            // left the job's output wherever you happened to be standing. (Found by the outside
+            // review, 2026-10-11: the usage text and the code had disagreed the whole time.)
+            let outdir: String = if !work_outdir.is_empty() {
+                abspath(work_outdir)
+            } else {
+                let d = dirname(&abspath(work));
+                if d.is_empty() {
+                    env::current_dir()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                } else {
+                    d
+                }
+            };
+            // ★ A FAILED mkdir MUST REFUSE THE JOB (fix 2026-10-11). This used to be `let _ =`, which
+            // swallowed the failure and launched anyway — so a job ran into a directory that did not
+            // exist and turned up later as a MISSING output, instead of being refused up front the way
+            // the other two builds refuse it. And no io::Error text in the message: each language
+            // spells its own error differently, which is the one thing this branch cannot share.
+            if std::fs::create_dir_all(&outdir).is_err() {
+                println!("  work: REFUSED — cannot use {}", outdir);
+                println!("          (the job needs a directory it can write to; check the path)");
+                return 1;
+            }
             let stem = stem_of(work);
             if split && targets.len() > 1 {
                 let total = media_duration(work);
@@ -2772,19 +2871,26 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
                 let n = targets.len();
                 let span = total / n as f64;
                 println!(
-                    "  ★ SPLIT JOB: {}.mp4 is {:.1}s — divided into {} slices across {} cards, one each.",
-                    stem, total, n, n
+                    "  ★ SPLIT JOB: {} is {:.1}s — divided into {} slices across {} cards, one each.",
+                    Path::new(work)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| work.to_string()),
+                    total,
+                    n,
+                    n
                 );
-                for (i, node) in targets.iter().enumerate() {
+                for (i, (node, va)) in targets.iter().enumerate() {
                     let ss = i as f64 * span;
                     let dur = if i < n - 1 { span } else { total - ss };
-                    match start_work(node, work, outdir, &stem, i as i64, ss, dur) {
+                    match start_work(node, work, &outdir, &stem, i as i64, ss, dur, va) {
                         Ok((out, ch)) => {
                             println!(
                                 "      {:<12} slice {}  [{:6.1}s .. {:6.1}s] -> {}",
                                 node, i + 1, ss, ss + dur, base_of(&out)
                             );
                             procs.push(ch);
+                            proc_nodes.push(node.clone());
                             job_outputs.push((node.clone(), out));
                         }
                         Err(_) => {}
@@ -2796,10 +2902,11 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
                     println!("  split: only one spare card has a render node — replicating instead, and");
                     println!("         saying so rather than calling it a split.");
                 }
-                for node in &targets {
-                    if let Ok((out, ch)) = start_work(node, work, outdir, &stem, -1, 0.0, 0.0) {
+                for (node, va) in &targets {
+                    if let Ok((out, ch)) = start_work(node, work, &outdir, &stem, -1, 0.0, 0.0, va) {
                         job_outputs.push((node.clone(), out));
                         procs.push(ch);
+                        proc_nodes.push(node.clone());
                     }
                 }
                 if !procs.is_empty() {
@@ -2815,9 +2922,10 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
                 }
             }
         } else {
-            for n in &targets {
-                if let Ok(ch) = start_test_load(n) {
+            for (node, va) in &encoders {
+                if let Ok(ch) = start_test_load(node, va) {
                     procs.push(ch);
+                    proc_nodes.push(node.clone());
                 }
             }
             if !procs.is_empty() {
@@ -2891,6 +2999,18 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
             let _ = p.wait();
         }
     } else {
+        // ★ ASK EACH LOAD WHETHER IT IS STILL ALIVE, BEFORE KILLING IT (fix 2026-10-11, from the
+        // outside review). THE TAIL used to say every spare was "alive for N s of the session",
+        // using the GAME's elapsed time — and nothing ever polled the children. An ffmpeg that
+        // died at second zero (a card handed the wrong VA driver, say) was therefore reported as
+        // having run the whole session. A check that can only agree with you is a mirror, not a
+        // check: this one never asked the question, so it could not fail.
+        died_early.clear();
+        for (p, node) in procs.iter_mut().zip(proc_nodes.iter()) {
+            if let Ok(Some(st)) = p.try_wait() {
+                died_early.push((node.clone(), st.code().unwrap_or(-1)));
+            }
+        }
         for p in procs.iter_mut() {
             let _ = p.kill();
             let _ = p.wait();
@@ -2925,7 +3045,7 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
             }
         }
         if job_expect > 0.0 {
-            println!("  ── SPLIT CHECK ────────────────────────────────────────────────────────");
+            println!("  ── SPLIT CHECK {}", "─".repeat(55));
             println!("  slices written      : {} of {}", written, job_outputs.len());
             println!("  slice durations sum : {:.1}s", got);
             println!("  original duration   : {:.1}s", job_expect);
@@ -2949,30 +3069,55 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
     // from one that is broken, and the loads are silent by design (ffmpeg's output goes to /dev/null).
     // So say it plainly, per card, and say "alive for" rather than claiming work was done.
     if !procs.is_empty() || !job_outputs.is_empty() {
+        // Python builds `names` as a dict keyed on the node basename, so a later spare wins a collision.
+        let mut names: Vec<(String, String)> = Vec::new();
+        for g in &spares {
+            let r = g.get("render_node").and_then(|v| v.as_str()).unwrap_or("");
+            names.push((base_of(r), gpu_name(g)));
+        }
+        let name_of = |node: &str| -> String {
+            names
+                .iter()
+                .rev()
+                .find(|(k, _)| k == node)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| "?".to_string())
+        };
         println!();
         println!("  ── THE TAIL — what the other cards did ───────────────────────────────");
         if !job_outputs.is_empty() {
             for (node, out) in &job_outputs {
                 let ok = std::path::Path::new(out).is_file();
-                let nm = spares
-                    .iter()
-                    .find(|g| {
-                        let r = g.get("render_node").and_then(|v| v.as_str()).unwrap_or("");
-                        r.rsplit('/').next().unwrap_or(r) == node
-                    })
-                    .map(gpu_name)
-                    .unwrap_or_else(|| "?".to_string());
-                println!("  {:<12} {:<22} REAL JOB  {}", node, nm,
+                println!("  {:<12} {:<22} REAL JOB  {}", node, name_of(node),
                          if ok { out.clone() } else { "FAILED — no file".to_string() });
             }
         } else {
             for g in &spares {
                 let r = g.get("render_node").and_then(|v| v.as_str()).unwrap_or("");
-                let node = r.rsplit('/').next().unwrap_or(r);
+                let node = base_of(r);
                 if node.is_empty() { continue; }
-                println!("  {:<12} {:<22} SYNTHETIC TEST LOAD — alive for {:.0} s of the session,",
-                         node, gpu_name(g), elapsed);
-                println!("  {:<12} {:<22} produced nothing (a job needs --work FILE)", "", "");
+                let nm = name_of(&node);
+                if encoders.iter().any(|(n, _)| n == &node) {
+                    match died_early.iter().find(|(n, _)| n == &node).map(|(_, rc)| *rc) {
+                        None => println!("  {:<12} {:<22} SYNTHETIC TEST LOAD — ran for the whole session ({:.0} s),",
+                                         node, nm, elapsed),
+                        Some(rc) => {
+                            // ★ Say what was SEEN, not what was hoped: this one was already gone before the
+                            // game exited, so it did not run the session however long the game lasted.
+                            println!("  {:<12} {:<22} SYNTHETIC TEST LOAD — EXITED EARLY (rc={}, before the game",
+                                     node, nm, rc);
+                            println!("  {:<12} {:<22}   exited): it did NOT run for the session.", "", "");
+                        }
+                    }
+                    println!("  {:<12} {:<22} produced nothing (a job needs --work FILE)", "", "");
+                } else {
+                    let why = skipped
+                        .iter()
+                        .find(|(n2, _, _)| n2 == &node)
+                        .map(|(_, _, w)| w.clone())
+                        .unwrap_or_else(|| "not used".to_string());
+                    println!("  {:<12} {:<22} SKIPPED — {}", node, nm, why);
+                }
             }
         }
     }

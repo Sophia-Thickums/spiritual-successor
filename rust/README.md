@@ -52,9 +52,12 @@ errors) / the `play --scale` & `play --framegen` argument surface / the whole `-
   `SPIRIT_VAAPI_DEVICE` for `encode`.
 - **`play`** spawns a user/mount namespace (`unshare -rm sh -c …`) hiding every other
   card's `/dev/dri/<card>` and `/dev/dri/<renderDn>` node behind `/dev/null`, starts a real
-  `ffmpeg` VAAPI H.264 encode (`LIBVA_DRIVER_NAME=radeonsi`) on every spare render node,
-  launches the game, then kills the encoders on exit. The exact `unshare` argv and the
-  exact ffmpeg argv were diffed against the Python and are byte-identical.
+  `ffmpeg` VAAPI H.264 encode on every spare render node, launches the game, then polls the
+  encoders before terminating them. **`LIBVA_DRIVER_NAME` is chosen per card** from its own
+  kernel driver — `amdgpu` → `radeonsi`, `i915`/`xe` → `iHD` — and a card with no encoder this
+  tool knows of is reported as `SKIPPED` rather than launched and left to fail silently. The
+  exact `unshare` argv and the exact ffmpeg argv were diffed against the Python and are
+  byte-identical.
 - **JSON output** matches `json.dumps(..., indent=2, ensure_ascii=True)` exactly, including
   key order, `\uXXXX` escaping (e.g. the em-dash in the role "why" strings), and the int/float
   distinction (a whole-number float prints as `54.0`, never `54`).

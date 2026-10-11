@@ -692,7 +692,13 @@ def _ensure_lsfg_profile(multiplier):
              'override_present_mode = true\npacing_mode = "vsync"\nperformance_mode = false\n'
              'preserve_swapchain_image_count = false\n' % (multiplier, name))
     try:
-        shutil.copy2(LSFG_CONF, LSFG_CONF + ".bak-spirit")
+        # ★ KEEP THE USER'S ORIGINAL, ONCE (fix 2026-10-11, from the outside review). This copied
+        # unconditionally, so a SECOND multiplier overwrote the backup with the already-modified
+        # file — and the user's original lsfg-vk config was then gone for good. A backup that is
+        # rewritten on every use is not a backup; it is a copy of the last thing we did.
+        bak = LSFG_CONF + ".bak-spirit"
+        if not os.path.exists(bak):
+            shutil.copy2(LSFG_CONF, bak)
         with open(LSFG_CONF, "a", encoding="utf-8") as fh:
             fh.write(block)
     except OSError as exc:
@@ -757,7 +763,29 @@ def _main_card(db):
     return max(panel or db["gpus"], key=score)
 
 
-def _start_test_load(node):
+# ★ THE ENCODER DRIVER IS NOT ALWAYS radeonsi (fix 2026-10-11, found by the outside review).
+# `LIBVA_DRIVER_NAME=radeonsi` was hard-coded at both launch sites, so a spare card that is not AMD was
+# handed AMD's VAAPI driver. With `--work` the job then failed and printed MISSING; with a test load it
+# failed SILENTLY, because ffmpeg's own output goes to /dev/null. That made two README claims untrue in
+# practice — "different makers, different ages" and "AMD and Intel work today" — for the one half of the
+# machine the offload is about. The driver is now chosen from the card's OWN kernel driver, and a card
+# with no VAAPI encoder we know of is SKIPPED AND SAID OUT LOUD rather than quietly doing nothing.
+VA_DRIVERS = {
+    "amdgpu": "radeonsi",
+    "i915": "iHD",
+    "xe": "iHD",
+}
+
+
+def _va_driver(g):
+    """(driver, None) if this card can encode, or (None, why not). Never a guess, never a default."""
+    d = (g.get("driver") or "").lower()
+    if d in VA_DRIVERS:
+        return VA_DRIVERS[d], None
+    return None, ("no VAAPI encoder this tool knows of (kernel driver: %s)" % (d or "unknown"))
+
+
+def _start_test_load(node, va):
     """A SYNTHETIC load on a spare card: ffmpeg's OWN generated test pattern, piped to /dev/null.
 
     ★ WHY THIS IS NAMED A LOAD AND NOT A JOB (2026-10-10 — the owner asked "are we offloading REAL JOBS
@@ -774,7 +802,7 @@ def _start_test_load(node):
          "-vaapi_device", "/dev/dri/%s" % node,
          "-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-f", "null", "-"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        env={**os.environ, "LIBVA_DRIVER_NAME": "radeonsi"})
+        env={**os.environ, "LIBVA_DRIVER_NAME": va})
 
 
 def _media_duration(src):
@@ -789,7 +817,7 @@ def _media_duration(src):
         return None
 
 
-def _start_work(node, src, outdir, seg=None):
+def _start_work(node, src, outdir, seg=None, va="radeonsi"):
     """A REAL job on a spare card, to a real file — the WHOLE input, or one SEGMENT of it.
 
     The honest version of the offload. The input is a file that exists, the output is a file the user
@@ -815,7 +843,7 @@ def _start_work(node, src, outdir, seg=None):
             "-vaapi_device", "/dev/dri/%s" % node,
             "-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-b:v", "8M", out]
     return out, subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 env={**os.environ, "LIBVA_DRIVER_NAME": "radeonsi"})
+                                 env={**os.environ, "LIBVA_DRIVER_NAME": va})
 
 
 # ── ORIGIN — the mark. Every run prints it; break it and the tool says so, loudly, forever.
@@ -1004,9 +1032,15 @@ def _hidden_argv(cmd, main, db):
             if n:
                 hide.append(n)
     if hide and shutil.which("unshare"):
+        # ★ A WALL THAT FAILS SILENTLY IS NOT A WALL. This used to end every bind with `|| true`, so a
+        # failed hide said nothing at all and the game could still see the other cards while the run
+        # looked identical to a good one. It now says so, on stderr, at the moment it happens.
+        # (Found by the outside review, 2026-10-11.)
         script = ('hide="$1"; shift; for n in $hide; do '
-                  '[ -e "/dev/dri/$n" ] && mount --bind /dev/null "/dev/dri/$n" 2>/dev/null || true; '
-                  'done; exec "$@"')
+                  'if [ -e "/dev/dri/$n" ]; then '
+                  'mount --bind /dev/null "/dev/dri/$n" 2>/dev/null || '
+                  'echo "  wall: could NOT hide /dev/dri/$n - the game can still see this card" >&2; '
+                  'fi; done; exec "$@"')
         return ["unshare", "-rm", "sh", "-c", script, "sh", " ".join(hide)] + list(cmd)
     return list(cmd)
 
@@ -1188,22 +1222,49 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
         _ensure_compatdata(cmd)
 
     procs = []
+    proc_nodes = []          # parallel to procs — which card each test load went to (see THE TAIL)
+    died_early = {}          # render node -> rc, for loads that were already gone at game exit
     job_outputs = []
     job_expect = None
+    # ★ WHICH SPARES CAN ACTUALLY ENCODE, decided from each card's own kernel driver, before anything
+    # is launched. A card we cannot drive is left out and NAMED — the alternative is an ffmpeg that
+    # dies instantly with its output going to /dev/null, which looks exactly like a card doing work.
+    encoders = []            # [(render_node, va_driver)]
+    skipped = []             # [(render_node_or_card, name, reason)]
+    for g in spares:
+        node = g.get("render_node")
+        va, why = _va_driver(g)
+        if va and node:
+            encoders.append((os.path.basename(node), va))
+        else:
+            skipped.append((os.path.basename(node) if node else g.get("card", "?"),
+                            _gpu_name(g), why or "no render node"))
     if do_offload and shutil.which("ffmpeg"):
+        for node, nm, why in skipped:
+            print("  spare: SKIPPED %s (%s) — %s" % (node, nm, why))
         if work:
             # ★ A REAL JOB. Real input, real output, on cards that are NOT the one running the game.
             if not os.path.isfile(work):
                 print("  work: REFUSED — %r is not a file. A job needs a real input; the synthetic "
                       "test load is what runs when you do not give one." % work)
                 return 1
-            outdir = os.path.abspath(work_outdir or ".")
+            # ★ BESIDE THE INPUT, which is what --work-outdir's own help text has always promised.
+            # It used to default to the CURRENT DIRECTORY, so `spirit play --work film.mkv -- game`
+            # left the job's output wherever you happened to be standing. (Found by the outside
+            # review, 2026-10-11: the usage text and the code had disagreed the whole time.)
+            outdir = (os.path.abspath(work_outdir) if work_outdir
+                      else (os.path.dirname(os.path.abspath(work)) or os.getcwd()))
             try:
                 os.makedirs(outdir, exist_ok=True)
-            except OSError as e:
-                print("  work: REFUSED — cannot use %s (%s)" % (outdir, e))
+            except OSError:
+                # ★ NO OS ERROR TEXT HERE, for the same reason as the compatdata branch above: each
+                # language spells its own runtime's error differently (Python an OSError, C++ strerror,
+                # Rust an io::Error Display), so interpolating it makes this a branch the three builds
+                # CANNOT agree on. Same words in every build instead, naming the thing to check.
+                print("  work: REFUSED — cannot use %s" % outdir)
+                print("          (the job needs a directory it can write to; check the path)")
                 return 1
-            targets = [g.get("render_node") for g in spares if g.get("render_node")]
+            targets = list(encoders)
             if split and len(targets) > 1:
                 # ★ SPLIT, NOT REPLICATE. Each card gets a slice of the ONE input, and the pieces have
                 # to add back up to the original. This is the only shape that shows a job being
@@ -1218,10 +1279,11 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                 span = total / n
                 print("  ★ SPLIT JOB: %s is %.1fs — divided into %d slices across %d cards, one each."
                       % (os.path.basename(work), total, n, n))
-                for i, node in enumerate(targets):
+                for i, (node, va) in enumerate(targets):
                     seg = (i * span, span if i < n - 1 else total - i * span, i)
-                    out, p = _start_work(node, work, outdir, seg=seg)
+                    out, p = _start_work(node, work, outdir, seg=seg, va=va)
                     procs.append(p)
+                    proc_nodes.append(node)
                     job_outputs.append((os.path.basename(node), out))
                     print("      %-12s slice %d  [%6.1fs .. %6.1fs] -> %s"
                           % (os.path.basename(node), i + 1, seg[0], seg[0] + seg[1],
@@ -1231,9 +1293,10 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                 if split:
                     print("  split: only one spare card has a render node — replicating instead, and "
                           "saying so rather than calling it a split.")
-                for node in targets:
-                    out, p = _start_work(node, work, outdir)
+                for node, va in targets:
+                    out, p = _start_work(node, work, outdir, va=va)
                     procs.append(p)
+                    proc_nodes.append(node)
                     job_outputs.append((os.path.basename(node), out))
                 job_expect = None
                 if procs:
@@ -1243,10 +1306,9 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                     for node, out in job_outputs:
                         print("      %s -> %s" % (node, out))
         else:
-            for g in spares:
-                n = g.get("render_node")
-                if n:
-                    procs.append(_start_test_load(n))
+            for node, va in encoders:
+                procs.append(_start_test_load(node, va))
+                proc_nodes.append(node)
             if procs:
                 print("  cards: %d spare card(s) running a SYNTHETIC TEST LOAD" % len(procs))
                 print("         (ffmpeg's own testsrc2 test pattern -> /dev/null). This proves the")
@@ -1296,6 +1358,16 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                 except Exception:
                     pass
         else:
+            # ★ ASK EACH LOAD WHETHER IT IS STILL ALIVE, BEFORE KILLING IT (fix 2026-10-11, from the
+            # outside review). THE TAIL used to say every spare was "alive for N s of the session",
+            # using the GAME's elapsed time — and nothing ever polled the children. An ffmpeg that
+            # died at second zero (a card handed the wrong VA driver, say) was therefore reported as
+            # having run the whole session. A check that can only agree with you is a mirror, not a
+            # check: this one never asked the question, so it could not fail.
+            died_early = {}
+            for p, node in zip(procs, proc_nodes):
+                if p.poll() is not None:
+                    died_early[node] = p.returncode
             for p in procs:
                 p.terminate()
     elapsed = max(time.time() - t0, 1e-6)
@@ -1343,10 +1415,24 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
         else:
             for g in spares:
                 node = os.path.basename(g.get("render_node") or "")
-                if node:
-                    print("  %-12s %-22s SYNTHETIC TEST LOAD — alive for %.0f s of the session,"
-                          % (node, names.get(node, "?"), elapsed))
+                if not node:
+                    continue
+                nm = names.get(node, "?")
+                if node in [n for n, _v in encoders]:
+                    rc_early = died_early.get(node)
+                    if rc_early is None:
+                        print("  %-12s %-22s SYNTHETIC TEST LOAD — ran for the whole session (%.0f s),"
+                              % (node, nm, elapsed))
+                    else:
+                        # ★ Say what was SEEN, not what was hoped: this one was already gone before the
+                        # game exited, so it did not run the session however long the game lasted.
+                        print("  %-12s %-22s SYNTHETIC TEST LOAD — EXITED EARLY (rc=%s, before the game"
+                              % (node, nm, rc_early))
+                        print("  %-12s %-22s   exited): it did NOT run for the session." % ("", ""))
                     print("  %-12s %-22s produced nothing (a job needs --work FILE)" % ("", ""))
+                else:
+                    print("  %-12s %-22s SKIPPED — %s"
+                          % (node, nm, next((w for n2, _nm, w in skipped if n2 == node), "not used")))
 
     if fg_count_path:
         n = _read_counter(fg_count_path)
