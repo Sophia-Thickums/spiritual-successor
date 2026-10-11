@@ -2515,6 +2515,16 @@ static bool is_steam_launcher(const vector<string> &cmd) {
     return false;
 }
 
+// The running program's own absolute path, for the Steam launch-options recipe. Mirrors spirit.py's
+// `os.path.abspath(__file__)` and the Rust build's `/proc/self/exe` readlink: a stranger copying the
+// recipe out must get the path to THIS binary, not a guess.
+static string self_exe_path() {
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) { buf[n] = '\0'; return string(buf); }
+    return "spirit";
+}
+
 // True if unprivileged user namespaces WORK here, false if they are denied, nullopt if no `unshare`.
 // Cached once per process like Python's _USERNS_CACHE. Mirrors spirit.py::_userns_available.
 static std::optional<bool> userns_available() {
@@ -2817,6 +2827,18 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
         }
     }
 
+    // ★ THE STEAM PATH IS SAID, NOT SILENT (blocking item 2). `steam`/`steam://` is not the game
+    // — it is a REQUEST to the Steam client, which starts the game itself, in its own environment.
+    // This tool cannot put the pin there, so it says so and gives the recipe that CAN pin it.
+    bool steam_launch = is_steam_launcher(cmd);
+    if (steam_launch) {
+        printf("  steam: this is a Steam launch — it cannot be pinned from here.\n");
+        printf("         `steam`/`steam://` hands the request to the running Steam client and returns\n");
+        printf("         at once, so the game would start WITHOUT this tool's pin. The pin only reaches\n");
+        printf("         a process THIS tool launches. To pin a Steam game, set its launch options to:\n");
+        printf("             \"%s\" play -- %%command%%\n", self_exe_path().c_str());
+        printf("         (note the `--` before %%command%%), then launch the game from Steam.\n");
+    }
     if (is_wine_target(cmd)) {
         printf("  wall: Proton/Wine detected — skipping the mount namespace (Wine refuses to run as\n");
         printf("        root, and `unshare -r` makes us root); the exclusive pin still applies.\n");
@@ -3143,6 +3165,17 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
     double elapsed = (double)(t_end_ts.tv_sec - t_game_ts.tv_sec) +
                      (double)(t_end_ts.tv_nsec - t_game_ts.tv_nsec) / 1e9;
     if (elapsed < 1e-6) elapsed = 1e-6;
+
+    // ★ A LAUNCHER THAT RETURNS AT ONCE IS SAID, NOT REPORTED AS A NORMAL SESSION (blocking item 2).
+    // With the Steam client already running, `steam`/`steam://` hands off and exits in about a second:
+    // the game starts unpinned, and the old code printed `game exited (rc=0)` as if the session had
+    // been routed. It had not. Detect the fast clean exit and say plainly that the game went its own way.
+    if (steam_launch && rc == 0 && elapsed < 3.0) {
+        printf("\n  ★ steam returned after %.1fs (rc=0): it handed the launch to the already-running\n", elapsed);
+        printf("    Steam client, so the game is starting on its own — WITHOUT this tool's pin. This\n");
+        printf("    session did NOT route the game. Pin a Steam game with the launch-options recipe above.\n");
+        fflush(stdout);
+    }
 
     // ★ THE TAIL — what the OTHER cards actually did. A feature you cannot see is indistinguishable
     // from one that is broken, and the loads are silent by design (ffmpeg's output goes to /dev/null).

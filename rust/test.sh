@@ -194,7 +194,12 @@ while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done
 [ "${1:-}" = "--" ] && shift
 exec "$@"
 EOF
-chmod +x "$STUB/unshare" "$STUB/ffmpeg" "$STUB/ffprobe" "$STUB/vulkaninfo" "$STUB/gamescope"
+# steam: exits 0 at once, standing in for a running Steam client that accepts a hand-off and returns.
+cat > "$STUB/steam" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$STUB/unshare" "$STUB/ffmpeg" "$STUB/ffprobe" "$STUB/vulkaninfo" "$STUB/gamescope" "$STUB/steam"
 ln -sf "$STUB/unshare"    "$NOFFMPEG/unshare"
 ln -sf "$STUB/vulkaninfo" "$NOFFMPEG/vulkaninfo"
 ln -sf "$STUB/ffmpeg"     "$NOFFPROBE/ffmpeg"
@@ -451,6 +456,40 @@ CHILD_HOME=""
 PATHVAL="$NOGS:$REAL_PATH"
 compare "play --overlay, gamescope absent" "$FLEET10" play --overlay -- /bin/echo HI
 PATHVAL="$STUB:$REAL_PATH"
+
+echo
+echo "== play: the Steam path (blocking item 2 — said, not silent) =="
+# ★ A STEAM LAUNCH CANNOT BE PINNED FROM HERE, AND BOTH BUILDS MUST SAY SO. Two claims, two cases:
+#   (1) `steam://rungameid/N` is not a program: both must print the launch-options RECIPE and the same
+#       exec-failure line (rc 127).
+#   (2) a launcher that RETURNS AT ONCE (`steam`, stubbed to exit 0) must be named as having routed
+#       NOTHING — the old code printed `game exited (rc=0)` as if the session had worked.
+# The recipe line carries each build's OWN absolute path, and the fast-return line a measured time;
+# normalize both — the CLAIM is the message, not the path or the clock.
+_steam_norm() {
+    sed -e 's#".*" play -- %command%#"<SELF>" play -- %command%#' \
+        -e 's/after [0-9][0-9.]*s/after N.Ns/'
+}
+compare_steam() {
+  label=$1; dev=$2; shift 2
+  DEV=$dev
+  run_side "$PYBIN" "$PY" "$@" >"$TMP/py.raw" 2>/dev/null; prc=$?
+  run_side "$RS" "$@" >"$TMP/rs.raw" 2>/dev/null; rrc=$?
+  _steam_norm < "$TMP/py.raw" > "$TMP/py.out"
+  _steam_norm < "$TMP/rs.raw" > "$TMP/rs.out"
+  DEV=""; kill_stubs
+  if [ "$prc" != "$rrc" ] || ! diff -q "$TMP/py.out" "$TMP/rs.out" >/dev/null; then
+    echo "FAIL: $label   (py rc=$prc rs rc=$rrc)"; fail=$((fail+1))
+    diff -u "$TMP/py.out" "$TMP/rs.out" | head -30
+  else echo "PASS: $label   (rc=$prc)"; pass=$((pass+1)); fi
+}
+compare_steam "play -- steam:// (says it cannot be pinned; prints the recipe)" \
+        "$FLEET10" play --no-offload -- steam://rungameid/123
+compare_steam "play -- steam (fast clean exit -> session did NOT route the game)" \
+        "$FLEET10" play --no-offload -- steam
+if grep -q 'play -- %command%' "$TMP/rs.out" && grep -q 'did NOT route the game' "$TMP/rs.out"; then
+  echo "PASS: steam message present (recipe + not-routed)"; pass=$((pass+1))
+else echo "FAIL: steam message missing from the output"; fail=$((fail+1)); cat "$TMP/rs.out"; fi
 
 echo
 echo "== C5: a hung child must not hang THIS tool (gamescope --help, 15 s each side) =="

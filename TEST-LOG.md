@@ -1005,6 +1005,11 @@ The witness (arming, the exit panel, and the `boost` status line), the first-lau
 | `cpp/run_tests.sh` (C++ vs Python, ~69 cases, fake fleet + live box) | 44 passed, **21 failed** | **69 passed, 0 failed** |
 | `rust/test.sh` (Rust vs Python, ~52 cases) | — | **52 passed, 0 failed** |
 
+> **SUPERSEDED (2026-10-11, later the same day).** These rows are the 15:30 state and are kept as the
+> record of where the suites were. After the repair round and the new Steam-path cases they stand at
+> **C++ 125 / 0** and **Rust 143 / 0** — see "THE HARNESSES, BEFORE AND AFTER" below and the closing
+> count at the end of this file.
+
 Run by hand, not by the process that produced the change. `make clean && make` is warning-free under
 `-Wall -Wextra`. Both harnesses gained `play --help`, `play -h`, `ui -h` and `ui --help` cases.
 
@@ -1071,6 +1076,7 @@ and the `--json` comparison already stripped the same field (`idle_degraded`) fo
 while the text comparison did not. Now stripped there too.
 **A suite that fails at random is not evidence of anything.** Four consecutive clean runs after the fix,
 where it used to fail one in four. Rust 52/0 and C++ 69/0, the C++ one run four times.
+> **SUPERSEDED.** Those counts date from 15:30; the current totals are at the end of this file.
 
 ## THE CLAIM THAT SURVIVES, AND THE ONE THAT DOES NOT
 - **Survives, and is now true where it was not:** the three builds produce identical output, and the
@@ -1130,8 +1136,14 @@ number I had not checked against the thing I was citing.** It took an outside re
 the code; it took reading the instrument to make me look at my own prose.
 
 ## STILL OPEN
-- `doctor` tests the PIN but not the mount-namespace wall. Now stated plainly in the README rather than
-  claimed; teaching `doctor` to test it is the next improvement.
+> **STATUS (2026-10-11, later):** the first item below is now RESOLVED; the second still stands. The
+> section is kept as the record of what was open at the time it was written.
+- ~~`doctor` tests the PIN but not the mount-namespace wall. Now stated plainly in the README rather than
+  claimed; teaching `doctor` to test it is the next improvement.~~ **RESOLVED:** `doctor` now probes the
+  wall itself (`unshare -Urm true`) and reports a real `namespace-wall` line — PASS when available,
+  **UNKNOWN (a holding verdict that never passes) when denied or when `unshare` is absent**. Verified live
+  in the denied state on all three builds: the line prints, it is non-core, and the overall is
+  `WORKS, NOT FULLY VERIFIED`, exit 3.
 - Intel's VAAPI path is written but has never run on Intel hardware. Now labelled unverified.
 
 
@@ -1147,6 +1159,9 @@ its own harness, so a fix and its test landed together.
 |---|---|---|---|
 | `cpp/run_tests.sh` | 44 passed, 21 failed | 69 / 0 | **106 / 0** (11 consecutive clean runs) |
 | `rust/test.sh` | no stubs, no offload, no argv check, no real-box phase | 52 / 0 | **116 / 0** (8 consecutive clean runs) |
+
+> **SUPERSEDED (later 2026-10-11).** After the repair round and the Steam-path cases: **C++ 125 / 0**,
+> **Rust 143 / 0**. The `106/0` and `116/0` rows are the 16:30 state, kept as the record.
 
 **Rust's suite now has teeth, and that was measured rather than asserted:** run against the PRE-FIX
 binary it reports **47 failures**. A suite that cannot fail is theatre; this one demonstrably can.
@@ -1305,3 +1320,34 @@ figure, no "different makers".
   1,514 / 6,898 / 10,692 MiB, each from a named run.
 - The ~9% frame-gen figure was real but lived outside the repo; it is now recorded in this file with its
   limits, so a reader can check it.
+
+
+---
+
+# ★★★★ THE STEAM PATH — PORTED INTO C++, AND PINNED BY A CASE (2026-10-11, evening)
+
+## THE GAP A GREEN SUITE COULD NOT SEE
+Blocking item 2 (the Steam path) was fixed in the REFERENCE and in Rust, but **not in the C++ build.** C++
+had `is_steam_launcher` — it did skip the mount namespace for a `steam`/`steam://` target — but it never
+printed the launch-options recipe and never detected a launcher that returns at once. So a Steam launch
+read as a clean, routed session: `game exited (rc=0)`, exactly the false statement item 2 exists to kill.
+**Both harnesses were green while it sat there**, because neither had a Steam case — the same shared-blind
+shape this file keeps finding, one level down.
+
+## WHAT WAS ADDED
+- C++ now prints the recipe (`…"/path/to/spirit" play -- %command%`) and the not-routed line, matching
+  Python and Rust byte for byte — verified by running both and diffing with the path normalized.
+- A `steam` stub (exits 0 at once) plus two differential cases in **both** suites: the `steam://` exec
+  failure (rc 127) and the fast clean exit (rc 0, `session did NOT route the game`).
+- **The cases were proven to have teeth, not asserted:** run against the PRE-PORT C++ binary they fail on
+  exactly the two missing lines (`steam: this is a Steam launch…` and `★ steam returned after …`).
+
+## CURRENT SUITE TOTALS (run by hand, this window)
+| harness | cases | result |
+|---|---|---|
+| `cpp/run_tests.sh` | 125 | **125 passed, 0 failed** |
+| `rust/test.sh`   | 143 | **143 passed, 0 failed** |
+
+The `namespace-wall` item in STILL OPEN above is resolved (doctor probes the wall; UNKNOWN holds, never
+passes). The Intel VAAPI item still stands. **The release is HELD deliberately** — fix, verify, and
+overwrite the published history in one pass rather than shipping a moving target.
