@@ -539,6 +539,30 @@ def _enabled_connectors(card):
     return out
 
 
+# ★ THE ONE PROBE FOR THE SECOND WALL, RUN THE SAME WAY EVERYWHERE (blocking item 1). `unshare`
+# being on PATH says nothing about whether an unprivileged user namespace can be CREATED: Ubuntu
+# 24.04's default AppArmor policy and Debian's `unprivileged_userns_clone=0` both deny it, and there
+# `unshare -r` fails. `doctor` already ran this exact test; `play` now consults the SAME answer
+# before it wraps a launch, so the two can never disagree about whether the wall exists. Cached —
+# the answer cannot change within one run, and re-probing would fork a process per call.
+_USERNS_CACHE = {}
+
+
+def _userns_available():
+    """True if unprivileged user namespaces WORK here, False if they are denied, None if no `unshare`."""
+    if "v" in _USERNS_CACHE:
+        return _USERNS_CACHE["v"]
+    if not shutil.which("unshare"):
+        _USERNS_CACHE["v"] = None
+        return None
+    try:
+        _USERNS_CACHE["v"] = subprocess.run(["unshare", "-Urm", "true"],
+                                            capture_output=True, timeout=10).returncode == 0
+    except Exception:
+        _USERNS_CACHE["v"] = False
+    return _USERNS_CACHE["v"]
+
+
 def doctor(db, as_json=False):
     """Run the tool's own claims against the live machine.
 
@@ -694,13 +718,9 @@ def doctor(db, as_json=False):
                                      % main["card"]})
 
         # E. THE SECOND WALL. The README used to confess that doctor did not test it. Now doctor says what
-        #    it found, which is the least it can do.
-        wall = None
-        if shutil.which("unshare"):
-            try:
-                wall = subprocess.run(["unshare", "-Urm", "true"], capture_output=True, timeout=10).returncode == 0
-            except Exception:
-                wall = None
+        #    it found, which is the least it can do. The probe is shared with `play` (1a.1) so the two
+        #    can never disagree about whether the wall exists.
+        wall = _userns_available()
         if wall is True:
             checks.append({"check": "namespace-wall", "verdict": "PASS",
                            "detail": "unprivileged user namespaces are available; the game can be separated "
@@ -1062,7 +1082,7 @@ def boost(db):
     return 0
 
 
-# ── play: the game path — the strongest card renders, every other card works the tail ──
+# ── play: the game path — the monitor card renders; other cards idle unless asked ──
 def _gpu_name(g):
     """The card's short name, as the role table prints it."""
     n = (g.get("name") or g.get("card") or "?").strip()
@@ -1132,6 +1152,17 @@ def _marginal(g):
     if w is not None and w < 4:
         return "x%s link at the host — too narrow to use unasked" % w
     return None
+
+
+# ★ GRACE MARGIN ON THE WALL-CLOCK BACKSTOP (blocking item 3). The parent timer used to fire at
+# EXACTLY `cap` seconds while `ffmpeg -re -t cap` reaches `cap` of MEDIA slightly LATER (startup
+# latency), so in the ordinary case the timer SIGTERMed ffmpeg first and the tail printed
+# `DIED (rc=…) before its Ns run finished` over a run that had done exactly what it was asked. The
+# load's own `-t` is the real bound; the parent timer exists only as a backstop for a card that
+# cannot keep up. The grace margin lets a normal load END ITSELF, cleanly, with rc 0 — which the tail
+# already reports as COMPLETED, as designed. (Chosen over "treat a timer-killed load as completed"
+# because it fixes the race without masking a genuinely stuck load.)
+LOAD_TIMER_GRACE = 5
 
 
 def _start_test_load(node, va, cap=60):
@@ -1294,6 +1325,24 @@ def _is_wine_target(cmd):
     return False
 
 
+def _is_steam_launcher(cmd):
+    """True if this launches the STEAM CLIENT itself (or a `steam://` URL) rather than the game.
+
+    ★ THE STEAM PATH WAS BYPASSED, AND SILENTLY (blocking item 2). `steam` is not a Wine target, so
+    the old code wrapped it in the fake-root namespace — and Steam's own `bin_steam.sh` refuses to run
+    as root, so the launch died with Steam's error. Worse, when the client is ALREADY running,
+    `steam -applaunch` / `steam://` hands the request to it and returns at once: the game then starts
+    with none of our environment (no MESA_VK_DEVICE_SELECT), i.e. UNPINNED, while the tool printed
+    `game exited (rc=0)` a second later. This tool cannot pin a process the Steam client starts, so
+    the honest move is to SAY that — see the `steam:` note and the launch-options recipe in `play`.
+    """
+    for a in cmd:
+        s = str(a)
+        if s.startswith("steam://") or os.path.basename(s).lower() == "steam":
+            return True
+    return False
+
+
 def _steam_root():
     """The Steam install that has a `steamapps` directory, or None. Never guessed from a path shape."""
     for c in (os.path.expanduser("~/.steam/steam"), os.path.expanduser("~/.local/share/Steam")):
@@ -1389,7 +1438,10 @@ def _hidden_argv(cmd, main, db):
     Xwayland server". Measured 2026-10-10. gamescope goes OUTSIDE this function; only the game is
     inside. Build here, call from the caller.
     """
-    if _is_wine_target(cmd):
+    if _is_wine_target(cmd) or _is_steam_launcher(cmd):
+        # ★ BOTH REFUSE TO RUN AS ROOT. Wine/Proton die with `Cannot run as root user`, and the Steam
+        # client refuses the same way; `unshare -r` makes us root inside. So the second wall would
+        # break these launches outright — skip it, and the exclusive pin is the load-bearing half.
         return list(cmd)
     hide = []
     for g in db["gpus"]:
@@ -1398,7 +1450,27 @@ def _hidden_argv(cmd, main, db):
         for n in (g["card"], g.get("render_node")):
             if n:
                 hide.append(n)
-    if hide and shutil.which("unshare"):
+    if hide:
+        avail = _userns_available()
+        if avail is None:
+            # ★ A MISSING `unshare` IS NOT SILENT ANY MORE (blocking item 1 / §2 item 13). It used to
+            # just return the command, so a machine without the binary got no wall and no message.
+            print("  wall: unshare is not installed — only the pin separates the game from the "
+                  "other cards' device nodes.")
+            sys.stdout.flush()
+            return list(cmd)
+        if avail is False:
+            # ★ THE FALLBACK THAT KEEPS THE GAME LAUNCHING (blocking item 1). On Ubuntu 24.04 or a
+            # Debian with `unprivileged_userns_clone=0`, `unshare -r` FAILS. The old code wrapped the
+            # launch in it anyway, so the game never started — and the tool reported the session as
+            # normal. A wall that cannot be built must never stop a launch: fall back to the pin alone,
+            # and SAY SO rather than weakening the wall in silence.
+            print("  wall: the second wall is unavailable here — unprivileged user namespaces are "
+                  "denied on this machine, so the game")
+            print("        launches WITHOUT the namespace; only the pin separates it from the other "
+                  "cards' device nodes.")
+            sys.stdout.flush()
+            return list(cmd)
         # ★ A WALL THAT FAILS SILENTLY IS NOT A WALL. This used to end every bind with `|| true`, so a
         # failed hide said nothing at all and the game could still see the other cards while the run
         # looked identical to a good one. It now says so, on stderr, at the moment it happens.
@@ -1472,7 +1544,8 @@ def ui(argv):
 # instead of help. Printed here, byte-for-byte, so all three builds can share it.
 PLAY_USAGE = """usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] [--work FILE [--work-outdir DIR] [--split]] [--spare NODE,...] -- <game command...>
 
-Play a game on the strongest card, with every other card doing real work beside it.
+Play a game on the card your monitor is plugged into. The other cards do nothing unless you ask
+for it with --work (a real transcode) or --test-load (a bounded synthetic check).
 
 options:
   -h, --help            show this help message and exit
@@ -1542,12 +1615,13 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                                                    for g in kept)))
         spares = kept
 
-    print("spirit play — the game on the strongest card, every other card working the tail\n")
+    print("spirit play — the game on your monitor card; the other cards stay idle unless you give "
+          "them work\n")
     L = main["link"]
     print("  MAIN  (renders)  %-6s %-30s x%s %s  %s GB/s" %
           (main["card"], main["name"][:30], L["max_width"], L["max_gen"], _fmt_float(L["gbps_max"])))
     for g in spares:
-        print("  SPARE (offload)  %-6s %-30s node /dev/dri/%s" %
+        print("  SPARE (idle unless asked)  %-6s %-30s node /dev/dri/%s" %
               (g["card"], g["name"][:30], g.get("render_node") or "?"))
 
     env = dict(os.environ)
@@ -1611,6 +1685,17 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
         else:
             print("  witness: UNAVAILABLE — %s" % cdet)
 
+    steam_launch = _is_steam_launcher(cmd)
+    if steam_launch:
+        # ★ THE STEAM PATH IS SAID, NOT SILENT (blocking item 2). `steam`/`steam://` is not the game
+        # — it is a REQUEST to the Steam client, which starts the game itself, in its own environment.
+        # This tool cannot put the pin there, so it says so and gives the recipe that CAN pin it.
+        print("  steam: this is a Steam launch — it cannot be pinned from here.")
+        print("         `steam`/`steam://` hands the request to the running Steam client and returns")
+        print("         at once, so the game would start WITHOUT this tool's pin. The pin only reaches")
+        print("         a process THIS tool launches. To pin a Steam game, set its launch options to:")
+        print("             \"%s\" play -- %%command%%" % os.path.abspath(__file__))
+        print("         (note the `--` before %command%), then launch the game from Steam.")
     if _is_wine_target(cmd):
         print("  wall: Proton/Wine detected — skipping the mount namespace (Wine refuses to run as")
         print("        root, and `unshare -r` makes us root); the exclusive pin still applies.")
@@ -1753,7 +1838,8 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                 # in real time (an old card) falls behind, and wall time then runs past the cap without
                 # bound. This timer terminates the loads at `cap` seconds of WALL time, and `-t` stays
                 # as the backstop. daemon=True so it can never hold the process open.
-                load_timer = threading.Timer(float(test_load), lambda: _terminate_live(procs))
+                load_timer = threading.Timer(float(test_load) + LOAD_TIMER_GRACE,
+                                             lambda: _terminate_live(procs))
                 load_timer.daemon = True
                 load_timer.start()
                 print("  TEST LOAD on %d card(s) for %ss wall time, then it stops." % (len(procs), test_load))
@@ -1770,7 +1856,7 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
         # honest rather than surprising.
         print("  no job given — your other cards will stay idle.")
         print("          give them a real job:      spirit play --work FILE -- CMD")
-        print("          check they can be driven:  spirit doctor")
+        print("          check they can be driven:  spirit play --test-load 60 -- CMD")
     elif work and do_offload:
         # ★ An absent tool must be SAID, not silently skipped (the README promises exactly this, and
         # the promise was false for ffmpeg). Found 2026-10-11 by an outside review.
@@ -1928,6 +2014,17 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                       % (rc, no_load_reason or "nothing was given the load"))
         else:
             print("\n  game exited (rc=%s) — no work was running on the other cards" % rc)
+
+    # ★ A LAUNCHER THAT RETURNS AT ONCE IS SAID, NOT REPORTED AS A NORMAL SESSION (blocking item 2).
+    # With the Steam client already running, `steam`/`steam://` hands off and exits in about a second:
+    # the game starts unpinned, and the old code printed `game exited (rc=0)` as if the session had
+    # been routed. It had not. Detect the fast clean exit and say plainly that the game went its own way.
+    if steam_launch and rc == 0 and elapsed < 3.0:
+        print("\n  ★ steam returned after %.1fs (rc=0): it handed the launch to the already-running"
+              % elapsed)
+        print("    Steam client, so the game is starting on its own — WITHOUT this tool's pin. This")
+        print("    session did NOT route the game. Pin a Steam game with the launch-options recipe above.")
+        sys.stdout.flush()
 
     # ★ THE TAIL — what the OTHER cards actually did. A feature you cannot see is indistinguishable
     # from one that is broken, and the loads are silent by design (ffmpeg's output goes to /dev/null).

@@ -12,7 +12,7 @@ spirit play --work video.mp4 --split -- ./yourgame
 That cuts the video into pieces and encodes one piece on each card it will use. When the game exits, it
 checks on disk that the pieces add back up to the full length of the original.
 
-**By default it uses only cards on a wide host link.** A card behind a narrow slot or an external dock is
+**By default it uses only cards on a wide host link.** A card behind a narrow slot or a slow riser is
 named and left out unless you ask for it:
 
 ```
@@ -76,6 +76,10 @@ spirit play --work lecture.mp4 -- ./yourgame     # plus a real job on the others
 **Give no `--work` and nothing is run on them.** They are left alone, and the tool says so both before
 launching and when the game exits. A card the tool cannot drive is named rather than silently passed over.
 
+What does a job cost the game? Our own runs found a few percent at most in one title and no measurable
+difference in another — but each side of those comparisons was only two runs, so the honest reading is
+*small or none*, not a percentage. Measure it on your own machine.
+
 ## How you can see it happened
 
 When your game exits, the tool prints what each card actually did. Run on the test machine with a
@@ -99,7 +103,8 @@ When your game exits, the tool prints what each card actually did. Run on the te
 
 Every job output is checked on disk afterwards — it exists, it was written by *this* run, and under
 `--split` its duration is added up against the input to within a second or one percent, whichever is
-larger. A file that did not get written says `MISSING` and the split says `INCOMPLETE`. Nothing here
+larger — on a clip shorter than 100 seconds the rule applied is the one-second tolerance, not the
+percentage. A file that did not get written says `MISSING` and the split says `INCOMPLETE`. Nothing here
 takes a process's exit code for an answer. Without `--split` each card transcodes the whole input, so a
 shortened file will still report as present; the `--split` check is the one that proves the pieces
 reconstruct.
@@ -168,9 +173,7 @@ spirit play --scale 0.7 -- ./yourgame
 ```
 
 On a 2560x1440 screen that renders 1792x1008 — 49% of the pixels. It runs through gamescope, which you
-need installed. On the cost to your game: our own runs found a few percent at most in one title and no
-measurable difference in another, but each side of those comparisons was only two runs — enough to say
-*small or none*, not enough to quote a percentage. Measure it on your own machine.
+need installed. It costs you the resolution you chose to give up — nothing else measured.
 
 **Frame generation** invents frames between the real ones. It needs `lsfg-vk`, which needs you to own
 Lossless Scaling. If you have both, the tool drives it:
@@ -188,6 +191,12 @@ not this tool.
 Anyone with more than one graphics chip. If you have an old card in a drawer and a slot to put it in,
 this turns it back into something useful instead of a paperweight. Same for the graphics built into
 your CPU, which sits idle the whole time you play.
+
+**One honest warning about laptops.** On a laptop the built-in panel is very often wired to the
+integrated graphics, not to the discrete card. The rule here is that the game renders on the card
+driving your display — so on that machine it will pin your game to the *weaker* chip. On a desktop
+that rule is what you want. On a laptop, run `spirit roles` first and see what it picks before you
+trust it with a game.
 
 ## Telling me it went wrong
 
