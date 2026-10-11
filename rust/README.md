@@ -8,8 +8,8 @@ human-readable output text, the same JSON structure and the same exit codes.
 promise). The binary shells out to `lspci`, `vulkaninfo`, `gamescope`, `unshare`,
 `ffmpeg` *only when they are present*, exactly as the Python does.
 
-Current parity target: **spirit.py v0.2** (the `boost` command, `play --scale` /
-`play --framegen`, and the two new `doctor` checks).
+Current parity target: **spirit.py v1.0.0** (the `boost` command, `play --scale` /
+`play --framegen`, the two new `doctor` checks, and `--version`).
 
 ## Build
 
@@ -62,7 +62,7 @@ errors) / the `play --scale` & `play --framegen` argument surface / the whole `-
   key order, `\uXXXX` escaping (e.g. the em-dash in the role "why" strings), and the int/float
   distinction (a whole-number float prints as `54.0`, never `54`).
 
-## v0.2 additions (ported from the updated original)
+## v1.0 additions (ported from the updated original)
 
 - **`boost`** — an upscaling / frame-generation availability report. Reads the live
   gamescope state (via `gamescope --help`, **both** streams — its whole help goes to

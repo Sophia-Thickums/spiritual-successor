@@ -89,11 +89,21 @@ real display. In REAL mode the stubs are removed.
 
 ## Known limitations
 
-* Python `%`-width padding counts *characters*; this port uses `printf` widths, which
-  count *bytes*. They differ only when a padded field contains non-ASCII (not the case
-  for any string field on the tested hardware).
-* `argparse` abbreviation matching (`spirit probe --j`) is not implemented; exact long
-  flags are. All help text and error messages for the tested flags match byte-for-byte.
+* ~~Python `%`-width padding counts *characters*; this port uses `printf` widths, which count
+  *bytes*.~~ **Fixed 2026-10-11.** `gpu_name` / `print_roles` / `print_table` / `play` / `run` now cut
+  and pad on code-point boundaries (`utf8_cpslice` / `pad_display`), so a non-ASCII card name is
+  neither cut mid-character (invalid UTF-8) nor mis-padded — verified by a non-ASCII fleet case in
+  `run_tests.sh`.
+* `argparse` abbreviation matching (`spirit probe --j`) is still not implemented; exact long flags
+  are. NOTE: since Python 3.14 the reference does NOT reject these either — `allow_abbrev=False` is
+  not propagated to subparsers, so `spirit probe --js` succeeds while this port rejects it. That is
+  the one remaining divergence, and it is in the reference, not here (the spec's stated behaviour —
+  "abbreviations are now rejected" — is not what `spirit.py` actually does).
+* `probe` refuses an unreadable `SPIRIT_DEVICES` with exit 2 and the same fixed text in every build;
+  the *parse-error* parenthesis still carries each language's own parser wording, so the malformed-JSON
+  case is compared on exit code only.
+* `play --vram-mib` with an integer larger than 2^63 is accepted by Python's arbitrary-precision
+  `int()` and rejected here; no realistic VRAM figure reaches it.
 * `doctor --json` exists as an internal function (as in the original) but, like the
   original, is not reachable from the CLI.
 

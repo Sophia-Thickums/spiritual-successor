@@ -4,8 +4,19 @@
 #         PY=/path/to/spirit.py ./test.sh
 #
 # It builds nothing and modifies nothing; it only reads the Python and runs both CLIs.
+#
 # SPIRIT_DEVICES is set PER CHILD COMMAND (never exported), so it cannot leak into the
 # caller's shell and poison later readings with a fake fleet.
+#
+# THREE THINGS THIS SUITE USED NOT TO CHECK, AND NOW DOES (fix 2026-10-11):
+#   * PATH stubs for unshare / ffmpeg / ffprobe / vulkaninfo / gamescope. Before this, a `play`
+#     case ran the REAL `unshare -r` on the live box, and the Rust spawn argv — including the
+#     LIBVA_DRIVER_NAME the offload hands each encoder — was never compared at all.
+#   * offload cases: --work, --split, --work-outdir, --spare, and the three "no job" reasons.
+#   * a real-box phase (SPIRIT_DEVICES unset, no stubs), plus the `--opt=value` argument form.
+#
+# The spawn argv is compared by diffing the stub logs; the ffmpeg log is SORTED first because
+# the spare encoders start concurrently and their lines interleave in a different order each run.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 PARENT=$(cd "$HERE/.." && pwd)
@@ -17,21 +28,174 @@ FLEETWEAK=$PARENT/fleet-monitor-on-weak.example.json
 [ -x "$RS" ] || { echo "build first: cargo build --release" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "python3 required" >&2; exit 1; }
 
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+STUB="$TMP/bin";          mkdir -p "$STUB"           # every stub
+NOFFMPEG="$TMP/bin-noff"; mkdir -p "$NOFFMPEG"       # no ffmpeg  -> "ffmpeg is not installed"
+NOFFPROBE="$TMP/bin-nofp";mkdir -p "$NOFFPROBE"      # no ffprobe -> split: REFUSED
+NOGS="$TMP/bin-nogs";     mkdir -p "$NOGS"           # no gamescope -> overlay: REFUSED
+HANG="$TMP/bin-hang";     mkdir -p "$HANG"           # gamescope --help never returns
+UNLOG="$TMP/un.log"; FFLOG="$TMP/ff.log"; GSLOG="$TMP/gs.log"
+: > "$UNLOG"; : > "$FFLOG"; : > "$GSLOG"
+REAL_PATH=$PATH
+PATHVAL=$REAL_PATH       # what the children get; never exported into this shell
+
+# ── fixtures (nothing is written outside $TMP) ────────────────────────────────────────────────
+python3 - "$TMP" <<'PYEOF'
+import json, os, sys
+d = sys.argv[1]
+def gpu(card, bdf, name, driver, vram, out, node, gbps=13.5, integ=False, conn=3):
+    return {"card": card, "bdf": bdf, "name": name, "driver": driver,
+            "vendor": "0x1002", "device": "0x0000", "integrated": integ,
+            "render_node": node, "vram_total_mib": vram, "vram_used_mib": 0,
+            "display_outputs": 1 if out else 0, "connectors_total": conn, "has_output": out,
+            "link": {"binding_element": "0000:00:00.0", "max_width": 16, "max_gen": None,
+                     "gbps_max": gbps, "current_width": 16, "current_gen": None,
+                     "gbps_current": gbps, "idle_degraded": False,
+                     "own_reports_width": 16, "capped_by_topology": False}}
+def dump(name, gpus):
+    with open(os.path.join(d, name), "w") as fh:
+        json.dump({"gpufan": "probe/1.0.0", "gpus": gpus}, fh)
+# ★ A card name whose 22nd BYTE falls INSIDE a multi-byte character: `™` is E2 84 A2 at bytes
+# 21..23, so a byte-index `[..22]` slices mid-character. Python cuts at 22 CODE POINTS.
+dump("unicode.json", [
+    gpu("card0", "0000:01:00.0", "RX 9070 XT", "amdgpu", 16304, True, "renderD128", 54.4),
+    gpu("card1", "0000:02:00.0", "RX 6800", "amdgpu", 16384, False, "renderD129"),
+    gpu("card2", "0000:03:00.0", "AMD Radeon RX 7900 XT\u2122 24GB", "nvidia", 24576, False, "renderD130"),
+])
+dump("nogpu.json", [])
+dump("one.json", [gpu("card0", "0000:01:00.0", "RX 9070 XT", "amdgpu", 16304, True, "renderD128", 54.4)])
+dump("two.json", [
+    gpu("card0", "0000:01:00.0", "RX 9070 XT", "amdgpu", 16304, True, "renderD128", 54.4),
+    gpu("card1", "0000:02:00.0", "RX 6800", "amdgpu", 16384, False, "renderD129"),
+])
+dump("noenc.json", [
+    gpu("card0", "0000:01:00.0", "RX 9070 XT", "amdgpu", 16304, True, "renderD128", 54.4),
+    gpu("card1", "0000:02:00.0", "Tesla P40", "nvidia", 24576, False, "renderD129"),
+])
+# ★ The main card is card1 here, because card1 is the one on THIS box whose connected output
+# publishes a preferred mode — so `--scale`/`--overlay` get past the native-resolution gate and
+# the gamescope argv is actually built and spawned. On a box where no mode is readable both
+# builds simply refuse, and the case still holds (they agree on the refusal).
+dump("modes.json", [
+    gpu("card1", "0000:02:00.0", "RX 6800", "amdgpu", 16384, True, "renderD129", 54.4),
+    gpu("card0", "0000:01:00.0", "RX 9070 XT", "amdgpu", 16304, False, "renderD128"),
+])
+PYEOF
+: > "$TMP/job.mkv"          # a real (tiny, empty) input for --work
+: > "$TMP/nonfile-dir"      # used as the NON-file --work argument
+
+# ── stubs on PATH ─────────────────────────────────────────────────────────────────────────────
+# unshare: log the WHOLE argv, then do what `unshare -rm sh -c SCRIPT sh HIDE$ cmd...` does —
+# drop -rm, and hand the rest to the shell. Nothing is actually namespaced or mounted.
+cat > "$STUB/unshare" <<'EOF'
+#!/bin/sh
+{ for a in "$@"; do printf 'ARG[%s]\n' "$a"; done; } >> "$STUB_UN"
+shift
+exec "$@"
+EOF
+# ffmpeg: log argv + the LIBVA driver the tool chose for THIS card (the thing that was never
+# checked), then either linger (a SYNTHETIC TEST LOAD) or exit at once (a --work job).
+cat > "$STUB/ffmpeg" <<'EOF'
+#!/bin/sh
+printf 'FFMPEG ARGS: %s\nLIBVA=%s\n' "$*" "$LIBVA_DRIVER_NAME" >> "$STUB_FF"
+case " $* " in *" -f null "*) exec sleep 30 ;; esac   # a test load: stays alive, dies with the game
+exit 0                                               # a job: "finishes" and writes nothing
+EOF
+cat > "$STUB/vulkaninfo" <<'EOF'
+#!/bin/sh
+echo "deviceName stub"
+EOF
+# ffprobe: a fixed duration, so --split has something to divide.
+cat > "$STUB/ffprobe" <<'EOF'
+#!/bin/sh
+echo 120.000
+EOF
+# gamescope: --help prints its help to STDERR (it contains "fsr"); otherwise log argv, run the game.
+cat > "$STUB/gamescope" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = "--help" ]; then
+    { echo "gamescope help"; echo "  -F, --filter fsr / nearest / linear"; } >&2
+    exit 0
+fi
+{ for a in "$@"; do printf 'GSARG[%s]\n' "$a"; done; } >> "$STUB_GS"
+while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done
+[ "${1:-}" = "--" ] && shift
+exec "$@"
+EOF
+chmod +x "$STUB/unshare" "$STUB/ffmpeg" "$STUB/ffprobe" "$STUB/vulkaninfo" "$STUB/gamescope"
+ln -sf "$STUB/unshare"    "$NOFFMPEG/unshare"
+ln -sf "$STUB/vulkaninfo" "$NOFFMPEG/vulkaninfo"
+ln -sf "$STUB/ffmpeg"     "$NOFFPROBE/ffmpeg"
+ln -sf "$STUB/unshare"    "$NOFFPROBE/unshare"
+ln -sf "$STUB/vulkaninfo" "$NOFFPROBE/vulkaninfo"
+ln -sf "$STUB/ffmpeg"     "$NOGS/ffmpeg"
+ln -sf "$STUB/unshare"    "$NOGS/unshare"
+ln -sf "$STUB/vulkaninfo" "$NOGS/vulkaninfo"
+# ★ `exec sleep`: the stub BECOMES sleep, so the SIGKILL on timeout really closes the pipe.
+# A non-exec stub (sh spawning sleep) leaves an orphan holding the pipe and costs ~60 s.
+printf '#!/bin/sh\nexec sleep 60\n' > "$HANG/gamescope"
+chmod +x "$HANG/gamescope"
+
+# normalizer for the live probe --json (drops the fields that legitimately flap run to run)
+NORM_JSON='import sys,json
+d=json.load(sys.stdin)
+for g in d["gpus"]:
+    g.pop("vram_used_mib",None)
+    g["link"].pop("current_gen",None)
+    g["link"].pop("current_width",None)
+    g["link"].pop("gbps_current",None)
+    g["link"].pop("idle_degraded",None)
+print(json.dumps(d,indent=2,sort_keys=True))'
+
 pass=0; fail=0
-compare() {                        # compare <label> <SPIRIT_DEVICES-or-empty> <args...>
-  label=$1; dev=$2; shift 2
-  if [ -n "$dev" ]; then
-    SPIRIT_DEVICES="$dev" python3 "$PY" "$@" >"$TMP/py.out" 2>"$TMP/py.err"; prc=$?
-    SPIRIT_DEVICES="$dev" "$RS"      "$@" >"$TMP/rs.out" 2>"$TMP/rs.err"; rrc=$?
+DEV=""                   # SPIRIT_DEVICES value for the pair; "" = unset for both children
+
+kill_stubs() {
+  pkill -f "$STUB/unshare"    2>/dev/null
+  pkill -f "$STUB/ffmpeg"     2>/dev/null
+  pkill -f "$STUB/gamescope"  2>/dev/null
+  true
+}
+
+# run_side <binary> <args...> — SPIRIT_DEVICES/PATH/stub logs are granted to the CHILD, never
+# exported into this shell (a leaked export poisons every later reading with a fake fleet).
+run_side() {
+  bin=$1; shift
+  if [ -n "$DEV" ]; then
+    env SPIRIT_DEVICES="$DEV" PATH="$PATHVAL" STUB_UN="$UNLOG" STUB_FF="$FFLOG" STUB_GS="$GSLOG" \
+        "$bin" "$@"
   else
-    python3 "$PY" "$@" >"$TMP/py.out" 2>"$TMP/py.err"; prc=$?
-    "$RS"      "$@" >"$TMP/rs.out" 2>"$TMP/rs.err"; rrc=$?
+    env -u SPIRIT_DEVICES PATH="$PATHVAL" STUB_UN="$UNLOG" STUB_FF="$FFLOG" STUB_GS="$GSLOG" \
+        "$bin" "$@"
   fi
+}
+
+# compare <label> <SPIRIT_DEVICES-or-empty> <args...>
+# Compares exit code, stdout, stderr AND the three stub logs (so the spawn argv and the per-card
+# LIBVA driver are checked in every case, not just in the ones that say so).
+compare() {
+  label=$1; dev=$2; shift 2
+  DEV=$dev
+  : > "$UNLOG"; : > "$FFLOG"; : > "$GSLOG"
+  run_side python3 "$PY" "$@" >"$TMP/py.out" 2>"$TMP/py.err"; prc=$?
+  cp "$UNLOG" "$TMP/py.un"; cp "$GSLOG" "$TMP/py.gs"; sort "$FFLOG" > "$TMP/py.ff"
+  : > "$UNLOG"; : > "$FFLOG"; : > "$GSLOG"
+  run_side "$RS" "$@" >"$TMP/rs.out" 2>"$TMP/rs.err"; rrc=$?
+  cp "$UNLOG" "$TMP/rs.un"; cp "$GSLOG" "$TMP/rs.gs"; sort "$FFLOG" > "$TMP/rs.ff"
+  DEV=""; kill_stubs
   if [ "$prc" != "$rrc" ] || ! diff -q "$TMP/py.out" "$TMP/rs.out" >/dev/null \
-                          || ! diff -q "$TMP/py.err" "$TMP/rs.err" >/dev/null; then
+                          || ! diff -q "$TMP/py.err" "$TMP/rs.err" >/dev/null \
+                          || ! diff -q "$TMP/py.un"  "$TMP/rs.un"  >/dev/null \
+                          || ! diff -q "$TMP/py.ff"  "$TMP/rs.ff"  >/dev/null \
+                          || ! diff -q "$TMP/py.gs"  "$TMP/rs.gs"  >/dev/null; then
     echo "FAIL: $label   (py rc=$prc rs rc=$rrc)"
     diff -u "$TMP/py.out" "$TMP/rs.out" | head -40
     diff -u "$TMP/py.err" "$TMP/rs.err" | head -40
+    diff -u "$TMP/py.un"  "$TMP/rs.un"  | head -20
+    diff -u "$TMP/py.ff"  "$TMP/rs.ff"  | head -20
+    diff -u "$TMP/py.gs"  "$TMP/rs.gs"  | head -20
     fail=$((fail+1))
   else
     echo "PASS: $label   (rc=$prc)"
@@ -39,10 +203,8 @@ compare() {                        # compare <label> <SPIRIT_DEVICES-or-empty> <
   fi
 }
 
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
-
 echo "== fake-device parity (deterministic) =="
+PATHVAL="$STUB:$REAL_PATH"
 for wl in 1440p60-framegen 4k60-framegen 1440p-perframe-split; do
   compare "plan $wl" "$FLEET10" plan --workload "$wl"
 done
@@ -61,7 +223,38 @@ compare "roles (weak fleet)"           "$FLEETWEAK" roles
 compare "roles --json (weak fleet)"    "$FLEETWEAK" roles --json
 
 echo
-echo "== boost (v0.2: reads the live gamescope / lsfg-vk / sysfs state; same for both sides) =="
+echo "== --opt=value forms (Python and C++ accept them; Rust alone used to reject: C3) =="
+compare "roles --profile=edit"          "$FLEET10" roles --profile=edit
+compare "fg --res=1440p60"              "$FLEET10" fg --res=1440p60
+compare "fg --res=4k120 --mode=round-trip" "$FLEET10" fg --res=4k120 --mode=round-trip
+compare "plan --workload=llm-13b"       "$FLEET10" plan --workload=llm-13b
+compare "plan --vram-mib=8192"          "$FLEET10" plan --workload 1440p60-framegen --vram-mib=8192
+compare "plan --vram-mib=1_000"         "$FLEET10" plan --vram-mib=1_000
+compare "probe --json=1 (argparse error)" "$FLEET10" probe --json=1
+
+echo
+echo "== plan --vram-mib: Python's int() trims and ignores underscores (C4) =="
+compare "plan --vram-mib ' 12'"         "$FLEET10" plan --vram-mib " 12"
+compare "plan --vram-mib 1_000"         "$FLEET10" plan --vram-mib 1_000
+compare "plan --vram-mib notanint"      "$FLEET10" plan --vram-mib notanint
+
+echo
+echo "== fg --res: the tool's OWN documented examples (A2) =="
+compare "fg 4k120"                      "$FLEET10" fg --res 4k120
+compare "fg 1080p144"                   "$FLEET10" fg --res 1080p144
+compare "fg 1440p@0 (zero -> 60)"       "$FLEET10" fg --res 1440p@0
+compare "fg 1440p60@144"                "$FLEET10" fg --res 1440p60@144
+compare "fg 4K120 (case-insensitive)"   "$FLEET10" fg --res 4K120
+compare "fg unreadable res (note)"      "$FLEET10" fg --res bogus
+compare "fg empty res"                  "$FLEET10" fg --res ""
+
+echo
+echo "== probe: SPIRIT_DEVICES that cannot be read (B) =="
+compare "probe missing fixture -> exit 2"  "$TMP/does-not-exist.json" probe
+compare "probe missing fixture (--json)"   "$TMP/does-not-exist.json" probe --json
+
+echo
+echo "== boost (v1.0.0: reads the live gamescope / lsfg-vk / sysfs state; same for both sides) =="
 compare "boost"                        "$FLEET10" boost
 compare "boost (weak fleet)"           "$FLEETWEAK" boost
 
@@ -74,9 +267,10 @@ compare "run no such card"              "$FLEET10" run --role encode --card card
 compare "run missing --role"            "$FLEET10" run --card card1 -- /bin/echo x
 compare "run child exit code"           "$FLEET10" run --role encode --card card1 -- /bin/sh -c 'exit 7'
 compare "play --no-offload -- echo"    "$FLEET10" play --no-offload -- /bin/echo HELLO
+compare "play -- echo (offload stubbed)" "$FLEET10" play -- /bin/echo HELLO
 
 echo
-echo "== play --scale / --framegen argument surface (v0.2; exit-2 cases only) =="
+echo "== play: --scale / --framegen argument surface (v1.0.0; exit-2 cases) =="
 compare "play --scale 1.5"              "$FLEET10" play --scale 1.5 --no-offload -- /bin/echo HI
 compare "play --scale abc"             "$FLEET10" play --scale abc --no-offload -- /bin/echo HI
 compare "play --scale (no value)"      "$FLEET10" play --scale
@@ -88,26 +282,130 @@ compare "play --framegen abc"          "$FLEET10" play --framegen abc --no-offlo
 compare "play --framegen 2"            "$FLEET10" play --framegen 2 --no-offload -- /bin/echo HI
 
 echo
+echo "== play: the game command that cannot be found (B) and a SIGNALLED game (C2) =="
+compare "play missing game cmd (1 card)" "$TMP/one.json" play --no-offload -- /nonexistent/game
+compare "play signalled game -> -15"     "$FLEET10" play --no-offload -- /bin/sh -c 'kill -TERM $$'
+
+echo
+echo "== play: no GPUs at all (C11) =="
+compare "play with no GPUs"             "$TMP/nogpu.json" play -- /bin/echo HI
+compare "play --work with no GPUs"      "$TMP/nogpu.json" play --work "$TMP/job.mkv" -- /bin/echo HI
+
+echo
+echo "== play: a non-ASCII card name must not panic (C1) =="
+compare "non-ASCII name (test load + SKIPPED)" "$TMP/unicode.json" play -- /bin/echo HI
+compare "non-ASCII name (--no-offload)"         "$TMP/unicode.json" play --no-offload -- /bin/echo HI
+
+echo
+echo "== play --work: A REAL JOB, and the three reasons none is started (A1/A6) =="
+compare "play --work (replication)"     "$FLEET10" play --work "$TMP/job.mkv" -- /bin/echo HELLO
+compare "play --work --split"           "$FLEET10" play --work "$TMP/job.mkv" --split -- /bin/echo HELLO
+compare "play --work-outdir with .."   "$FLEET10" play --work "$TMP/job.mkv" --work-outdir "$TMP/out/../jobs" -- /bin/echo HELLO
+compare "play --work non-file"          "$FLEET10" play --work "$TMP/nonfile-dir" -- /bin/echo HELLO
+compare "play --no-offload --work"      "$FLEET10" play --no-offload --work "$TMP/job.mkv" -- /bin/echo HELLO
+PATHVAL="$NOFFMPEG:$REAL_PATH"
+compare "play --work with no ffmpeg"    "$FLEET10" play --work "$TMP/job.mkv" -- /bin/echo HELLO
+PATHVAL="$STUB:$REAL_PATH"
+compare "play --work, no card can encode" "$TMP/noenc.json" play --work "$TMP/job.mkv" -- /bin/echo HELLO
+PATHVAL="$NOFFPROBE:$REAL_PATH"
+compare "play --split, duration unreadable (C8)" "$FLEET10" play --work "$TMP/job.mkv" --split -- /bin/echo HELLO
+PATHVAL="$STUB:$REAL_PATH"
+compare "play --split, one card only (C9 wording)" "$TMP/two.json" play --work "$TMP/job.mkv" --split -- /bin/echo HI
+
+echo
+echo "== play --spare: dedupe, the unknown-node notice, the REFUSED wording (C6) =="
+compare "play --spare renderD130"       "$FLEET10" play --spare renderD130 -- /bin/echo HELLO
+compare "play --spare renderD130,renderD130 (dedupe)" "$FLEET10" play --spare renderD130,renderD130 -- /bin/echo HELLO
+compare "play --spare unknown node"     "$FLEET10" play --spare renderD999 -- /bin/echo HELLO
+compare "play --spare known,unknown"    "$FLEET10" play --spare renderD130,renderD999 -- /bin/echo HELLO
+compare "play --spare (no value)"       "$FLEET10" play --spare
+
+echo
+echo "== play --overlay: the refusal happens BEFORE anything is spawned (A5) =="
+compare "play --overlay (gamescope READY)" "$FLEET10" play --overlay -- /bin/echo HI
+compare "play --overlay --framegen 2"      "$FLEET10" play --overlay --framegen 2 -- /bin/echo HI
+PATHVAL="$NOGS:$REAL_PATH"
+compare "play --overlay, gamescope absent" "$FLEET10" play --overlay -- /bin/echo HI
+PATHVAL="$STUB:$REAL_PATH"
+
+echo
+echo "== C5: a hung child must not hang THIS tool (gamescope --help, 15 s each side) =="
+compare "boost with a hung gamescope"  "$FLEET10" boost
+
+echo
+echo "== play: gamescope wrapping, with a readable native mode (argv compared via the stub) =="
+compare "play --scale 0.7 (gamescope wrapped)" "$TMP/modes.json" play --scale 0.7 -- /bin/echo HI
+compare "play --scale 0.7 --framegen 2"        "$TMP/modes.json" play --scale 0.7 --framegen 2 -- /bin/echo HI
+compare "play --overlay (native readable)"     "$TMP/modes.json" play --overlay -- /bin/echo HI
+compare "play --overlay --framegen 2 (native)" "$TMP/modes.json" play --overlay --framegen 2 -- /bin/echo HI
+
+echo
 echo "== doctor (fake fleet; uses real vulkaninfo/gamescope/lsfg, identical on both sides) =="
 compare "doctor (fleet-10)"             "$FLEET10"   doctor
 
 echo
 echo "== help / usage surface =="
-compare "no args"                       ""          
+compare "no args"                       ""
 compare "empty subcommand arg"          ""          ""
 compare "top-level --help"              ""          --help
+compare "--version (one line, exit 0)"  ""          --version
 for c in probe roles plan doctor fg boost; do compare "$c -h" "" "$c" -h; done
+compare "origin -h (C10)"               ""          origin -h
+compare "origin --bogus (C10)"          ""          origin --bogus
+compare "origin --check"                ""          origin --check
+compare "origin"                        ""          origin
 compare "ui -h"                         ""          ui -h
 compare "ui --help"                     ""          ui --help
 compare "play --help"                    ""          play --help
 compare "play -h"                       ""          play -h
 compare "unknown subcommand"            ""          frobnicate
 compare "unrecognized arg (probe)"      ""          probe --bogus
+# ★ ABBREVIATIONS MUST BE REJECTED (added 2026-10-11). argparse's allow_abbrev does NOT propagate to
+# subparsers, so Python used to accept `probe --js` while both ports rejected it. No case could exist
+# until the reference was repaired; now one can.
+compare "probe --js (abbrev rejected)"   ""          probe --js
+compare "roles --profil (abbrev)"        ""          roles --profil edit
+compare "fg --re (abbrev rejected)"      ""          fg --re 4k120
 compare "unrecognized trailing"         ""          probe --json extra
 compare "unrecognized arg (boost)"      ""          boost --bogus
 compare "missing value (roles)"         ""          roles --profile
 compare "bad --mode"                    ""          fg --mode sideways
 compare "bad --vram-mib"                ""          plan --vram-mib notanint
+
+# ── PHASE 2: the live box. No stubs on PATH — the real sysfs, vulkaninfo, gamescope and lsfg
+# state are read. No `play` here on purpose: with the real `unshare` present a play case would
+# spawn a real mount namespace on this machine, which is exactly what the stubs exist to avoid.
+echo
+echo "== real box (SPIRIT_DEVICES unset, no stubs on PATH) =="
+PATHVAL="$REAL_PATH"
+compare "roles (real)"                  ""  roles
+compare "roles --json (real)"           ""  roles --json
+compare "plan framegen (real)"          ""  plan --workload 1440p60-framegen
+compare "plan vram (real)"              ""  plan --workload 1440p60-framegen --vram-mib 6898
+compare "fg 4k120 (real)"               ""  fg --res 4k120
+compare "doctor (real)"                ""  doctor
+compare "boost (real)"                 ""  boost
+
+# ★ THE LIVE PROBE FLAPS: the "[idle now: xN GenN]" suffix comes and goes with the card's own
+# low-power link state between two invocations milliseconds apart. It is a measurement of the
+# MACHINE, not a property of a build — so it is stripped here, exactly as the --json comparison
+# below strips the same field. ★ And the line's trailing padding goes with it: the suffix is the
+# last thing on the line, so on a run where only ONE side saw it the `%-6s` padding of the `out`
+# column is left behind on the other and the two lines differ by whitespace alone. A suite that
+# fails at random is not evidence of anything, so both are normalized.
+DEV=""
+PROBE_NORM='s/\[idle now: [^]]*\]//; s/[[:space:]]*$//'
+run_side python3 "$PY" probe 2>/dev/null | sed "$PROBE_NORM" > "$TMP/py.out"
+run_side "$RS"        probe 2>/dev/null | sed "$PROBE_NORM" > "$TMP/rs.out"
+if diff -q "$TMP/py.out" "$TMP/rs.out" >/dev/null; then
+  echo "PASS: probe (real; live link suffix normalized)"; pass=$((pass+1))
+else echo "FAIL: probe (real)"; fail=$((fail+1)); diff -u "$TMP/py.out" "$TMP/rs.out" | head -40; fi
+
+run_side python3 "$PY" probe --json 2>/dev/null | python3 -c "$NORM_JSON" > "$TMP/py.out"
+run_side "$RS"        probe --json 2>/dev/null | python3 -c "$NORM_JSON" > "$TMP/rs.out"
+if diff -q "$TMP/py.out" "$TMP/rs.out" >/dev/null; then
+  echo "PASS: probe --json (real; unstable fields stripped)"; pass=$((pass+1))
+else echo "FAIL: probe --json (real)"; fail=$((fail+1)); diff -u "$TMP/py.out" "$TMP/rs.out" | head -40; fi
 
 echo
 echo "== summary: $pass passed, $fail failed =="

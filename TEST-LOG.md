@@ -1074,3 +1074,112 @@ where it used to fail one in four. Rust 52/0 and C++ 69/0, the C++ one run four 
   full `--split --work` path was diffed byte-for-byte across all three rather than assumed.
 - **Does not survive:** *"tested"* never meant the claims were checked. It meant the builds agreed.
   Those are different sentences and only the first one was ever earned.
+
+
+---
+
+# ★★★★ THE SECOND AUDIT — SHARED FAULTS, AND ONE OF THEM WAS MINE, WRITTEN AN HOUR EARLIER
+
+The first read stopped on a refusal after one section. We ran the remaining sections separately. It
+found that the first read had been the shallow one.
+
+## THE SEVEREST FINDING: A COMMAND INJECTION IN PUBLISHED CODE
+`cpp`'s `media_duration` built the shell string `ffprobe … '<filename>'` and handed it to `popen()`. A
+filename containing a single quote closed the quoting and everything after it ran as a separate
+command. **Proven both ways rather than reasoned about:** a copy of the pre-fix binary executed a payload
+planted in a filename; the fixed binary does not, while still reading the duration correctly. Fixed and
+shipped as `eaa1c27`. The Python build was never affected — it passes argv.
+
+## SHARED FAULTS — every build agreed, so no differential harness could flag any of them
+1. **`--work` claimed a job that never ran.** With `--no-offload`, or ffmpeg absent, or no card able to
+   encode, it printed `— the job ran to completion` over an empty `JOB OUTPUT`. Nothing had run. *The
+   same false-statement class as the tail, in a different path.*
+2. **`fg --res` was wrong for the tool's OWN documented examples.** `4k120` parsed as `4k1` at 20 Hz and
+   fell back to 1440p; `1080p144` likewise; `1440p@0` divided by zero. Two of the three examples in its
+   own help text did not work.
+3. **`doctor`'s frame-generation verdict could never be anything but UNKNOWN** — it mapped `READY` and
+   `NOT-WORKING`, and `_lsfg_state()` returns neither. A check that can never reach a verdict is a dead
+   one. Now maps the states that actually exist.
+4. **The WITNESS panel still asserted the game's FPS goes down**, contradicting the README line corrected
+   the same afternoon.
+5. **`--overlay` refused AFTER spawning encoders**, orphaning them.
+6. **A missing ffmpeg said nothing**, though the README promised it speaks.
+
+## AND A DIVERGENCE THAT PANICKED
+`rust`'s `gpu_name` slices `n[..22]` by BYTE index, so a non-ASCII card name panics when the 22nd byte is
+mid-character; `cpp` slices by byte too and misaligns its columns. Python slices by code point. Plus
+~29 further cross-build divergences the harnesses had no case for at all — `--work`, `--split`,
+`--work-outdir`, `--spare`, `--overlay`, `origin`, a Wine target, a missing game command, a signalled
+game, an early-dying load, a non-ASCII name.
+
+## ★★ AND THE ONE I CAUGHT IN MYSELF, AN HOUR AFTER WRITING IT
+Rewriting the README, I replaced the headline with a *better-sourced* claim and pointed at
+`evidence/multigpu_4card.jsonl` for the figures — including that the gaming card sat at "0–2% and about
+25 W throughout". Then I read the file instead of trusting my summary of it.
+
+**The file says the display card was BUSY — mean 65%, max 100%, mean power 199 W over 459 samples — for
+that whole window.** Because in that run the display card was *one of the four doing a job*. The claim I
+had attached to it belonged to a different run, whose raw window was never kept.
+
+The README now says what the evidence says, and explicitly tells the reader to open the file rather than
+trust the sentence. **The lesson is the one this whole file keeps re-teaching: I wrote a citation for a
+number I had not checked against the thing I was citing.** It took an outside review to make me look at
+the code; it took reading the instrument to make me look at my own prose.
+
+## STILL OPEN
+- `doctor` tests the PIN but not the mount-namespace wall. Now stated plainly in the README rather than
+  claimed; teaching `doctor` to test it is the next improvement.
+- Intel's VAAPI path is written but has never run on Intel hardware. Now labelled unverified.
+
+
+---
+
+# ★★★★ THE SECOND ROUND OF FIXES, AND THE HARNESSES BECOME TESTS (2026-10-11, 16:03-16:30)
+
+Both ports ran against a written spec (`../the port spec`). Each worker owned its own build AND
+its own harness, so a fix and its test landed together.
+
+## THE HARNESSES, BEFORE AND AFTER
+| harness | before today | after the first pass | now |
+|---|---|---|---|
+| `cpp/run_tests.sh` | 44 passed, 21 failed | 69 / 0 | **106 / 0** (11 consecutive clean runs) |
+| `rust/test.sh` | no stubs, no offload, no argv check, no real-box phase | 52 / 0 | **116 / 0** (8 consecutive clean runs) |
+
+**Rust's suite now has teeth, and that was measured rather than asserted:** run against the PRE-FIX
+binary it reports **47 failures**. A suite that cannot fail is theatre; this one demonstrably can.
+
+**What the suites could not see before, and now do:** `--work`, `--split`, `--work-outdir`, `--spare`,
+`--overlay`, `origin`, a Wine/`.exe` target, a game command that does not exist, a game killed by a
+signal, a test load that dies early, a non-ASCII card name. Every one of those was invisible this
+morning. Rust additionally checks the three stub logs on every case now, so the spawn argv — including
+**which card got which `LIBVA_DRIVER_NAME`** — is verified rather than assumed (7× radeonsi + 1× iHD come
+back from the log).
+
+Two harness faults fixed while proving all this: the `gamescope-argv` PASS never incremented the counter
+(so the reported total undercounted), and Phase 2's `play --framegen 2` was writing to the user's REAL
+`~/.config/lsfg-vk/conf.toml` — now isolated, verified by the config's hash being unchanged across runs.
+
+## ★ AND A FIX OF MINE THAT BOTH WORKERS INDEPENDENTLY CAUGHT
+I had added `allow_abbrev=False` to the top-level `argparse` parser to stop Python accepting `probe --js`
+while the ports rejected it. **It does not propagate to subparsers.** Both workers reported the same
+thing, unprompted, and they were right: the fix was inert, and it had CREATED a divergence rather than
+removed one.
+
+Corrected by passing it to every subparser through a small helper, so a future subcommand cannot silently
+opt out. All three now agree: `probe --js`, `roles --profil edit`, `fg --re 4k120` → exit 2 everywhere;
+`--json`, `--profile edit`, `--res 4k120` → exit 0 everywhere. A harness case for it could not exist until
+the reference was repaired — which is the whole lesson of this file in miniature.
+
+## ALSO FOUND BY ADDING A CASE
+With abbreviations fixed, a new case exposed that **argparse reports EVERY argument it could not place,
+not just the first**: `roles --profil edit` yields `unrecognized arguments: --profil edit`, where the C++
+build named only `--profil`. Rust already matched. Fixed in C++ with an `unrec_extras` helper that scans
+the whole argument list per subcommand. **The bug only became reachable once the case could exist.**
+
+## STILL NOT BYTE-IDENTICAL — stated plainly, not glossed
+1. The parenthetical in the malformed-`SPIRIT_DEVICES` parse error is each language's own parser wording;
+   the harness compares that case on exit code and the fixed text prefix.
+2. `plan --vram-mib` with an integer beyond 2^63: Python's bignum accepts it, the ports cannot. Unreachable
+   in practice.
+3. Python's tracebacks for `run` with a nonexistent command, and for `--overlay --no-offload` with an
+   unreadable native mode, are not reproducible in the ports.

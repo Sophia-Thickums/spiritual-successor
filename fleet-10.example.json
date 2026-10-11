@@ -1,5 +1,5 @@
 {
- "gpufan": "probe/0.1",
+ "gpufan": "probe/1.0.0",
  "gpus": [
   {
    "card": "card0",
