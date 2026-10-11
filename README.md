@@ -10,7 +10,7 @@ spirit play --work lecture.mp4 -- ./yourgame
 ```
 
 That is a real job with a real output — a transcoded file you can open, written by a card that is not
-the one running your game. Measured on our box: three mismatched cards, two of them from 2017, ran a
+the one running your game. Measured on the test machine: three mismatched cards, two of them from 2017, ran a
 240-second 1080p transcode while the gaming card sat at **0–2% and 25 W**. Three valid files came out.
 
 **Give no `--work` and the spare cards run a synthetic test load instead** — ffmpeg's own generated test
@@ -29,7 +29,7 @@ Linux. No root. No dependencies.
 
 - **Not SLI and not CrossFire.** Those tried to make several cards behave like one faster card. This
   does not do that.
-- **Lossless Scaling is not included, in any form.** We do not ship it and we do not copy it. If you
+- **Lossless Scaling is not included, in any form.** It is not shipped and it is not copied. If you
   happen to own it, this tool can drive it — see "More frames" below.
 - **The spare cards do not add frames to your game.** Moving pixels across cards per frame is dead by
   arithmetic — a 1440p frame is 14.7 MB and an `x1` card needs 17 ms to move one. What *can* raise your
@@ -37,7 +37,7 @@ Linux. No root. No dependencies.
   **measures** the result rather than claiming one. See "More frames" below.
 - **It does not turn a mid-range card into a 5090.** Nothing does.
 - **Not Nvidia.** This is Linux, and the pinning uses Mesa, so AMD and Intel work today. Nvidia's driver
-  does not give us the same control.
+  does not give the same control.
 
 ## What it does
 
@@ -54,7 +54,7 @@ spirit play --work lecture.mp4 -- ./yourgame               # + a real job on the
 
 ## The trap this closes
 
-Leave a game alone and it picks a card for itself — and it can pick the wrong one. We watched it happen:
+Leave a game alone and it picks a card for itself — and it can pick the wrong one. Observed on the test machine:
 a game with no pinning picked a slow card on an external dock instead of the fast one. It ran at a crawl,
 it got that slow card hot, and the fast card sat idle the whole time.
 
@@ -128,7 +128,7 @@ then a run ends like this:
   presented rate                     : 165.0 /s
 ```
 
-On our test machine the same 300 frames of work produced **300** presented images with frame generation
+On the test machine the same 300 frames of work produced **300** presented images with frame generation
 off, and **1200** with it on at 4x — a ratio of exactly 1.000 and exactly 4.000.
 
 **What that proves:** the frame-gen layer multiplied the presented rate, measured downstream of it, by a
@@ -140,7 +140,14 @@ that the interpolated frames look right. No counter can tell you that last part.
 **Do the cards have to match?** No. An RX 580 next to a Vega 7, a new card next to the one built into
 your CPU — the tool asks what each card can do and gives it that.
 
-**Is this SLI or CrossFire?** No.
+**Is this SLI or CrossFire?** No — and that is why it is called *Spiritual Successor*.
+
+SLI and CrossFire tried to turn two cards into one faster card. They needed matching cards, a bridge, and
+games rewritten to support them. Almost none were, and the idea died.
+
+The goal never died with it: more than one card in a machine, all of them earning their slot. That goal is
+the one this is named after. It just needs a different mechanism — one card plays the game whole, and the
+others do real work beside it, with no game needing to know this exists.
 
 **Is this Lossless Scaling?** No. That scales a frame; this moves work onto other cards.
 
@@ -155,18 +162,19 @@ nothing measurable in another. In a full open-world session the player reported 
 
 ## What is true, and what is not
 
-Everything here was measured on our own machine. Where we could not measure it, we say so.
+Everything here was measured on the test machine. Where it could not be measured, this file says so.
 
 - **The spare cards do not add frames.** The win there is the work they do alongside your game. Extra
   *presented* frames come from upscaling and from frame generation — and the tool measures those instead
   of asserting them.
-- **Frame generation is available — but it is not ours and we do not ship it.** It comes from `lsfg-vk`,
-  which requires you to own Lossless Scaling. `spirit boost` tells you whether it is available on your
-  machine. We do not bundle it, and we do not reimplement it.
+- **Frame generation is available — but it is not part of Spiritual Successor and it is not shipped with
+  it.** It comes from `lsfg-vk`, which requires you to own Lossless Scaling. `spirit boost` tells you
+  whether it is available on your machine. Spiritual Successor does not bundle it and does not
+  reimplement it.
 - **Upscaling is ours and it is tested.** `--scale` is a real FPS gain, measured on a real game, and it
   costs your game nothing but the resolution you chose to give up.
-- **Two things fooled us, and they are here so they do not fool you.** We once thought a busy second card
-  made the main card *faster* — it looked real, and a real game killed it. And the first run of any game is
+- **Two things that look real and are not, here so they do not fool you.** A busy second card does not make
+  the main card *faster* — it looked real, and a real game killed it. And the first run of any game is
   slow while it builds its shader cache, which looks exactly like a gain. Warm up before you compare.
 
 ## Who this is for

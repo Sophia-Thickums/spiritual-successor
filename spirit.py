@@ -824,7 +824,7 @@ ORIGIN_NAME = "Spiritual Successor"
 ORIGIN_AUTHOR = "Sophia Marie DeClue"
 ORIGIN_REPO = "github.com/Sophia-Thickums/spiritual-successor"
 ORIGIN_NOTICE = ("%s by %s — %s" % (ORIGIN_NAME, ORIGIN_AUTHOR, ORIGIN_REPO))
-ORIGIN_SEAL = "4f411c5017ff15a5cca565be2d4e8b18e7e267f9ab146f0364a093658c771bf5"
+ORIGIN_SEAL = "74c06104c43a4c80"
 # ★ THE TRUE NOTICE, kept separately from the one that prints. If the printed notice is rewritten,
 # the warning below still names the ORIGINAL — a tampered build must not get to choose what it is
 # accused of being derived from.
@@ -833,8 +833,18 @@ ORIGIN_TRUE = ("Spiritual Successor by Sophia Marie DeClue — "
 
 
 def _origin_seal(text=None):
-    import hashlib
-    return hashlib.sha256((text if text is not None else ORIGIN_NOTICE).encode("utf-8")).hexdigest()
+    """FNV-1a 64 over the notice. Ten lines in every language, identical bytes in all three builds.
+
+    ★ NOT CRYPTOGRAPHIC, AND IT DOES NOT NEED TO BE. Its job is to detect that the notice CHANGED,
+    not to resist a forger — and the project's promise is "no dependencies", which rules out a
+    hashing library in C++ and Rust. A forger can recompute this seal; doing so means they edited
+    the notice AND the seal on purpose, which is precisely the deliberateness this exists to force.
+    """
+    h = 0xcbf29ce484222325
+    for b in (text if text is not None else ORIGIN_NOTICE).encode("utf-8"):
+        h ^= b
+        h = (h * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return "%016x" % h
 
 
 def origin(check_only=False):
