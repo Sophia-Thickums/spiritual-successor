@@ -1,9 +1,21 @@
 # Spiritual Successor
 
-**Your game gets one GPU. Every other GPU gets a job.**
+**Your game gets one GPU. Your other cards get a job — one you actually name.**
 
-Your game runs on the card your monitor is plugged into. Every other card in the machine does real work
-at the same time — a video encode, a compute job. Quit the game and they stop.
+Your game runs on the card your monitor is plugged into. Every other card in the machine can do **real
+work** at the same time, on its own encoder, while you play:
+
+```
+spirit play --work lecture.mp4 -- ./yourgame
+```
+
+That is a real job with a real output — a transcoded file you can open, written by a card that is not
+the one running your game. Measured on our box: three mismatched cards, two of them from 2017, ran a
+240-second 1080p transcode while the gaming card sat at **0–2% and 25 W**. Three valid files came out.
+
+**Give no `--work` and the spare cards run a synthetic test load instead** — ffmpeg's own generated test
+pattern, thrown away. That proves the cards can be *driven*; it is a load, not a job, and it produces
+nothing. The tool says so on screen rather than letting you assume otherwise.
 
 Two cards, four cards, ten cards, or just the graphics built into your processor sitting next to a real
 card. Different makers, different ages, different speeds. That is the normal case, not a complication.
@@ -30,12 +42,15 @@ Linux. No root. No dependencies.
 ## What it does
 
 ```
-spirit play -- ./yourgame
+spirit play -- ./yourgame                                  # your game, pinned correctly
+spirit play --work lecture.mp4 -- ./yourgame               # + a real job on the other cards
 ```
 
 1. Finds the card your monitor is plugged into.
 2. Launches the game so it can only see that card.
-3. Starts a real video encode on every other card, so they work while you play.
+3. Runs a job on every other card. With `--work FILE` that is a real transcode on their own encoders,
+   to a real file. Without it, the cards run a synthetic test load so you can watch them being driven
+   — that is a load, not a job, and the tool prints exactly that.
 
 ## The trap this closes
 
