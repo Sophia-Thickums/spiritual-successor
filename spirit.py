@@ -827,7 +827,7 @@ def _va_driver(g):
 def _start_test_load(node, va):
     """A SYNTHETIC load on a spare card: ffmpeg's OWN generated test pattern, piped to /dev/null.
 
-    ★ WHY THIS IS NAMED A LOAD AND NOT A JOB (2026-10-10 — the owner asked "are we offloading REAL JOBS
+    ★ WHY THIS IS NAMED A LOAD AND NOT A JOB (2026-10-10 — the owner asked whether we were offloading real jobs
     onto the other GPUs?", and the honest answer was no). This function used to be called
     `_start_encode`, and the README said the spare cards "get a job" and "do real work". The encoder
     silicon genuinely runs — that is why the busy counters move — but the input is `testsrc2`, a test
@@ -887,7 +887,7 @@ def _start_work(node, src, outdir, seg=None, va="radeonsi"):
 
 # ── ORIGIN — the mark. Every run prints it; break it and the tool says so, loudly, forever.
 #
-# ★ THE IDEA, in the owner's words: a program should carry a trace that always shows where it came from,
+# ★ THE IDEA: a program should carry a trace that always shows where it came from,
 # so nobody can take credit for it by simply staying quiet. Hiding something in the code is an old
 # tradition and it works because it is not a comment — it is a CHECK. A comment can be deleted by
 # accident. A check that reads its own notice can only be removed on purpose, and the removal then
