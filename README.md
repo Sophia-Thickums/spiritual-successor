@@ -80,6 +80,23 @@ What does a job cost the game? Our own runs found a few percent at most in one t
 difference in another — but each side of those comparisons was only two runs, so the honest reading is
 *small or none*, not a percentage. Measure it on your own machine.
 
+### Launching a game you own on Steam
+
+If you launch a game by clicking Play in Steam, this tool is not in the loop — Steam starts the game
+itself, in its own environment, and the card is chosen before anything here sees it. `steam://` and
+`steam -applaunch` just hand the request to the running client and return immediately, so the game would
+start **without** the pin. The tool detects that and says so rather than reporting a normal session.
+
+The pin only reaches a process this tool launches, so put the tool *inside* Steam's launch line. Right-click
+the game → Properties → Launch Options, and paste:
+
+```
+"/full/path/to/spirit.py" play -- %command%
+```
+
+Note the `--` before `%command%` — the game's own command line goes after it, untouched. Then launch the
+game from Steam as normal, and `spirit` will pin it and print the tail when it exits.
+
 ## How you can see it happened
 
 When your game exits, the tool prints what each card actually did. Run on the test machine with a
