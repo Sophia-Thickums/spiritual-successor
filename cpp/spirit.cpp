@@ -2068,7 +2068,11 @@ static void ensure_compatdata(const vector<string> &cmd) {
     if (stat((d + "/pfx").c_str(), &sb) == 0 && S_ISDIR(sb.st_mode)) return; // real prefix present
     bool made = !(stat(d.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode));
     if (!mkdirs(d)) {
-        printf("  prefix: could not create %s (%s)\n", d.c_str(), strerror(errno));
+        // ★ NO strerror() HERE, deliberately: each language spells its own runtime's error
+        // differently, so interpolating it makes this the one branch the three builds cannot agree on —
+        // and a read-only Steam directory or a full disk reaches it. Same words in every build instead.
+        printf("  prefix: could not create %s\n", d.c_str());
+        printf("          (Proton needs this directory for its prefix; check that you can write to it)\n");
         return;
     }
     if (made) {

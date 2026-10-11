@@ -966,8 +966,14 @@ def _ensure_compatdata(cmd):
     made = not os.path.isdir(d)
     try:
         os.makedirs(d, exist_ok=True)
-    except OSError as e:
-        print("  prefix: could not create %s (%s)" % (d, e))
+    except OSError:
+        # ★ THE ERROR TEXT IS DELIBERATELY NOT INTERPOLATED HERE. Every language spells its own
+        # runtime's error differently (Python an OSError, C++ strerror, Rust an io::Error Display), so
+        # including it would make this branch the one place the three builds CANNOT agree — and this is
+        # a branch a stranger can actually reach, with a read-only Steam directory or a full disk.
+        # The message says the same thing in every build instead, and names the thing to check.
+        print("  prefix: could not create %s" % d)
+        print("          (Proton needs this directory for its prefix; check that you can write to it)")
         return
     if made:
         print("  prefix: FIRST-EVER LAUNCH of appid %s — created %s" % (appid, d))
