@@ -532,6 +532,8 @@ cmp_steam() { # label args...
         echo "PASS  $label"; pass=$((pass+1))
     else echo "FAIL  $label"; fail=$((fail+1)); diff "$WORK/py.out" "$WORK/cpp.out" | head -20; fi
 }
+# isolate HOME so the session-pin state is OFF for these cases regardless of the dev box
+PINOFF="$WORK/pinoff"; mkdir -p "$PINOFF"; CHILD_HOME="$PINOFF"
 cmp_steam "play -- steam:// (says it cannot be pinned; prints the recipe)" \
         play --no-offload -- steam://rungameid/123
 cmp_steam "play -- steam (fast clean exit -> session did NOT route the game)" \
@@ -540,6 +542,39 @@ cmp_steam "play -- steam (fast clean exit -> session did NOT route the game)" \
 if grep -q 'play -- %command%' "$WORK/cpp.out" && grep -q 'did NOT route the game' "$WORK/cpp.out"; then
     echo "PASS  steam message present (recipe + not-routed)"; pass=$((pass+1))
 else echo "FAIL  steam message missing from the output"; fail=$((fail+1)); cat "$WORK/cpp.out"; fi
+# ★ BOTH STEAM CASES ABOVE RUN WITH THE SESSION PIN OFF (isolated HOME above), or a dev box that has
+# just run `spirit enable` would flip the message and make the case depend on ambient state. The pin-ON
+# branch gets its OWN case below, with the pin file present.
+echo "--- play: the Steam path with the session-wide pin ON (spirit enable) ---"
+PINON="$WORK/pinon"; mkdir -p "$PINON/.config/environment.d"
+printf 'MESA_VK_DEVICE_SELECT=1002:1234!\nDRI_PRIME=pci-0000:01:00.0\n' \
+    > "$PINON/.config/environment.d/90-spirit.conf"
+CHILD_HOME="$PINON"
+cmp_steam "play -- steam with the pin ON (says it is already pinned)" \
+        play --no-offload -- steam
+CHILD_HOME=""
+if grep -q 'session-wide pin IS on' "$WORK/cpp.out"; then
+    echo "PASS  steam pin-ON message present"; pass=$((pass+1))
+else echo "FAIL  steam pin-ON message missing"; fail=$((fail+1)); cat "$WORK/cpp.out"; fi
+
+echo "--- enable / disable: the session-wide pin (isolated HOME, no side effects) ---"
+# The pin lives in $HOME/.config/environment.d — isolated here so a test never touches the real one,
+# and so the state is the same for both sides. `--now` is NOT run (it would set the env in the user
+# manager of whatever box is running the suite).
+ENHOME="$WORK/enhome"; mkdir -p "$ENHOME"; CHILD_HOME="$ENHOME"
+cmp_cmd "enable writes the session-wide pin" enable
+en_reset() { mkdir -p "$ENHOME/.config/environment.d"
+             printf 'MESA_VK_DEVICE_SELECT=1002:1234!\nDRI_PRIME=pci-0000:01:00.0\n' \
+                 > "$ENHOME/.config/environment.d/90-spirit.conf"; }
+# disable must start from the SAME state on each side, or the second side finds the file already gone
+en_reset; run_py  disable > "$WORK/py.out" 2>"$WORK/py.err"; pyrc=$?
+en_reset; run_cpp disable > "$WORK/cpp.out" 2>"$WORK/cpp.err"; crc=$?
+if [ "$pyrc" = "$crc" ] && diff -q "$WORK/py.out" "$WORK/cpp.out" >/dev/null 2>&1; then
+    echo "PASS  disable removes the pin"; pass=$((pass+1))
+else echo "FAIL  disable removes the pin (py=$pyrc cpp=$crc)"; fail=$((fail+1)); diff "$WORK/py.out" "$WORK/cpp.out"; fi
+cmp_cmd "disable when it was never on" disable
+cmp_cmd "enable --bogus (exit 2, our flag only)" enable --bogus
+CHILD_HOME=""
 
 echo "--- play --scale / --framegen: stdout + exact gamescope argv (gamescope stubbed) ---"
 # ★ ISOLATE HOME FOR EVERY --framegen CASE (spec B4): _ensure_lsfg_profile appends to

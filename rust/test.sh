@@ -483,6 +483,8 @@ compare_steam() {
     diff -u "$TMP/py.out" "$TMP/rs.out" | head -30
   else echo "PASS: $label   (rc=$prc)"; pass=$((pass+1)); fi
 }
+# isolate HOME so the session-pin state is OFF regardless of what this dev box has enabled
+PINOFF="$TMP/pinoff"; mkdir -p "$PINOFF"; CHILD_HOME="$PINOFF"
 compare_steam "play -- steam:// (says it cannot be pinned; prints the recipe)" \
         "$FLEET10" play --no-offload -- steam://rungameid/123
 compare_steam "play -- steam (fast clean exit -> session did NOT route the game)" \
@@ -490,6 +492,37 @@ compare_steam "play -- steam (fast clean exit -> session did NOT route the game)
 if grep -q 'play -- %command%' "$TMP/rs.out" && grep -q 'did NOT route the game' "$TMP/rs.out"; then
   echo "PASS: steam message present (recipe + not-routed)"; pass=$((pass+1))
 else echo "FAIL: steam message missing from the output"; fail=$((fail+1)); cat "$TMP/rs.out"; fi
+echo
+echo "== play: the Steam path with the session-wide pin ON (spirit enable) =="
+PINON="$TMP/pinon"; mkdir -p "$PINON/.config/environment.d"
+printf 'MESA_VK_DEVICE_SELECT=1002:1234!\nDRI_PRIME=pci-0000:01:00.0\n' \
+    > "$PINON/.config/environment.d/90-spirit.conf"
+CHILD_HOME="$PINON"
+compare_steam "play -- steam with the pin ON (says it is already pinned)" \
+        "$FLEET10" play --no-offload -- steam
+CHILD_HOME=""
+if grep -q 'session-wide pin IS on' "$TMP/rs.out"; then
+  echo "PASS: steam pin-ON message present"; pass=$((pass+1))
+else echo "FAIL: steam pin-ON message missing"; fail=$((fail+1)); cat "$TMP/rs.out"; fi
+
+echo
+echo "== enable / disable: the session-wide pin (isolated HOME, no side effects) =="
+# The pin lives in $HOME/.config/environment.d — isolated here so a test never touches the real one and
+# both sides start from the same state. `--now` is NOT run (it would set the user manager's env).
+ENHOME="$TMP/enhome"; mkdir -p "$ENHOME"; CHILD_HOME="$ENHOME"
+compare "enable writes the session-wide pin" "$FLEET10" enable
+en_reset() { mkdir -p "$ENHOME/.config/environment.d"
+             printf 'MESA_VK_DEVICE_SELECT=1002:1234!\nDRI_PRIME=pci-0000:01:00.0\n' \
+                 > "$ENHOME/.config/environment.d/90-spirit.conf"; }
+en_reset; run_side "$PYBIN" "$PY" disable >"$TMP/py.out" 2>"$TMP/py.err"; prc=$?
+en_reset; run_side "$RS" disable >"$TMP/rs.out" 2>"$TMP/rs.err"; rrc=$?
+if [ "$prc" = "$rrc" ] && diff -q "$TMP/py.out" "$TMP/rs.out" >/dev/null 2>&1; then
+  echo "PASS: disable removes the pin   (rc=$prc)"; pass=$((pass+1))
+else echo "FAIL: disable removes the pin   (py rc=$prc rs rc=$rrc)"; fail=$((fail+1))
+     diff -u "$TMP/py.out" "$TMP/rs.out" | head -20; fi
+compare "disable when it was never on" "$FLEET10" disable
+compare "enable --bogus (exit 2, our flag only)" "$FLEET10" enable --bogus
+CHILD_HOME=""
 
 echo
 echo "== C5: a hung child must not hang THIS tool (gamescope --help, 15 s each side) =="

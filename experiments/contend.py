@@ -10,7 +10,7 @@ import argparse, os, re, statistics as st, subprocess, sys, time
 FF = "ffmpeg"
 SRC4K = "/tmp/sp_src4k.mp4"
 SRC = "/tmp/sp_src.mp4"
-XT_SEL = "1002:7550!"          # pin the Vulkan filter to the 9070 XT
+XT_SEL = "1002:1234!"          # vendor:device id of the card to pin as the renderer (set your own)
 WIN = 12
 
 
@@ -53,7 +53,7 @@ def stats(v):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pairs", type=int, default=6)
-    ap.add_argument("--node", default="renderD129", help="render node of the offload card (MI25)")
+    ap.add_argument("--node", default="renderD129", help="render node of the offload card")
     a = ap.parse_args()
     A, B = [], []
     for i in range(a.pairs):
