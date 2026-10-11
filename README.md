@@ -180,6 +180,23 @@ spirit ui
 It shows your cards, what each one is for, whether upscaling and frame generation are available here,
 and a box to launch your game from. It listens on your own machine only.
 
+## Known limits
+
+- **Arming only reaches apps started after it.** A Steam that was already running keeps the environment
+  it started with — restart it once.
+- **`spirit enable` delivers the device pin, not the second wall.** The mount namespace that hides the
+  other cards' device nodes applies to games launched through `spirit play`, not to ones Steam starts
+  by itself.
+- **The pin is written once and never re-checked.** Move your monitor to another card, or add a card that
+  renumbers PCI addresses, and the pin still names the old one. Re-run `spirit enable` whenever what
+  drives your display changes.
+- **`~/.config` that is a symlink** (a stow/dotfiles setup) takes the pin file into that repository, where
+  it names a card that means nothing on another machine. `spirit disable` before you commit.
+- **`XDG_CONFIG_HOME` is not honoured** — the pin is always written under `~/.config`.
+- **A session-wide pin hides your other cards from Vulkan apps in the session**, a compute job included.
+  That is the point for a game; on a machine that also computes on those cards, leave it off and use
+  `spirit play` per launch.
+
 ## Commands
 
 ```
