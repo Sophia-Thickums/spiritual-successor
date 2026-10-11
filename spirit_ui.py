@@ -425,7 +425,7 @@ def render_page():
 # the server
 # ---------------------------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
-    server_version = "spirit-ui/0.1"
+    server_version = "spirit-ui/1.0.0"
 
     def log_message(self, *a):  # quiet by default; the page is the interface
         pass

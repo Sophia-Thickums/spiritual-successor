@@ -51,6 +51,10 @@ using std::vector;
 
 extern char **environ;
 
+// ★ THE ONE VERSION STRING — identical to the Python `VERSION` and the Rust `VERSION`. `--version`
+// prints it as `spirit 1.0.0`; it is the value a bug report should quote back.
+static const char *VERSION = "1.0.0";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // tiny ordered JSON DOM (key order preserved; int/float distinguished)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -369,17 +373,50 @@ static string trim(const string &s) {
     while (b > a && isspace((unsigned char)s[b - 1])) b--;
     return s.substr(a, b - a);
 }
-static string rstrip_char(const string &s, char c) {
-    size_t b = s.size();
-    while (b > 0 && s[b - 1] == c) b--;
-    return s.substr(0, b);
-}
 static string join(const vector<string> &v, const string &sep) {
     string out;
     for (size_t i = 0; i < v.size(); i++) { if (i) out += sep; out += v[i]; }
     return out;
 }
 static bool starts_with(const string &s, const string &p) { return s.rfind(p, 0) == 0; }
+
+// ── UTF-8 helpers (★ C1). Python's str slicing and %-width padding count CODE POINTS, not bytes.
+// Slicing the port's std::string by byte cut a multi-byte card name mid-character (invalid UTF-8)
+// and printf %-Ns padded by byte, so a non-ASCII name misaligned the columns. Both now count
+// code points, exactly as the Python does.
+static size_t utf8_cplen(const string &s) {
+    size_t n = 0;
+    for (size_t i = 0; i < s.size(); ) {
+        unsigned char c = (unsigned char)s[i];
+        size_t len = 1;
+        if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        if (i + len > s.size()) len = 1;
+        i += len; n++;
+    }
+    return n;
+}
+static string utf8_cpslice(const string &s, size_t cps) {
+    size_t i = 0, n = 0;
+    while (i < s.size() && n < cps) {
+        unsigned char c = (unsigned char)s[i];
+        size_t len = 1;
+        if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        if (i + len > s.size()) len = 1;
+        i += len; n++;
+    }
+    return s.substr(0, i);
+}
+// Python's "%-Nw" % s: pad on the RIGHT to N code points.
+static string pad_display(const string &s, size_t width) {
+    string r = s;
+    size_t n = utf8_cplen(s);
+    while (n < width) { r.push_back(' '); n++; }
+    return r;
+}
 
 // Python repr() for a plain string: single-quoted unless it contains a single quote.
 static string py_repr(const string &s) {
@@ -397,6 +434,17 @@ static string py_repr(const string &s) {
         else out.push_back(c);
     }
     out.push_back(q);
+    return out;
+}
+
+// Python repr() of a list of strings, e.g. ['renderD999'] — used where the Python prints sorted(want).
+static string py_list_repr(const vector<string> &v) {
+    string out = "[";
+    for (size_t i = 0; i < v.size(); i++) {
+        if (i) out += ", ";
+        out += py_repr(v[i]);
+    }
+    out += "]";
     return out;
 }
 
@@ -673,7 +721,45 @@ static ProcResult run_capture_both(const vector<string> &argv, const vector<stri
     return R;
 }
 
-// spawn and wait; returns exit code (negative for signal), like subprocess.call
+// spawn and wait; returns exit code (negative for signal), like subprocess.call.
+// ★ ALSO REPORT AN exec FAILURE (fix 2026-10-11, outside review). Python's subprocess.call raises
+// FileNotFoundError when the program cannot be found, and play() turns that into a clean rc=127 line
+// plus THE TAIL. A bare fork/execvp cannot tell an exec failure from a program that exited 127, so the
+// child reports the errno over a close-on-exec pipe.
+struct SpawnResultEx { int rc = 127; bool exec_failed = false; int err = 0; string prog; };
+static SpawnResultEx spawn_wait_ex(const vector<string> &argv, const vector<string> &env) {
+    SpawnResultEx R;
+    int pfd[2];
+    if (pipe(pfd) != 0) return R;
+    pid_t pid = fork();
+    if (pid < 0) { close(pfd[0]); close(pfd[1]); return R; }
+    if (pid == 0) {
+        close(pfd[0]);
+        fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
+        auto a = to_cargv(argv);
+        auto e = to_cargv(env);
+        execvpe(a[0], a.data(), e.data());
+        int err = errno;
+        ssize_t w = write(pfd[1], &err, sizeof(err));
+        (void)w;
+        _exit(127);
+    }
+    close(pfd[1]);
+    int err = 0;
+    ssize_t n = read(pfd[0], &err, sizeof(err));
+    close(pfd[0]);
+    int status;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) R.rc = WEXITSTATUS(status);
+    else if (WIFSIGNALED(status)) R.rc = -WTERMSIG(status);
+    if (n == (ssize_t)sizeof(err)) {
+        R.exec_failed = true;
+        R.err = err;
+        R.prog = argv.empty() ? "" : argv[0];
+    }
+    return R;
+}
+
 static int spawn_wait(const vector<string> &argv, const vector<string> &env, bool devnull) {
     pid_t pid = fork();
     if (pid < 0) return 127;
@@ -771,23 +857,38 @@ static std::optional<string> card_render_node(const string &card) {
 static J probe() {
     const char *fake = getenv("SPIRIT_DEVICES");
     if (fake && *fake) {
+        // ★ A FIXTURE THAT CANNOT BE READ MUST NOT SILENTLY BECOME THE REAL MACHINE (fix 2026-10-11,
+        // outside review). This used to fall through to the live probe whenever the path did not
+        // exist, or crash with a traceback when the JSON was malformed — so a typo in the variable
+        // name for `spirit probe` meant you were reading your actual hardware and thought you were
+        // reading a fixture. That is the ambient-state trap this whole project has a law about.
         struct stat st;
-        if (stat(fake, &st) == 0) {
-            FILE *f = fopen(fake, "r");
-            if (f) {
-                string data;
-                char buf[4096];
-                size_t n;
-                while ((n = fread(buf, 1, sizeof(buf), f)) > 0) data.append(buf, n);
-                fclose(f);
-                try {
-                    J db = JsonParser(data).parse();
-                    if (!jget(db, "gpufan")) db.put("gpufan", J::str("probe/0.1"));
-                    return db;
-                } catch (...) {
-                    // fall through to a real probe on parse failure
-                }
-            }
+        if (stat(fake, &st) != 0) {
+            fprintf(stderr, "SPIRIT_DEVICES is set to %s, which does not exist. Refusing to "
+                            "silently read the real machine instead.\n", py_repr(fake).c_str());
+            exit(2);
+        }
+        FILE *f = fopen(fake, "r");
+        if (!f) {
+            int e = errno;
+            fprintf(stderr, "SPIRIT_DEVICES is set to %s, which is not readable JSON (%s). "
+                            "Refusing to silently read the real machine instead.\n",
+                    py_repr(fake).c_str(), strerror(e));
+            exit(2);
+        }
+        string data;
+        { char buf[4096]; size_t n; while ((n = fread(buf, 1, sizeof(buf), f)) > 0) data.append(buf, n); }
+        fclose(f);
+        try {
+            J db = JsonParser(data).parse();
+            if (!jget(db, "gpufan")) db.put("gpufan", J::str("probe/1.0.0"));
+            return db;
+        } catch (const std::exception &exc) {
+            // The parse-error text is the ONE part of this message each language spells its own way.
+            fprintf(stderr, "SPIRIT_DEVICES is set to %s, which is not readable JSON (%s). "
+                            "Refusing to silently read the real machine instead.\n",
+                    py_repr(fake).c_str(), exc.what());
+            exit(2);
         }
     }
 
@@ -903,7 +1004,7 @@ static J probe() {
     });
 
     J out = J::object();
-    out.put("gpufan", J::str("probe/0.1"));
+    out.put("gpufan", J::str("probe/1.0.0"));
     J arr = J::array();
     for (auto &g : gpus) arr.push(std::move(g));
     out.put("gpus", std::move(arr));
@@ -1164,10 +1265,9 @@ static void print_table(const J &db) {
                 string gn = L ? s_or_none(*L, "max_gen") : "None";
                 linkstr = "x" + std::to_string(*xw) + " " + gn;
             } else linkstr = "-";
-            string nm = sfield(g, "name");
-            if (nm.size() > 30) nm = nm.substr(0, 30);
-            printf("%-6s %-13s %-30s %-9s %-9s %-8s %-6s %s\n",
-                   sfield(g, "card").c_str(), sfield(g, "bdf").c_str(), nm.c_str(),
+            string nm = utf8_cpslice(sfield(g, "name"), 30);
+            printf("%-6s %-13s %s %-9s %-9s %-8s %-6s %s\n",
+                   sfield(g, "card").c_str(), sfield(g, "bdf").c_str(), pad_display(nm, 30).c_str(),
                    linkstr.c_str(), gbps_or_dash(g).c_str(), vr.c_str(),
                    bfield(g, "has_output") ? "yes" : "no", note.c_str());
         }
@@ -1191,8 +1291,7 @@ static void print_roles(const J &db, const string &profile) {
     printf("%-6s %-26s %-9s %-8s %s\n", "card", "name", "link", "VRAM", "role(s)");
     printf("%s\n", string(104, '-').c_str());
     for (auto &r : roles.arr) {
-        string nm = sfield(r, "name");
-        if (nm.size() > 26) nm = nm.substr(0, 26);
+        string nm = utf8_cpslice(sfield(r, "name"), 26);
         auto vt = ifield(r, "vram_total_mib");
         string vr = (vt && *vt) ? (std::to_string(*vt) + "M") : "-";
         vector<string> rl;
@@ -1200,8 +1299,8 @@ static void print_roles(const J &db, const string &profile) {
         if (rls) for (auto &x : rls->arr) rl.push_back(x.s);
         auto gm = ffield(r, "link_gbps_max");
         string linkcol = gm ? py_float_repr(*gm) : "-";
-        printf("%-6s %-26s %-9s %-8s %s\n", sfield(r, "card").c_str(), nm.c_str(), linkcol.c_str(),
-               vr.c_str(), join(rl, ", ").c_str());
+        printf("%-6s %s %-9s %-8s %s\n", sfield(r, "card").c_str(), pad_display(nm, 26).c_str(),
+               linkcol.c_str(), vr.c_str(), join(rl, ", ").c_str());
         const J *why = jget(r, "why");
         if (why) for (auto &w : why->arr) printf("        └─ %s\n", w.s.c_str());
     }
@@ -1318,17 +1417,29 @@ static const std::map<string, double> HANDOFF_GBPS = {{"card0", 0.76}, {"card2",
 static const std::map<string, double> FRAME_MIB = {{"1080p", 8.29}, {"1440p", 14.75}, {"4k", 33.18}};
 
 static int fg_cmd(const J &db, const string &res_in, const string &mode) {
-    string r, hz;
-    size_t at = res_in.rfind('@');
-    if (at != string::npos) { r = res_in.substr(0, at); hz = res_in.substr(at + 1); }
-    else {
-        if (res_in.size() >= 2) { r = res_in.substr(0, res_in.size() - 2); hz = res_in.substr(res_in.size() - 2); }
-        else { r = ""; hz = res_in; }
-    }
-    r = rstrip_char(r, '@');
-    string res = FRAME_MIB.count(r) ? r : "1440p";
+    // ★ PARSE THE RESOLUTION AND THE REFRESH AS TWO FIELDS (fix 2026-10-11, outside review). The old
+    // parser split the last two characters off the end, so the two examples the help text itself
+    // advertises were silently wrong: `4k120` became `4k1` at 20 Hz and fell back to 1440p (`1080p144`
+    // likewise), and `1440p@0` divided by zero. Both of those examples are now correct, and a refresh
+    // of zero falls back rather than crashing.
+    string res;
     int hznum;
-    try { hznum = std::stoi(hz); } catch (...) { hznum = 60; }
+    std::regex rx("^\\s*(1080p|1440p|4k)\\s*@?\\s*(\\d+)?\\s*$", std::regex::icase);
+    std::smatch m;
+    if (std::regex_match(res_in, m, rx)) {
+        res = m[1].str();
+        for (char &c : res) c = (char)tolower((unsigned char)c);
+        hznum = m[2].matched ? std::stoi(m[2].str()) : 60;
+    } else {
+        if (!res_in.empty())
+            printf("  fg: could not read %s as <1080p|1440p|4k>[@][Hz]; using 1440p60.\n",
+                   py_repr(res_in).c_str());
+        else
+            printf("  fg: no resolution given; using 1440p60.\n");
+        res = "1440p";
+        hznum = 60;
+    }
+    if (hznum <= 0) hznum = 60;
     double payload = FRAME_MIB.at(res);
     double budget = 1000.0 / hznum;
     bool one_way = (mode == "present-on-secondary");
@@ -1572,6 +1683,10 @@ static std::pair<std::optional<string>, string> ensure_lsfg_profile(int multipli
     // and the user's original lsfg-vk config was then gone for good. A backup that is rewritten on
     // every use is not a backup; it is a copy of the last thing we did.
     string bak = conf + ".bak-spirit";
+    // ★ NO RUNTIME ERROR TEXT (fix 2026-10-11, outside review). Same class as the compatdata and
+    // work-outdir branches: each language spells its own error differently, so interpolating it
+    // makes this a line the three builds can never agree on.
+    string write_fail = "could not write the profile — check that " + conf + " is writable";
     struct stat bst;
     bool need_backup = (stat(bak.c_str(), &bst) != 0);   // shutil.copy2 only if not exists
     FILE *src = need_backup ? fopen(conf.c_str(), "rb") : nullptr;
@@ -1579,7 +1694,7 @@ static std::pair<std::optional<string>, string> ensure_lsfg_profile(int multipli
     if (need_backup && (!src || !dst)) {
         if (src) fclose(src);
         if (dst) fclose(dst);
-        return {std::nullopt, "could not write the profile (" + string(strerror(errno)) + ")"};
+        return {std::nullopt, write_fail};
     }
     if (src && dst) {
         char buf[8192];
@@ -1589,7 +1704,7 @@ static std::pair<std::optional<string>, string> ensure_lsfg_profile(int multipli
             if (fwrite(buf, 1, n, dst) != n) { okc = false; break; }
         fclose(src); fclose(dst);
         if (!okc)
-            return {std::nullopt, "could not write the profile (" + string(strerror(errno)) + ")"};
+            return {std::nullopt, write_fail};
     }
     FILE *af = fopen(conf.c_str(), "a");
     if (af) {
@@ -1599,7 +1714,7 @@ static std::pair<std::optional<string>, string> ensure_lsfg_profile(int multipli
         if (wok)
             return {name, "added profile " + py_repr(name) + " (backup: " + bak + ")"};
     }
-    return {std::nullopt, "could not write the profile (" + string(strerror(errno)) + ")"};
+    return {std::nullopt, write_fail};
 }
 
 static int boost_cmd(const J &db) {
@@ -1765,7 +1880,14 @@ static int doctor(const J &db, bool as_json) {
     //    is a FAIL.
     {
         auto ls = lsfg_state();
-        string lv = (ls.first == "READY") ? "PASS" : (ls.first == "NOT-WORKING" ? "FAIL" : "UNKNOWN");
+        // ★ THE VERDICT MUST BE DERIVED FROM THE STATES THIS FUNCTION ACTUALLY RETURNS (fix
+        // 2026-10-11, outside review). This mapped only "READY" and "NOT-WORKING" — and lsfg_state()
+        // returns NEITHER, so the check printed UNKNOWN on every machine that ever ran it, including a
+        // working one. A check that can never reach a verdict is not a cautious check; it is a dead one.
+        string lv = "UNKNOWN";
+        if (ls.first == "INSTALLED") lv = "PASS";
+        else if (ls.first == "NEEDS-BRANCH" || ls.first == "PARTIAL") lv = "FAIL";
+        // STANDS-DOWN / ABSENT / NEEDS-GAME → UNKNOWN
         J c = J::object();
         c.put("check", J::str("frame-generation"));
         c.put("verdict", J::str(lv));
@@ -1779,7 +1901,7 @@ static int doctor(const J &db, bool as_json) {
 
     if (as_json) {
         J o = J::object();
-        o.put("spirit", J::str("doctor/0.1"));
+        o.put("spirit", J::str("doctor/1.0.0"));
         o.put("overall", J::str(overall));
         J arr = J::array();
         for (auto &c : checks) arr.push(c);
@@ -1827,8 +1949,7 @@ static int run_cmd(const J &db, const string &role, const string &card, const ve
 
     const J *L = jget(*g, "link");
     auto gm = L ? ffield(*L, "gbps_max") : std::nullopt;
-    string nm = sfield(*g, "name");
-    if (nm.size() > 34) nm = nm.substr(0, 34);
+    string nm = utf8_cpslice(sfield(*g, "name"), 34);
     printf("# routing role=%s to %s (%s, link %s GB/s)\n", role.c_str(), sfield(*g, "card").c_str(),
            nm.c_str(), gm ? py_float_repr(*gm).c_str() : "None");
     printf("# env: DRI_PRIME=%s  MESA_VK_DEVICE_SELECT=%s\n", pci.c_str(), mvs.c_str());
@@ -1936,8 +2057,11 @@ static string base_of(const string &path) {
 static string stem_of(const string &path) {
     size_t sl = path.rfind('/');
     string b = (sl == string::npos) ? path : path.substr(sl + 1);
+    // os.path.splitext: a leading dot is NOT an extension separator (".bashrc" -> (".bashrc", "")).
     size_t dot = b.rfind('.');
-    return (dot == string::npos) ? b : b.substr(0, dot);
+    if (dot == string::npos || dot == 0) return b.empty() ? "job" : b;
+    string s = b.substr(0, dot);
+    return s.empty() ? "job" : s;
 }
 
 // os.path.abspath: join to cwd when relative, then normalise (collapse "//", ".", "..").
@@ -2031,6 +2155,9 @@ static std::pair<string, pid_t> start_work(const string &node, const string &src
 }
 
 // The card's short name, as the role table prints it.
+// ★ SLICE ON A CODE-POINT BOUNDARY (C1). Python's _gpu_name takes the first 22 CODE POINTS; the port
+// used substr(0, 22) — bytes — so a name whose 22nd byte fell inside a multi-byte character emitted
+// invalid UTF-8 and misaligned the columns. utf8_cpslice/utf8_cplen count like Python.
 static string gpu_name(const J &g) {
     string n = sfield(g, "name");
     if (n.empty()) n = sfield(g, "card");
@@ -2039,8 +2166,7 @@ static string gpu_name(const J &g) {
         if (i != string::npos && i > 0) n = n.substr(0, i);
     }
     while (!n.empty() && n.back() == ' ') n.pop_back();
-    if (n.size() > 22) n = n.substr(0, 22);
-    return n;
+    return utf8_cpslice(n, 22);
 }
 
 // True if this is a Proton/Wine launch, where the mount-namespace wall MUST be skipped.
@@ -2190,7 +2316,12 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
     }
     vector<string> cmd = cmd_in;
     const J *main = main_card(db);
-    if (!main) { fprintf(stderr, "no GPUs detected\n"); return 1; }
+    if (!main) {
+        // ★ NO CARDS IS NOT A CRASH (fix 2026-10-11, outside review). This used to reach max() on an
+        // empty sequence and raise ValueError with a traceback. Python prints this line and returns 1.
+        printf("  no GPUs were found, so there is nothing to render on and nothing to work on.\n");
+        return 1;
+    }
     vector<const J *> spares;
     const J *ga = gpus_arr(db);
     if (ga) for (auto &g : ga->arr)
@@ -2199,19 +2330,34 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
         // ★ --spare NODE[,NODE...] — the human names the cards that work. Everything else is left
         // alone entirely, not merely idle. A real session runs for hours unattended, and an old card
         // on a marginal link is the human's risk to take, not a default we assume for them.
-        vector<string> want;
-        for (size_t i = 0, j = 0; i <= only_spares.size(); i++)
-            if (i == only_spares.size() || only_spares[i] == ',' || only_spares[i] == ' ') {
-                if (i > j) want.push_back(only_spares.substr(j, i - j));
-                j = i + 1;
+        // ★ DEDUPE and report the nodes we do not know (C6): a repeated node used to start two encoders
+        // on one card, and an unknown node used to refuse without saying which one it did not recognise.
+        std::set<string> want;
+        {
+            string s = only_spares;
+            for (char &c : s) if (c == ',') c = ' ';
+            size_t i = 0;
+            while (i <= s.size()) {
+                size_t j = s.find(' ', i);
+                if (j == string::npos) j = s.size();
+                string tok = trim(s.substr(i, j - i));
+                if (!tok.empty()) want.insert(tok);
+                i = j + 1;
             }
+        }
+        std::set<string> spare_nodes;
+        for (auto *g : spares) spare_nodes.insert(base_of(sfield(*g, "render_node")));
+        vector<string> missing;
+        for (auto &w : want) if (!spare_nodes.count(w)) missing.push_back(w);
+        if (!missing.empty())
+            printf("  spare: ignoring unknown render node(s): %s\n", join(missing, ", ").c_str());
         vector<const J *> kept;
         for (auto *g : spares)
-            for (const string &w : want)
-                if (base_of(sfield(*g, "render_node")) == w) kept.push_back(g);
+            if (want.count(base_of(sfield(*g, "render_node")))) kept.push_back(g);
         if (kept.empty()) {
-            printf("  spare: REFUSED — none of those render nodes is a spare card here. The game would\n"
-                   "         run with no cards working beside it.\n");
+            vector<string> wl(want.begin(), want.end());
+            printf("  spare: REFUSED — none of %s is a spare card here. The game would run with no"
+                   " cards working beside it.\n", py_list_repr(wl).c_str());
             return 1;
         }
         string kepts;
@@ -2229,18 +2375,16 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
     auto xw = L ? ifield(*L, "max_width") : std::nullopt;
     string mgen = L ? s_or_none(*L, "max_gen") : "None";
     auto gm = L ? ffield(*L, "gbps_max") : std::nullopt;
-    string mname = sfield(*main, "name");
-    if (mname.size() > 30) mname = mname.substr(0, 30);
+    string mname = utf8_cpslice(sfield(*main, "name"), 30);
     printf("  MAIN  (renders)  %-6s %-30s x%s %s  %s GB/s\n", sfield(*main, "card").c_str(),
-           mname.c_str(), xw ? std::to_string(*xw).c_str() : "None", mgen.c_str(),
+           pad_display(mname, 30).c_str(), xw ? std::to_string(*xw).c_str() : "None", mgen.c_str(),
            gm ? py_float_repr(*gm).c_str() : "None");
     for (auto *g : spares) {
-        string sn = sfield(*g, "name");
-        if (sn.size() > 30) sn = sn.substr(0, 30);
+        string sn = utf8_cpslice(sfield(*g, "name"), 30);
         string rn = sfield(*g, "render_node");
         if (rn.empty()) rn = "?";
         printf("  SPARE (offload)  %-6s %-30s node /dev/dri/%s\n", sfield(*g, "card").c_str(),
-               sn.c_str(), rn.c_str());
+               pad_display(sn, 30).c_str(), rn.c_str());
     }
 
     vector<string> env = current_env();
@@ -2323,6 +2467,19 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
     std::map<string, int> died_early;                 // render node -> rc, loads already gone at game exit
     vector<std::pair<string, string>> job_outputs;   // (node, out path)
     double job_expect = -1.0;
+    string no_job_reason;                             // set when --work was asked for but nothing could start
+
+    // ★ REFUSE --overlay BEFORE ANYTHING IS SPAWNED (fix 2026-10-11, outside review). This check used
+    // to run AFTER the spare cards had already been put to work, so refusing the overlay left the
+    // encoders running with no game to stop them — orphaned processes on a machine the user is about
+    // to keep using. A refusal that leaves work running is not a refusal.
+    if (do_offload && overlay && !scale) {
+        auto gs = gamescope_state();
+        if (gs.first != "READY" || !native_res(db)) {
+            printf("  overlay: REFUSED — gamescope is not ready (%s)\n", gs.second.c_str());
+            return 1;
+        }
+    }
     // ★ WHICH SPARES CAN ACTUALLY ENCODE, decided from each card's own kernel driver, before anything
     // is launched. A card we cannot drive is left out and NAMED — the alternative is an ffmpeg that
     // dies instantly with its output going to /dev/null, which looks exactly like a card doing work.
@@ -2345,17 +2502,32 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
     if (do_offload && which("ffmpeg")) {
         for (auto &s : skipped)
             printf("  spare: SKIPPED %s (%s) — %s\n", s.node.c_str(), s.name.c_str(), s.why.c_str());
+        // ★ NOTHING TO RUN A JOB ON — say it here, before the job block, so the reason is set for the
+        // "no job was started" line at the end (A1, fix 2026-10-11).
+        if (!work.empty() && encoders.empty()) {
+            no_job_reason = "no spare card on this machine can encode (see the SKIPPED lines above)";
+            printf("  work: no job started — %s\n", no_job_reason.c_str());
+        }
         if (!work.empty()) {
             // A REAL JOB. Real input, real output, on cards that are NOT the one running the game.
             struct stat st;
             if (stat(work.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
-                printf("  work: REFUSED — %s is not a file. A job needs a real input; the synthetic\n"
-                       "        test load is what runs when you do not give one.\n", work.c_str());
+                // ★ ONE UNIFORM TWO-LINE REFUSAL SHAPE for every refusal in this file (fix 2026-10-11).
+                printf("  work: REFUSED — %s is not a file\n", work.c_str());
+                printf("          (a job needs a real input; without one the spare cards run a test "
+                       "load, which produces nothing)\n");
                 return 1;
             }
             // ★ BESIDE THE INPUT, which is what --work-outdir's own help text has always promised.
             // It used to default to the CURRENT DIRECTORY. (Found by the outside review, 2026-10-11.)
+            // ★ --work-outdir IS NORMALISED WITH abspath (C7), which collapses `..`; the raw path used
+            // to reach mkdirs() and the output path, so `a/../b` and `b` named two different places.
             if (work_outdir.empty()) work_outdir = dir_name(abspath(work));
+            else work_outdir = abspath(work_outdir);
+            if (work_outdir.empty()) {
+                char cw[4096];
+                work_outdir = getcwd(cw, sizeof(cw)) ? string(cw) : ".";
+            }
             if (!mkdirs(work_outdir)) {
                 // ★ NO strerror() HERE, deliberately — see the compatdata branch. Each language spells
                 // its own runtime's error differently, so interpolating it makes this a branch the three
@@ -2368,8 +2540,8 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
             if (split && encoders.size() > 1) {
                 double total = media_duration(work);
                 if (total <= 0.0) {
-                    printf("  split: REFUSED — could not read the duration of %s, and a split whose\n"
-                           "         extent is guessed drops the tail.\n", stem.c_str());
+                    printf("  split: REFUSED — could not read the duration of %s, and a split whose "
+                           "extent is guessed drops the tail.\n", base_of(work).c_str());
                     return 1;
                 }
                 size_t n = encoders.size();
@@ -2397,9 +2569,11 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                     job_outputs.push_back({e.first, r.first});
                 }
                 if (!procs.empty()) {
+                    // ★ THE BASENAME, not stem + ".mp4" (C9): a `clip.mkv` input used to announce
+                    // itself as `clip.mkv.mp4`.
                     printf("  ★ JOB: transcoding %s on %d spare card(s) — real input, real output. "
                            "(WHOLE file on each card = REPLICATION, not a split; add --split to divide "
-                           "one job between them.)\n", (stem + ".mp4").c_str(), (int)procs.size());
+                           "one job between them.)\n", base_of(work).c_str(), (int)procs.size());
                     for (auto &jo : job_outputs)
                         printf("      %s -> %s\n", jo.first.c_str(), jo.second.c_str());
                 }
@@ -2416,6 +2590,14 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                 printf("         For real work: spirit play --work <file> [--work-outdir DIR] -- <game>\n");
             }
         }
+    } else if (!work.empty() && do_offload) {
+        // ★ An absent tool must be SAID, not silently skipped (the README promises exactly this, and
+        // the promise was false for ffmpeg). Found 2026-10-11 by an outside review.
+        no_job_reason = "ffmpeg is not installed, so no card can be given a job here";
+        printf("  work: no job started — %s\n", no_job_reason.c_str());
+    } else if (!work.empty()) {
+        no_job_reason = "--no-offload was given, so no card was asked to do anything";
+        printf("  work: no job started — %s\n", no_job_reason.c_str());
     }
     printf("\n  launching…\n\n");
     fflush(stdout);
@@ -2424,13 +2606,6 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
     // mount namespace (see hidden_argv).
     vector<string> inner = hidden_argv(cmd, *main, db);
     bool scale_on = scale && *scale != 0.0;
-    if (overlay && !scale_on) {
-        auto gs = gamescope_state();
-        if (gs.first != "READY" || !native_res(db)) {
-            printf("  overlay: REFUSED - gamescope not ready (%s)\n", gs.second.c_str());
-            return 1;
-        }
-    }
     if (scale_on || overlay) {
         auto nat = native_res(db);
         std::pair<long long, long long> rr =
@@ -2448,7 +2623,7 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
             // FPS readout is the COMPOSITOR's present rate - the only number frame generation moves.
             // The game's own counter reports frames IT rendered, which frame gen does not change.
             gs.push_back("--mangoapp");
-            printf("  overlay: mangoapp inside gamescope - on-screen FPS is the COMPOSITOR's present rate\n");
+            printf("  overlay: mangoapp inside gamescope — for the eye, not the evidence\n");
             fflush(stdout);   // same buffering reason as the Python
         }
         gs.push_back("--");
@@ -2457,7 +2632,17 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
     }
     struct timespec t_game_ts;
     clock_gettime(CLOCK_MONOTONIC, &t_game_ts);
-    int rc = spawn_wait(inner, env, false);
+    SpawnResultEx gr = spawn_wait_ex(inner, env);
+    int rc = gr.rc;
+    if (gr.exec_failed) {
+        // ★ A CLEAN REFUSAL, NOT A TRACEBACK (fix 2026-10-11, outside review). A game command that
+        // cannot be found used to raise out of play() as a Python traceback with no THE TAIL at all.
+        rc = 127;
+        printf("\n  could not run the game: [Errno %d] %s: %s\n", gr.err,
+               strerror(gr.err), py_repr(gr.prog).c_str());
+        printf("  Nothing was launched. The cards listed above did no work and have been stopped.\n");
+        fflush(stdout);
+    }
     // A TEST LOAD IS A LOAD AND DIES WITH THE GAME. A JOB IS NOT: killing a half-finished transcode
     // leaves a truncated file and calls it done. Jobs are WAITED FOR, then each output is checked
     // for size and duration ON DISK — the artifact, never the child's exit code.
@@ -2480,9 +2665,23 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                 died_early[proc_nodes[i]] = code;
             }
         }
+        // ★ SIGTERM, THEN WAIT (fix 2026-10-11, outside review). Python and C++ terminated without
+        // waiting, Rust killed outright; three different teardowns for the same act. A caller that
+        // assumes the cards are free when play() returns was right only on one of the three. SIGTERM,
+        // then wait (5 s), then kill, everywhere.
         for (pid_t p : procs) kill(p, SIGTERM);
+        for (pid_t p : procs) {
+            bool gone = false;
+            for (int k = 0; k < 50; k++) {
+                int st = 0;
+                if (waitpid(p, &st, WNOHANG) == p) { gone = true; break; }
+                struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = 100000000L;
+                nanosleep(&ts, nullptr);
+            }
+            if (!gone) kill(p, SIGKILL);
+        }
     }
-    if (!work.empty()) {
+    if (!work.empty() && !procs.empty()) {
         printf("\n  game exited (rc=%d) — the job ran to completion (not stopped with the game)\n", rc);
         printf("  ── JOB OUTPUT ────────────────────────────────────────────────────────\n");
         double got = 0.0;
@@ -2511,7 +2710,18 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                         job_expect - got, job_expect);
         }
     } else {
-        printf("\n  game exited (rc=%d) — test load stopped\n", rc);
+        // ★ DO NOT CLAIM A JOB THAT WAS NEVER STARTED (fix 2026-10-11, outside review). With --work
+        // given but nothing able to run — --no-offload, no ffmpeg, or no card that can encode — this
+        // printed "the job ran to completion" over an empty output block. Nothing had run.
+        if (!work.empty()) {
+            printf("\n  game exited (rc=%d)\n", rc);
+            printf("  ── JOB OUTPUT ────────────────────────────────────────────────────────\n");
+            printf("  NO JOB WAS STARTED — %s\n",
+                   no_job_reason.empty() ? "nothing was given the work" : no_job_reason.c_str());
+            printf("  Nothing was transcoded, so there is no output to check. The game ran normally.\n");
+        } else {
+            printf("\n  game exited (rc=%d) — test load stopped\n", rc);
+        }
     }
     // Real-valued, ever-so-slightly-positive wall delta, with the same 1e-6 floor as the Python.
     // The WITNESS panel divides by this; an integer clock would give a division by zero (nan).
@@ -2532,7 +2742,7 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                 bool ok = stat(jo.second.c_str(), &st) == 0;
                 string nm = "?";
                 for (auto *g : spares) if (base_of(sfield(*g, "render_node")) == jo.first) nm = gpu_name(*g);
-                printf("  %-12s %-22s REAL JOB  %s\n", jo.first.c_str(), nm.c_str(),
+                printf("  %-12s %s REAL JOB  %s\n", jo.first.c_str(), pad_display(nm, 22).c_str(),
                        ok ? jo.second.c_str() : "FAILED — no file");
             }
         } else {
@@ -2547,20 +2757,21 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                 if (is_enc) {
                     auto it = died_early.find(node);
                     if (it == died_early.end()) {
-                        printf("  %-12s %-22s SYNTHETIC TEST LOAD — ran for the whole session (%.0f s),\n",
-                               node.c_str(), nm.c_str(), elapsed);
+                        printf("  %-12s %s SYNTHETIC TEST LOAD — ran for the whole session (%.0f s),\n",
+                               node.c_str(), pad_display(nm, 22).c_str(), elapsed);
                     } else {
                         // ★ Say what was SEEN, not what was hoped: this one was already gone before the
                         // game exited, so it did not run the session however long the game lasted.
-                        printf("  %-12s %-22s SYNTHETIC TEST LOAD — EXITED EARLY (rc=%d, before the game\n",
-                               node.c_str(), nm.c_str(), it->second);
+                        printf("  %-12s %s SYNTHETIC TEST LOAD — EXITED EARLY (rc=%d, before the game\n",
+                               node.c_str(), pad_display(nm, 22).c_str(), it->second);
                         printf("  %-12s %-22s   exited): it did NOT run for the session.\n", "", "");
                     }
                     printf("  %-12s %-22s produced nothing (a job needs --work FILE)\n", "", "");
                 } else {
                     string why = "not used";
                     for (auto &s : skipped) if (s.node == node) { why = s.why; break; }
-                    printf("  %-12s %-22s SKIPPED — %s\n", node.c_str(), nm.c_str(), why.c_str());
+                    printf("  %-12s %s SKIPPED — %s\n", node.c_str(), pad_display(nm, 22).c_str(),
+                           why.c_str());
                 }
             }
         }
@@ -2574,8 +2785,10 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
         printf("  presented rate                     : %.1f /s\n", (double)n / elapsed);
         printf("  ★ This is the number frame generation moves, and the ONLY number it moves.\n");
         printf("    The game's own FPS counter cannot see it — that counts frames the GAME\n");
-        printf("    rendered, which frame gen does not change. Expect the game's figure to be\n");
-        printf("    LOWER with frame gen on: it is now paying for the interpolation.\n");
+        printf("    rendered, and with frame gen on the game may now be doing LESS work, because it\n");
+        printf("    is paying for the interpolation. On one title here that figure fell about 9%%;\n");
+        printf("    on another it did not move at all. Either way it cannot see what was added —\n");
+        printf("    which is the whole reason this counter exists.\n");
         printf("    Honest limit: an image handed to the compositor is not proof it was scanned\n");
         printf("    out, and no counter can tell you whether the interpolated frames look right.\n");
     }
@@ -2668,13 +2881,14 @@ static int ui_cmd(const vector<string> &args) {
 }
 
 static void print_help() {
-    printf("usage: spirit [-h] {probe,roles,plan,doctor,origin,boost,fg} ...\n\n");
+    printf("usage: spirit [-h] [--version] {probe,roles,plan,doctor,origin,boost,fg} ...\n\n");
     printf("Spiritual Successor — put every GPU to work\n");
     printf("commands: probe · roles · plan · doctor · fg · boost · run · play · ui  (`run` and `play` take a command after `--`)\n\n");
     printf("positional arguments:\n");
     printf("  {probe,roles,plan,doctor,origin,boost,fg}\n\n");
     printf("options:\n");
     printf("  -h, --help            show this help message and exit\n");
+    printf("  --version             show program's version number and exit\n");
 }
 
 // argparse-style subcommand usage lines (byte-for-byte from the Python original).
@@ -2686,7 +2900,7 @@ static string sub_usage(const string &cmd) {
     if (cmd == "origin") return "usage: spirit origin [-h] [--check]";
     if (cmd == "boost")  return "usage: spirit boost [-h]";
     if (cmd == "fg")     return "usage: spirit fg [-h] [--res RES] [--mode {present-on-secondary,round-trip}]";
-    return "usage: spirit [-h] {probe,roles,plan,doctor,origin,boost,fg} ...";
+    return "usage: spirit [-h] [--version] {probe,roles,plan,doctor,origin,boost,fg} ...";
 }
 
 static void print_sub_help(const string &cmd) {
@@ -2705,6 +2919,11 @@ static void print_sub_help(const string &cmd) {
         printf("  --vram-mib VRAM_MIB  VRAM the workload needs on its card\n");
     } else if (cmd == "doctor") {
         printf("  -h, --help  show this help message and exit\n");
+    } else if (cmd == "origin") {
+        // ★ argparse help for `origin`, including the --check line (C10): the port used to print only
+        // -h/--help, so `spirit origin -h` was a different document from the Python's.
+        printf("  -h, --help  show this help message and exit\n");
+        printf("  --check     exit 0 if this build is the original, 1 if not\n");
     } else if (cmd == "boost") {
         printf("  -h, --help  show this help message and exit\n");
     } else if (cmd == "fg") {
@@ -2720,22 +2939,65 @@ static int arg_error(const string &cmd, const string &msg) {
     fprintf(stderr, "spirit %s: error: %s\n", cmd.c_str(), msg.c_str());
     return 2;
 }
+// ★ argparse REPORTS EVERY ARGUMENT IT COULD NOT PLACE, NOT JUST THE FIRST (fix 2026-10-11, outside
+// review). `roles --profil edit` yields "unrecognized arguments: --profil edit", because neither token
+// was claimed; this build named only `--profil`. Found by a harness case that only became possible once
+// the Python reference stopped accepting abbreviations. `flags` are the bare options this subcommand
+// knows, `valued` the ones that consume the next token; anything else is reported, in order.
+static string unrec_extras(const vector<string> &args, const string &flags, const string &valued) {
+    auto in = [](const string &csv, const string &tok) {
+        size_t a = 0;
+        while (a <= csv.size()) {
+            size_t b = csv.find(',', a);
+            if (b == string::npos) b = csv.size();
+            if (b > a && csv.compare(a, b - a, tok) == 0) return true;
+            a = b + 1;
+        }
+        return false;
+    };
+    vector<string> out;
+    for (size_t k = 1; k < args.size(); k++) {
+        if (in(flags, args[k])) continue;
+        if (in(valued, args[k])) { k++; continue; }
+        out.push_back(args[k]);
+    }
+    return join(out, " ");
+}
+
 // argparse raises "unrecognized arguments" on the TOP-LEVEL parser.
 static int unrec_error(const string &msg) {
-    fprintf(stderr, "usage: spirit [-h] {probe,roles,plan,doctor,origin,boost,fg} ...\n");
+    fprintf(stderr, "usage: spirit [-h] [--version] {probe,roles,plan,doctor,origin,boost,fg} ...\n");
     fprintf(stderr, "spirit: error: %s\n", msg.c_str());
     return 2;
 }
 
-// Python int() semantics for argparse `type=int`: full-string base-10 parse.
+// Python int() semantics for argparse `type=int`: whitespace-trimmed, base-10, signs allowed and a
+// single underscore BETWEEN digits accepted (int("1_000") == 1000, int("_1") is a ValueError).
 static bool parse_py_int(const string &s, long long &out) {
     string t = trim(s);
     if (t.empty()) return false;
+    size_t i = 0;
+    bool neg = false;
+    if (t[i] == '+' || t[i] == '-') { neg = (t[i] == '-'); i++; }
+    if (i >= t.size()) return false;
+    string digits;
+    bool prev_digit = false;
+    for (; i < t.size(); i++) {
+        char c = t[i];
+        if (c >= '0' && c <= '9') { digits.push_back(c); prev_digit = true; }
+        else if (c == '_') {
+            if (!prev_digit || i + 1 >= t.size() || t[i + 1] < '0' || t[i + 1] > '9') return false;
+            prev_digit = false;
+        } else return false;
+    }
+    if (digits.empty()) return false;
     size_t idx = 0;
     try {
-        out = std::stoll(t, &idx, 10);
+        long long v = std::stoll((neg ? "-" : "") + digits, &idx, 10);
+        if (idx != digits.size() + (neg ? 1 : 0)) return false;
+        out = v;
     } catch (...) { return false; }
-    return idx == t.size();
+    return true;
 }
 
 // Python float() semantics: whitespace-trimmed, full-string, decimal/exp/inf/nan (not hex).
@@ -2759,11 +3021,18 @@ int main(int argc, char **argv) {
 
     // ★ THE MARK, ON EVERY RUN. Python calls origin() at the very top of main(), before the `run`
     // and `play` hand-parse branches. Skipped only when any argv element is `--json` (a machine is
-    // reading) or `origin` (which prints it properly). A tampered build cannot silence the warning.
+    // reading), `origin` (which prints it properly), or `--version` (which must print exactly one
+    // line). A tampered build cannot silence the warning.
     {
         bool skip = false;
-        for (const string &a : args) if (a == "--json" || a == "origin") skip = true;
+        for (const string &a : args) if (a == "--json" || a == "origin" || a == "--version") skip = true;
         if (!skip) origin_cmd(false);
+    }
+
+    // ★ --version prints THE one version string and nothing else: a single line, exit 0, no origin
+    // mark and no help footer. Handled ahead of every other branch so it matches the Python exactly.
+    for (const string &a : args) {
+        if (a == "--version") { printf("spirit %s\n", VERSION); return 0; }
     }
 
     if (!args.empty() && args[0] == "ui") {
@@ -2867,7 +3136,7 @@ int main(int argc, char **argv) {
     string cmd = args[0];
     if (cmd != "probe" && cmd != "roles" && cmd != "plan" && cmd != "doctor" && cmd != "origin" &&
         cmd != "boost" && cmd != "fg") {
-        fprintf(stderr, "usage: spirit [-h] {probe,roles,plan,doctor,origin,boost,fg} ...\n");
+        fprintf(stderr, "usage: spirit [-h] [--version] {probe,roles,plan,doctor,origin,boost,fg} ...\n");
         fprintf(stderr,
                 "spirit: error: argument cmd: invalid choice: '%s' (choose from 'probe', 'roles', 'plan', 'doctor', 'origin', 'boost', 'fg')\n",
                 cmd.c_str());
@@ -2886,7 +3155,7 @@ int main(int argc, char **argv) {
         bool json = false;
         for (size_t k = 1; k < args.size(); k++) {
             if (args[k] == "--json") json = true;
-            else return unrec_error("unrecognized arguments: " + args[k]);
+            else return unrec_error("unrecognized arguments: " + unrec_extras(args, "--json", ""));
         }
         if (json) printf("%s\n", json_dumps_indent2(db).c_str());
         else print_table(db);
@@ -2903,7 +3172,7 @@ int main(int argc, char **argv) {
                 profile = args[k + 1]; k += 2; continue;
             }
             if (starts_with(args[k], "--profile=")) { profile = args[k].substr(10); k++; continue; }
-            return unrec_error("unrecognized arguments: " + args[k]);
+            return unrec_error("unrecognized arguments: " + unrec_extras(args, "--json", "--profile"));
         }
         if (json) printf("%s\n", json_dumps_indent2(assign_roles(db, profile)).c_str());
         else print_roles(db, profile);
@@ -2934,26 +3203,26 @@ int main(int argc, char **argv) {
                     return arg_error(cmd, "argument --vram-mib: invalid int value: '" + val + "'");
                 vram = v; k++; continue;
             }
-            return unrec_error("unrecognized arguments: " + args[k]);
+            return unrec_error("unrecognized arguments: " + unrec_extras(args, "", "--workload,--vram-mib"));
         }
         return plan_cmd(db, workload, vram);
     }
     if (cmd == "doctor") {
         for (size_t k = 1; k < args.size(); k++)
-            return unrec_error("unrecognized arguments: " + args[k]);
+            return unrec_error("unrecognized arguments: " + unrec_extras(args, "", ""));
         return doctor(db, false);
     }
     if (cmd == "origin") {
         bool check = false;
         for (size_t k = 1; k < args.size(); k++) {
             if (args[k] == "--check") { check = true; continue; }
-            return unrec_error("unrecognized arguments: " + args[k]);
+            return unrec_error("unrecognized arguments: " + unrec_extras(args, "--check", ""));
         }
         return origin_cmd(check);
     }
     if (cmd == "boost") {
         for (size_t k = 1; k < args.size(); k++)
-            return unrec_error("unrecognized arguments: " + args[k]);
+            return unrec_error("unrecognized arguments: " + unrec_extras(args, "", ""));
         return boost_cmd(db);
     }
     if (cmd == "fg") {
@@ -2978,7 +3247,7 @@ int main(int argc, char **argv) {
                                          "' (choose from 'present-on-secondary', 'round-trip')");
                 mode = val; continue;
             }
-            return unrec_error("unrecognized arguments: " + args[k]);
+            return unrec_error("unrecognized arguments: " + unrec_extras(args, "", "--res,--mode"));
         }
         return fg_cmd(db, res, mode);
     }

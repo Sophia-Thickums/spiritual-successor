@@ -9,9 +9,14 @@ real work at the same time — encoding video, on its own chip:
 spirit play --work lecture.mp4 -- ./yourgame
 ```
 
-That is a real job with a real file at the end of it. Measured on the test machine: three mismatched
-cards, two of them from 2017, transcoded 240 seconds of 1080p while the gaming card sat at **0–2% and
-25 W**. Three files came out.
+That is a real job with a real file at the end of it. Measured on the test machine: **four mismatched
+cards — two of them from 2017 — each took a different real video file at once.** 318 seconds of source
+footage came back as four valid files in 18 seconds, every output checked on disk for size and duration.
+
+The per-second telemetry for that window ships as `evidence/multigpu_4card.jsonl`, and it is worth
+reading rather than this summary: across it the display card is **busy for much of the sample**, because
+it was one of the four doing a job. What is being demonstrated is that four cards can work at once, not
+that any of them sat idle.
 
 Different makers, different ages, different speeds. Two cards, four cards, or the graphics built into
 your processor sitting next to a real card. That is the normal case, not a complication.
@@ -41,7 +46,7 @@ claimed.
 - **Not Nvidia.** The pinning is Mesa-based, and the jobs run on a card's own video encoder — today
   that means AMD (`radeonsi`) or Intel (`iHD`). An Nvidia card can be the card your game runs on, but it
   cannot take the offload, and the tool names it as skipped rather than leaving it idle and saying
-  nothing.
+  nothing. Intel's path is written but has never been run — see the technical notes below.
 
 ---
 
@@ -75,19 +80,24 @@ When your game exits, the tool prints what each other card actually did. A divid
   original duration   : 900.0s
   ⇒ COMPLETE — the pieces reconstruct the whole input (within 1%).
   ── THE TAIL — what the other cards did ───────────────────────────────
-  renderD131   Ryzen iGPU             REAL JOB  .../lecture.renderD131_part1.mp4
-  renderD129   Instinct MI25          REAL JOB  .../lecture.renderD129_part2.mp4
-  renderD130   Vega Frontier Edition  REAL JOB  .../lecture.renderD130_part3.mp4
+  renderD131   Granite Ridge          REAL JOB  .../lecture.renderD131_part1.mp4
+  renderD129   Vega 10                REAL JOB  .../lecture.renderD129_part2.mp4
+  renderD130   Vega 10 XTX            REAL JOB  .../lecture.renderD130_part3.mp4
 ```
 
-Every output is checked on disk afterwards — it exists, and its duration adds up. A slice that did not
-get written says `MISSING` and the split says `INCOMPLETE`. Nothing here takes a process's exit code
-for an answer.
+(Card names are whatever `lspci` calls them, shortened — the two 2017 cards here print as `Vega 10` and
+`Vega 10 XTX`, not as their market names.)
 
-A card the tool cannot drive is named rather than quietly left out:
+Every job output is checked on disk afterwards — it exists, and under `--split` its duration is added
+up against the input to within a second or one percent, whichever is larger. A file that did not get
+written says `MISSING` and the split says `INCOMPLETE`. Nothing here takes a process's exit code for an
+answer. Without `--split` each card transcodes the whole input, so a shortened file will still report
+as present; the `--split` check is the one that proves the pieces reconstruct.
+
+A card the tool cannot drive is named rather than quietly left out, in this shape:
 
 ```
-  spare: SKIPPED renderD134 (Tesla P40) — no VAAPI encoder this tool knows of (kernel driver: nvidia)
+  spare: SKIPPED renderD134 (…) — no VAAPI encoder this tool knows of (kernel driver: nvidia)
 ```
 
 If you use frame generation, the tool also prints the one number frame generation actually moves — and
@@ -127,7 +137,8 @@ and a box to launch your game from. It listens on your own machine only.
 
 ```
 spirit doctor        test that it really works on your machine — run this first
-spirit probe         list your cards, and how fast each can actually talk
+spirit --version     print the version and exit
+spirit probe         list your cards and how each one is actually wired (the GB/s column is an estimate)
 spirit roles         give every card a job — or say plainly why it cannot have one
 spirit play -- CMD   run a game, with your other cards working underneath
 spirit boost         what extra frames this machine can give you, right now
@@ -144,8 +155,9 @@ spirit play --scale 0.7 -- ./yourgame
 ```
 
 On a 2560x1440 screen that renders 1792x1008 — 49% of the pixels. It runs through gamescope, which you
-need installed. Handing work to the other cards cost the game about 1–2% in one title and nothing
-measurable in another.
+need installed. On the cost to your game: our own runs found a few percent at most in one title and no
+measurable difference in another, but each side of those comparisons was only two runs — enough to say
+*small or none*, not enough to quote a percentage. Measure it on your own machine.
 
 **Frame generation** invents frames between the real ones. It needs `lsfg-vk`, which needs you to own
 Lossless Scaling. If you have both, the tool drives it:
@@ -177,19 +189,25 @@ actually happened. A wall of detail beats a one-line report.
 - **Links, not specs.** `lspci` and friends report the link between a GPU and the chip it sits behind,
   not the link to the CPU. A card on a dock or a chipset slot can read `x16` while its real host link is
   `x1`. `spirit probe` reports the **minimum negotiated width along the sysfs chain**, which is the
-  truth. On the dev box: RX 9070 XT `x16 Gen5` (54.9 GB/s), Instinct MI25 `x4 Gen3` (3.19), Vega FE
-  `x1 Gen3` (0.87).
+  truth. The `GB/s` column beside it is an *estimate* — theoretical per-lane rate times width times a
+  fixed efficiency — not a measurement; treat it as a ranking, not a speed. On the dev box `probe`
+  prints: RX 9070 XT `x16 Gen5` 54.4, Instinct MI25 `x4 Gen3` 3.4, Vega FE `x1 Gen3` 0.85, integrated
+  `x16 Gen4` 26.8.
 - **Never split the frame.** A 1440p frame is 14.7 MB; at 60 fps an `x1` card needs 17 ms to move one,
   which is more than the whole frame budget. Per-pixel, per-frame work across these links is dead by
   arithmetic. Cross the wire once per job, or at frame rate — never per pixel.
 - **The pin is load-bearing.** `MESA_VK_DEVICE_SELECT=<vid:did>!` — the trailing `!` is the exclusive
   flag. Without it the loader only *reorders* and a child still sees every GPU; with it, a child sees
   exactly one. Measured: an unpinned UE5 game rendered on the docked card while the main card sat at 0%.
-- **Two walls.** The exclusive pin, plus a mount namespace that hides the other cards' `/dev/dri` nodes
-  from the game. `spirit doctor` proves both, per card, on your machine. Proton titles skip the
-  namespace, because Wine refuses to run as root.
+- **Two walls, and `doctor` tests one of them.** The exclusive pin, plus a mount namespace that hides
+  the other cards' `/dev/dri` nodes from the game. `spirit doctor` proves the **pin**, per card, on your
+  machine — it does **not** test the namespace. If your kernel or distribution denies unprivileged user
+  namespaces, that second wall is simply absent, and this build does not currently say so. Proton titles
+  skip the namespace entirely, because Wine refuses to run as root.
 - **No 2-card or 4-card assumptions.** `spirit roles` placed 9 of 10 cards on a made-up 10-card machine;
   the tenth had nowhere to plug a monitor, and the tool said so.
+- **Intel is untested here.** The code selects Intel's VAAPI driver from the card's own kernel driver,
+  but this project has only ever run on AMD hardware. Treat Intel support as written-and-unverified.
 
 </details>
 

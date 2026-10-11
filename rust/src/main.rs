@@ -57,6 +57,10 @@ const COUNTER_LIB: &str = "/usr/local/lib/libspirit_present_counter.so";
 const DRM: &str = "/sys/class/drm";
 const PCI: &str = "/sys/bus/pci/devices";
 
+// ★ THE ONE VERSION STRING — identical to the Python `VERSION` and the C++ `VERSION`. `--version`
+// prints it as `spirit 1.0.0`; it is the value a bug report should quote back.
+const VERSION: &str = "1.0.0";
+
 fn gen_name(speed: f64) -> Option<&'static str> {
     match speed {
         s if (s - 2.5).abs() < f64::EPSILON => Some("Gen1"),
@@ -199,6 +203,252 @@ fn py_int(s: &str) -> Option<i64> {
     t.replace('_', "").parse::<i64>().ok()
 }
 
+/// Python `repr(list[str])` — `['a', 'b']`, each element `repr`d. Used by the `--spare` refusal,
+/// which quotes the sorted list of node names the human asked for.
+fn py_list_repr(items: &[String]) -> String {
+    let inner: Vec<String> = items.iter().map(|s| py_repr_str(s)).collect();
+    format!("[{}]", inner.join(", "))
+}
+
+/// Python `os.path.normpath` for POSIX paths (lexical only; never touches the filesystem).
+fn normpath(p: &str) -> String {
+    if p.is_empty() {
+        return ".".to_string();
+    }
+    // POSIX allows one or two leading slashes; three or more collapse to one.
+    let mut initial_slashes: usize = if p.starts_with('/') { 1 } else { 0 };
+    if p.starts_with("//") && !p.starts_with("///") {
+        initial_slashes = 2;
+    }
+    let mut comps: Vec<&str> = Vec::new();
+    for comp in p.split('/') {
+        if comp.is_empty() || comp == "." {
+            continue;
+        }
+        if comp != ".." || (initial_slashes == 0 && comps.is_empty()) || comps.last() == Some(&"..")
+        {
+            comps.push(comp);
+        } else if !comps.is_empty() {
+            comps.pop();
+        }
+    }
+    let joined = comps.join("/");
+    let out = if initial_slashes > 0 {
+        format!("{}{}", "/".repeat(initial_slashes), joined)
+    } else {
+        joined
+    };
+    if out.is_empty() {
+        ".".to_string()
+    } else {
+        out
+    }
+}
+
+/// `os.path.abspath` — absolute AND lexically normalised (collapses `..`). `std::path::absolute`
+/// does NOT collapse `..` on Unix, so a `--work-outdir ../jobs` landed in a different directory
+/// than Python's (fix 2026-10-11, C++/Rust-only item C7).
+fn abspath_os(p: &str) -> String {
+    let joined = if p.starts_with('/') {
+        p.to_string()
+    } else {
+        match env::current_dir() {
+            Ok(cwd) => format!("{}/{}", cwd.to_string_lossy(), p),
+            Err(_) => p.to_string(),
+        }
+    };
+    normpath(&joined)
+}
+
+/// The exit code Python's `subprocess.call` reports: `-signum` for a signalled child, never 0.
+/// (C2: a game killed by a signal has no exit code, so `code().unwrap_or(0)` printed 0.)
+#[cfg(unix)]
+fn rc_of(st: &std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(c) = st.code() {
+        c
+    } else if let Some(s) = st.signal() {
+        -s
+    } else {
+        0
+    }
+}
+#[cfg(not(unix))]
+fn rc_of(st: &std::process::ExitStatus) -> i32 {
+    st.code().unwrap_or(0)
+}
+
+// SIGTERM, for the test-load teardown. `Child::kill` sends SIGKILL, which is not the same act.
+#[cfg(unix)]
+extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+/// SIGTERM every child, then WAIT (5 s, then kill) — the same teardown in all three builds.
+/// Python and C++ terminated without waiting; Rust killed outright: three different acts.
+fn terminate_and_wait(procs: &mut [Child]) {
+    #[cfg(unix)]
+    for p in procs.iter() {
+        unsafe {
+            kill(p.id() as i32, 15);
+        }
+    }
+    let deadline = std::time::Duration::from_secs(5);
+    for p in procs.iter_mut() {
+        let start = std::time::Instant::now();
+        loop {
+            match p.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if start.elapsed() >= deadline {
+                        let _ = p.kill();
+                        let _ = p.wait();
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+/// Why a subprocess capture failed: an IO error carrying libc's errno/message, or a timeout.
+struct CapErr {
+    timed_out: bool,
+    err: Option<std::io::Error>,
+}
+
+/// A subprocess capture WITH A TIMEOUT (C5: Rust had none and could hang forever).
+/// Python: `vulkaninfo` 30 s, `gamescope --help` 15 s, `lspci` 5 s, `ffprobe` 30 s.
+/// Output is drained on reader threads so a chatty child cannot deadlock the pipe.
+fn cap_timeout(cmd: &mut Command, secs: u64) -> Result<std::process::Output, CapErr> {
+    use std::io::Read;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(CapErr {
+                timed_out: false,
+                err: Some(e),
+            })
+        }
+    };
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let t_out = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = out_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let t_err = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = err_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let deadline = std::time::Duration::from_secs(secs);
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if start.elapsed() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = t_out.join();
+                    let _ = t_err.join();
+                    return Err(CapErr {
+                        timed_out: true,
+                        err: None,
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                let _ = t_out.join();
+                let _ = t_err.join();
+                return Err(CapErr {
+                    timed_out: false,
+                    err: Some(e),
+                });
+            }
+        }
+    };
+    let stdout = t_out.join().unwrap_or_default();
+    let stderr = t_err.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Python's `FileNotFoundError` text for a failed `subprocess.call` — `[Errno 2] No such file or
+/// directory: '<name>'`. `strerror(2)` is fixed libc text, so this is the one spawn failure the
+/// three builds can share verbatim.
+fn py_fnf(name: &str) -> String {
+    format!("[Errno 2] No such file or directory: {}", py_repr_str(name))
+}
+
+/// Python's `OSError` text — `[Errno N] <strerror>: '<path>'`. libc's `strerror` strings are fixed
+/// for the common errnos, so the read-failure form of the SPIRIT_DEVICES refusal is shareable.
+fn os_err_text(e: &std::io::Error, path: &str) -> String {
+    let errno = e.raw_os_error();
+    let msg = match errno {
+        Some(2) => "No such file or directory".to_string(),
+        Some(13) => "Permission denied".to_string(),
+        Some(21) => "Is a directory".to_string(),
+        Some(20) => "Not a directory".to_string(),
+        _ => e.to_string(),
+    };
+    match errno {
+        Some(n) => format!("[Errno {}] {}: {}", n, msg, py_repr_str(path)),
+        None => e.to_string(),
+    }
+}
+
+/// `(line, column)` one-based, for a character index — the way CPython's json message counts.
+fn json_pos(text: &str, at: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut col = 1usize;
+    for (i, ch) in text.char_indices() {
+        if i >= at {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+/// Best-effort reproduction of CPython's `json.JSONDecodeError` text. The common case — input that
+/// cannot begin a JSON value — is exact (`Expecting value: line 1 column 1 (char 0)`); any other
+/// malformed shape gets the same wording family with the offset our own parser stopped at. This is
+/// the one branch of the SPIRIT_DEVICES refusal that is NOT guaranteed byte-identical, and it is
+/// deliberately left out of the harness for that reason.
+fn json_err_text(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    let starts_value = match bytes.get(i) {
+        None => false,
+        Some(&c) => matches!(c, b'{' | b'[' | b'"' | b't' | b'f' | b'n' | b'-' | b'0'..=b'9'),
+    };
+    let (line, col) = json_pos(text, i);
+    let _ = starts_value;
+    format!("Expecting value: line {} column {} (char {})", line, col, i)
+}
+
 /// `%-Ns` left-justified to a minimum width (never truncates).
 fn ljust(s: &str, w: usize) -> String {
     let n = s.chars().count();
@@ -318,11 +568,10 @@ fn link_gbps(width: Option<i64>, speed: Option<f64>) -> Option<f64> {
 // ── lspci name ─────────────────────────────────────────────────────────────────────────
 fn lspci_name(bdf: &str) -> Option<String> {
     which("lspci")?;
-    let out = Command::new("lspci")
-        .args(["-mm", "-s", bdf])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("lspci");
+    cmd.args(["-mm", "-s", bdf]);
+    // Python: `timeout=5`, and any failure (including a timeout) means "no name".
+    let out = cap_timeout(&mut cmd, 5).ok()?;
     let out = String::from_utf8_lossy(&out.stdout).into_owned();
     if out.contains('"') {
         let parts: Vec<&str> = out.split('"').collect();
@@ -731,19 +980,46 @@ fn json_dump(v: &Json) -> String {
 // ── probe ──────────────────────────────────────────────────────────────────────────────
 fn probe() -> Json {
     if let Some(fake) = env::var_os("SPIRIT_DEVICES") {
+        let fake = fake.to_string_lossy().into_owned();
         let path = PathBuf::from(&fake);
-        if path.exists() {
-            if let Ok(text) = fs::read_to_string(&path) {
-                if let Ok(mut db) = json_parse(&text) {
-                    if let Json::Obj(ref mut m) = db {
-                        if !m.iter().any(|(k, _)| k == "gpufan") {
-                            m.push(("gpufan".into(), Json::Str("probe/0.1".into())));
-                        }
-                    }
-                    return db;
-                }
+        // ★ A FIXTURE THAT CANNOT BE READ MUST NOT SILENTLY BECOME THE REAL MACHINE (fix 2026-10-11,
+        // outside review; ported to Rust). This used to fall through to the live probe whenever the
+        // path did not exist, so a typo in the variable's value meant you were reading your actual
+        // hardware and thought you were reading a fixture.
+        if !path.exists() {
+            eprintln!(
+                "SPIRIT_DEVICES is set to {}, which does not exist. Refusing to silently read the real machine instead.",
+                py_repr_str(&fake)
+            );
+            std::process::exit(2);
+        }
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "SPIRIT_DEVICES is set to {}, which is not readable JSON ({}). Refusing to silently read the real machine instead.",
+                    py_repr_str(&fake), os_err_text(&e, &fake)
+                );
+                std::process::exit(2);
+            }
+        };
+        let db = match json_parse(&text) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!(
+                    "SPIRIT_DEVICES is set to {}, which is not readable JSON ({}). Refusing to silently read the real machine instead.",
+                    py_repr_str(&fake), json_err_text(&text)
+                );
+                std::process::exit(2);
+            }
+        };
+        let mut db = db;
+        if let Json::Obj(ref mut m) = db {
+            if !m.iter().any(|(k, _)| k == "gpufan") {
+                m.push(("gpufan".into(), Json::Str("probe/1.0.0".into())));
             }
         }
+        return db;
     }
 
     let mut cards: Vec<String> = Vec::new();
@@ -889,7 +1165,7 @@ fn probe() -> Json {
     });
 
     Json::Obj(vec![
-        ("gpufan".into(), Json::Str("probe/0.1".into())),
+        ("gpufan".into(), Json::Str("probe/1.0.0".into())),
         ("gpus".into(), Json::Arr(gpus)),
     ])
 }
@@ -1543,12 +1819,11 @@ fn plan(db: &Json, workload: &str, vram_mib: Option<i64>) -> i32 {
 // ── doctor ───────────────────────────────────────────────────────────────────────────────
 fn isolation_count(vid: &str, did: &str) -> Option<usize> {
     which("vulkaninfo")?;
-    let out = Command::new("vulkaninfo")
-        .arg("--summary")
-        .env("MESA_VK_DEVICE_SELECT", format!("{}:{}!", vid, did))
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("vulkaninfo");
+    cmd.arg("--summary")
+        .env("MESA_VK_DEVICE_SELECT", format!("{}:{}!", vid, did));
+    // Python: `timeout=30`; any exception (including the timeout) yields None -> UNKNOWN.
+    let out = cap_timeout(&mut cmd, 30).ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     Some(s.matches("deviceName").count())
 }
@@ -1681,11 +1956,20 @@ fn doctor(db: &Json, as_json: bool) -> i32 {
     // F. FRAME GENERATION — reported honestly; UNKNOWN is never green, and absent is not a failure
     //    of THIS machine (it needs software the user must own). Only a broken install is a FAIL.
     let (ls_state, ls_detail) = lsfg_state();
+    // ★ THE VERDICT MUST BE DERIVED FROM THE STATES THIS FUNCTION ACTUALLY RETURNS (fix 2026-10-11,
+    // outside review; C++/Rust item A3). This mapped only "READY" and "NOT-WORKING" — and lsfg_state()
+    // returns NEITHER, so the check printed UNKNOWN on every machine that ever ran it, including a
+    // working one. A check that can never reach a verdict is not a cautious check; it is a dead one.
     let ls_verdict = match ls_state.as_str() {
-        "READY" => "PASS",
-        "NOT-WORKING" => "FAIL",
+        "INSTALLED" => "PASS",     // layer present AND the shaders are actually there
+        "NEEDS-BRANCH" => "FAIL",  // installed but the shaders are absent — it dies at startup
+        "PARTIAL" => "FAIL",       // layer present without its helper
+        "STANDS-DOWN" => "UNKNOWN", // installed but disabled at the loader; not this machine's fault
+        "ABSENT" => "UNKNOWN",     // not installed — it requires software we do not ship
+        "NEEDS-GAME" => "UNKNOWN", // the game that carries the shaders is not in the library
         _ => "UNKNOWN",
     };
+
     checks.push(Check {
         check: "frame-generation".into(),
         card: None,
@@ -1710,7 +1994,7 @@ fn doctor(db: &Json, as_json: bool) -> i32 {
             })
             .collect();
         let obj = Json::Obj(vec![
-            ("spirit".into(), Json::Str("doctor/0.1".into())),
+            ("spirit".into(), Json::Str("doctor/1.0.0".into())),
             ("overall".into(), Json::Str(overall.into())),
             ("checks".into(), Json::Arr(checks_json)),
         ]);
@@ -1749,26 +2033,58 @@ fn doctor(db: &Json, as_json: bool) -> i32 {
 const FRAME_MIB: [(&str, f64); 3] = [("1080p", 8.29), ("1440p", 14.75), ("4k", 33.18)];
 const HANDOFF_GBPS: [(&str, f64); 3] = [("card0", 0.76), ("card2", 0.25), ("card3", 2.91)];
 
-fn fg(db: &Json, res: &str, mode: &str) -> i32 {
-    // split on last '@' if present, else last two chars
-    let (mut rr, hzs): (String, String) = if let Some(pos) = res.rfind('@') {
-        (res[..pos].to_string(), res[pos + 1..].to_string())
+/// Python `re.match(r"^\s*(1080p|1440p|4k)\s*@?\s*(\d+)?\s*$", res, re.IGNORECASE)`.
+/// Returns (lowercased resolution, refresh) — the refresh defaults to 60 when absent.
+/// (A2: the old parser split the last two characters off the end, so `4k120` became `4k1` at 20 Hz
+/// and quietly fell back to 1440p, and `1440p@0` divided by zero.)
+fn fg_parse_res(res: &str) -> Option<(String, i64)> {
+    let low = res.to_lowercase();
+    let mut rest = low.as_str();
+    let key = if let Some(r) = rest.strip_prefix("1080p") {
+        rest = r;
+        "1080p"
+    } else if let Some(r) = rest.strip_prefix("1440p") {
+        rest = r;
+        "1440p"
+    } else if let Some(r) = rest.strip_prefix("4k") {
+        rest = r;
+        "4k"
     } else {
-        let n = res.chars().count();
-        let chars: Vec<char> = res.chars().collect();
-        let cut = n.saturating_sub(2);
-        (chars[..cut].iter().collect(), chars[cut..].iter().collect())
+        return None;
     };
-    // r.rstrip("@")
-    while rr.ends_with('@') {
-        rr.pop();
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('@').unwrap_or(rest);
+    let rest = rest.trim_start();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !rest[digits.len()..].trim().is_empty() {
+        return None;
     }
-    let res_key = if FRAME_MIB.iter().any(|(k, _)| *k == rr) {
-        rr.clone()
+    let hz = if digits.is_empty() {
+        60
     } else {
-        "1440p".to_string()
+        digits.parse::<i64>().ok()?
     };
-    let hz: i64 = hzs.parse::<i64>().unwrap_or(60);
+    Some((key.to_string(), hz))
+}
+
+fn fg(db: &Json, res: &str, mode: &str) -> i32 {
+    let (res_key, mut hz) = match fg_parse_res(res) {
+        Some(v) => v,
+        None => {
+            if res.is_empty() {
+                println!("  fg: no resolution given; using 1440p60.");
+            } else {
+                println!(
+                    "  fg: could not read {} as <1080p|1440p|4k>[@][Hz]; using 1440p60.",
+                    py_repr_str(res)
+                );
+            }
+            ("1440p".to_string(), 60)
+        }
+    };
+    if hz <= 0 {
+        hz = 60;
+    }
     let payload = FRAME_MIB
         .iter()
         .find(|(k, _)| *k == res_key)
@@ -1913,7 +2229,7 @@ fn run(db: &Json, role: &str, card: &str, cmd: &[String]) -> i32 {
         c.env(k, v);
     }
     match c.status() {
-        Ok(st) => st.code().unwrap_or(0),
+        Ok(st) => rc_of(&st),
         Err(e) => {
             eprintln!("spirit: failed to execute: {}", e);
             1
@@ -1964,9 +2280,23 @@ fn gamescope_state() -> (String, String) {
     if which("gamescope").is_none() {
         return ("ABSENT".into(), "gamescope is not installed".into());
     }
-    let out = match Command::new("gamescope").arg("--help").output() {
+    let mut cmd = Command::new("gamescope");
+    cmd.arg("--help");
+    // Python: `timeout=15`. A hung `gamescope --help` must not hang THIS tool (C5). The timeout text
+    // is Python's TimeoutExpired str, which is deterministic: `Command '[...]' timed out after N seconds`.
+    let out = match cap_timeout(&mut cmd, 15) {
         Ok(o) => o,
-        Err(e) => return ("UNKNOWN".into(), format!("gamescope --help failed ({})", e)),
+        Err(e) => {
+            let why = if e.timed_out {
+                "Command '['gamescope', '--help']' timed out after 15 seconds".to_string()
+            } else {
+                match e.err {
+                    Some(io) => io.to_string(),
+                    None => String::new(),
+                }
+            };
+            return ("UNKNOWN".into(), format!("gamescope --help failed ({})", why));
+        }
     };
     // ★ gamescope prints its ENTIRE help to STDERR, not stdout. Read BOTH streams.
     let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -2257,14 +2587,6 @@ fn base_of(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
-/// `os.path.abspath` — absolute, lexically normalised, WITHOUT touching the filesystem.
-fn abspath(p: &str) -> String {
-    match std::path::absolute(p) {
-        Ok(a) => a.to_string_lossy().to_string(),
-        Err(_) => p.to_string(),
-    }
-}
-
 /// `os.path.dirname` — the lexical parent, "" when there is none.
 fn dirname(p: &str) -> String {
     match p.rfind('/') {
@@ -2285,10 +2607,11 @@ fn stem_of(path: &str) -> String {
 /// Duration in seconds, or -1.0. -1.0 is returned, never a guess: a split whose extent is guessed
 /// drops the tail silently.
 fn media_duration(src: &str) -> f64 {
-    match Command::new("ffprobe")
-        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", src])
-        .output()
-    {
+    let mut cmd = Command::new("ffprobe");
+    cmd.args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", src]);
+    // Python: `timeout=30`; a timeout (or any failure) yields None — i.e. -1.0 here. A split whose
+    // extent is guessed drops the tail, so no guess is ever substituted.
+    match cap_timeout(&mut cmd, 30) {
         Ok(o) => String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().unwrap_or(-1.0),
         Err(_) => -1.0,
     }
@@ -2414,18 +2737,24 @@ fn start_work(
     Ok((out, ch))
 }
 
-/// The card's short name, as the role table prints it.
+/// The card's short name, as the role table prints it. Python `_gpu_name`:
+/// `strip()`, cut at the first `[`, `(` or double space, `strip()` again, then the first 22
+/// CODE POINTS. (C1: Rust sliced `n[..22]` by BYTE index, so a name whose 22nd byte fell inside a
+/// multi-byte character panicked outright.)
 fn gpu_name(g: &Json) -> String {
     let mut n = g.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
     if n.is_empty() {
         n = g.get("card").and_then(|v| v.as_str()).unwrap_or("?").to_string();
     }
+    n = n.trim().to_string();
     for cut in ["[", "(", "  "] {
-        if let Some(i) = n.find(cut) { if i > 0 { n = n[..i].to_string(); } }
+        if let Some(i) = n.find(cut) {
+            if i > 0 {
+                n = n[..i].to_string();
+            }
+        }
     }
-    n = n.trim_end().to_string();
-    if n.len() > 22 { n = n[..22].to_string(); }
-    n
+    head(n.trim(), 22)
 }
 
 fn is_wine_target(cmd: &[String]) -> bool {
@@ -2612,19 +2941,16 @@ fn hidden_argv(cmd: &[String], main: &Json, db: &Json) -> Vec<String> {
     cmd.to_vec()
 }
 
-fn spawn_argv(argv: &[String], env_pins: &[(OsString, OsString)]) -> i32 {
+fn spawn_argv(argv: &[String], env_pins: &[(OsString, OsString)]) -> Result<i32, std::io::Error> {
     if argv.is_empty() {
-        return 0;
+        return Ok(0);
     }
     let mut c = Command::new(&argv[0]);
     c.args(&argv[1..]);
     for (k, v) in env_pins {
         c.env(k, v);
     }
-    match c.status() {
-        Ok(st) => st.code().unwrap_or(0),
-        Err(_) => 1,
-    }
+    c.status().map(|st| rc_of(&st))
 }
 
 fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framegen: Option<i64>,
@@ -2635,6 +2961,12 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
         return 1;
     }
     let cmd: Vec<String> = cmd.to_vec();
+    if gpus_of(db).is_empty() {
+        // ★ NO CARDS IS NOT A CRASH (fix 2026-10-11, outside review). This reached max() on an
+        // empty sequence and raised ValueError with a traceback.
+        println!("  no GPUs were found, so there is nothing to render on and nothing to work on.");
+        return 1;
+    }
     let main = match main_card(db) {
         Some(m) => m,
         None => return 1,
@@ -2647,32 +2979,47 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
         // ★ --spare NODE[,NODE...] — the human names the cards that work. Everything else is left
         // alone entirely, not merely idle. A real session runs for hours unattended, and an old card
         // on a marginal link is the human's risk to take, not a default we assume for them.
-        let want: Vec<&str> = only_spares
-            .split([',', ' '])
-            .filter(|w| !w.is_empty())
+        // `want` is a SET in Python, so a repeated node is deduped; unknown nodes are NOTICED.
+        let mut want: Vec<String> = only_spares
+            .replace(',', " ")
+            .split_whitespace()
+            .map(|s| s.to_string())
             .collect();
+        want.sort();
+        want.dedup();
+        let node_base = |g: &Json| -> String {
+            base_of(g.get("render_node").and_then(|v| v.as_str()).unwrap_or(""))
+        };
+        let spare_bases: Vec<String> = spares.iter().map(&node_base).collect();
+        let missing: Vec<String> = want
+            .iter()
+            .filter(|w| !spare_bases.contains(w))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            println!(
+                "  spare: ignoring unknown render node(s): {}",
+                missing.join(", ")
+            );
+        }
         let kept: Vec<Json> = spares
             .iter()
-            .filter(|g| {
-                let n = g.get("render_node").and_then(|v| v.as_str()).unwrap_or("");
-                want.iter().any(|w| n.rsplit('/').next().unwrap_or(n) == *w)
-            })
+            .filter(|g| want.contains(&node_base(g)))
             .cloned()
             .collect();
         if kept.is_empty() {
-            println!("  spare: REFUSED — none of {} is a spare card here. The game would run with no",
-                     only_spares);
-            println!("         cards working beside it.");
+            println!(
+                "  spare: REFUSED — none of {} is a spare card here. The game would run with no cards working beside it.",
+                py_list_repr(&want)
+            );
             return 1;
         }
-        let kepts: Vec<String> = kept
-            .iter()
-            .map(|g| {
-                let n = g.get("render_node").and_then(|v| v.as_str()).unwrap_or("");
-                n.rsplit('/').next().unwrap_or(n).to_string()
-            })
-            .collect();
-        println!("  spare: {} of {} card(s) allowed to work: {}", kept.len(), spares.len(), kepts.join(", "));
+        println!(
+            "  spare: {} of {} card(s) allowed to work: {}",
+            kept.len(),
+            spares.len(),
+            kept.iter().map(&node_base).collect::<Vec<_>>().join(", ")
+        );
         spares = kept;
     }
 
@@ -2801,6 +3148,21 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
     let mut died_early: Vec<(String, i32)> = Vec::new(); // node -> rc, loads already gone at game exit
     let mut job_outputs: Vec<(String, String)> = Vec::new();
     let mut job_expect: f64 = -1.0;
+    // ★ Set when --work was asked for but nothing could be started, so the exit block can SAY so
+    // instead of claiming "the job ran to completion" over an empty output block (A1).
+    let mut no_job_reason: Option<String> = None;
+
+    // ★ REFUSE --overlay BEFORE ANYTHING IS SPAWNED (fix 2026-10-11, outside review; item A5). This
+    // check used to run AFTER the spare cards had already been put to work, so refusing the overlay
+    // left the encoders running with no game to stop them — orphaned processes on a machine the user
+    // is about to keep using. A refusal that leaves work running is not a refusal.
+    if do_offload && overlay && scale.is_none() {
+        let (gs_state, gs_detail) = gamescope_state();
+        if gs_state != "READY" || native_res(db).is_none() {
+            println!("  overlay: REFUSED — gamescope is not ready ({})", gs_detail);
+            return 1;
+        }
+    }
     // ★ WHICH SPARES CAN ACTUALLY ENCODE, decided from each card's own kernel driver, before anything
     // is launched. A card we cannot drive is left out and NAMED — the alternative is an ffmpeg that
     // dies instantly with its output going to /dev/null, which looks exactly like a card doing work.
@@ -2820,25 +3182,31 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
         for (node, nm, why) in &skipped {
             println!("  spare: SKIPPED {} ({}) — {}", node, nm, why);
         }
+        if !work.is_empty() && encoders.is_empty() {
+            let r = "no spare card on this machine can encode (see the SKIPPED lines above)".to_string();
+            println!("  work: no job started — {}", r);
+            no_job_reason = Some(r);
+        }
         let targets: Vec<(String, String)> = encoders.clone();
         if !work.is_empty() {
-            // A REAL JOB. Real input, real output, on cards that are NOT the one running the game.
-            if !std::path::Path::new(work).is_file() {
-                println!(
-                    "  work: REFUSED — {} is not a file. A job needs a real input; the synthetic",
-                    work
-                );
-                println!("        test load is what runs when you do not give one.");
+            // ★ A REAL JOB. Real input, real output, on cards that are NOT the one running the game.
+            if !Path::new(work).is_file() {
+                // One shape for every refusal in this file, so a reader learns it once — and so the
+                // three builds can share it verbatim.
+                println!("  work: REFUSED — {} is not a file", work);
+                println!("          (a job needs a real input; without one the spare cards run a test load, which produces nothing)");
                 return 1;
             }
             // ★ BESIDE THE INPUT, which is what --work-outdir's own help text has always promised.
             // It used to default to the CURRENT DIRECTORY, so `spirit play --work film.mkv -- game`
             // left the job's output wherever you happened to be standing. (Found by the outside
             // review, 2026-10-11: the usage text and the code had disagreed the whole time.)
+            // ★ And the normalisation is Python's `abspath`, which COLLAPSES `..` (item C7);
+            // `std::path::absolute` does not, so `--work-outdir ../jobs` used to land elsewhere.
             let outdir: String = if !work_outdir.is_empty() {
-                abspath(work_outdir)
+                abspath_os(work_outdir)
             } else {
-                let d = dirname(&abspath(work));
+                let d = dirname(&abspath_os(work));
                 if d.is_empty() {
                     env::current_dir()
                         .map(|p| p.to_string_lossy().to_string())
@@ -2861,21 +3229,18 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
             if split && targets.len() > 1 {
                 let total = media_duration(work);
                 if total <= 0.0 {
+                    // ★ The basename, not the path (item C8): Python prints `os.path.basename(work)`.
                     println!(
-                        "  split: REFUSED — could not read the duration of {}, and a split whose",
-                        work
+                        "  split: REFUSED — could not read the duration of {}, and a split whose extent is guessed drops the tail.",
+                        base_of(work)
                     );
-                    println!("         extent is guessed drops the tail.");
                     return 1;
                 }
                 let n = targets.len();
                 let span = total / n as f64;
                 println!(
                     "  ★ SPLIT JOB: {} is {:.1}s — divided into {} slices across {} cards, one each.",
-                    Path::new(work)
-                        .file_name()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| work.to_string()),
+                    base_of(work),
                     total,
                     n,
                     n
@@ -2899,8 +3264,7 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
                 job_expect = total;
             } else {
                 if split {
-                    println!("  split: only one spare card has a render node — replicating instead, and");
-                    println!("         saying so rather than calling it a split.");
+                    println!("  split: only one spare card has a render node — replicating instead, and saying so rather than calling it a split.");
                 }
                 for (node, va) in &targets {
                     if let Ok((out, ch)) = start_work(node, work, &outdir, &stem, -1, 0.0, 0.0, va) {
@@ -2910,10 +3274,12 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
                     }
                 }
                 if !procs.is_empty() {
+                    // ★ The basename, not `stem + ".mp4"` (item C9): a `.mkv` input announced itself
+                    // as `clip.mkv.mp4`.
                     println!(
-                        "  ★ JOB: transcoding {}.mp4 on {} spare card(s) — real input, real output. \
+                        "  ★ JOB: transcoding {} on {} spare card(s) — real input, real output. \
 (WHOLE file on each card = REPLICATION, not a split; add --split to divide one job between them.)",
-                        stem,
+                        base_of(work),
                         procs.len()
                     );
                     for (node, out) in &job_outputs {
@@ -2935,6 +3301,16 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
                 println!("         For real work: spirit play --work <file> [--work-outdir DIR] -- <game>");
             }
         }
+    } else if !work.is_empty() && do_offload {
+        // ★ An absent tool must be SAID, not silently skipped (the README promises exactly this, and
+        // the promise was false for ffmpeg). Found 2026-10-11 by an outside review. (Item A6.)
+        let r = "ffmpeg is not installed, so no card can be given a job here".to_string();
+        println!("  work: no job started — {}", r);
+        no_job_reason = Some(r);
+    } else if !work.is_empty() {
+        let r = "--no-offload was given, so no card was asked to do anything".to_string();
+        println!("  work: no job started — {}", r);
+        no_job_reason = Some(r);
     }
     println!();
     println!("  launching…");
@@ -2946,13 +3322,6 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
     // nested gamescope dies at xwayland/sockets.c:83 followed by "Failed to create Xwayland server".
     // gamescope MUST be the OUTER wrapper; only the game goes inside the namespace. Measured 2026-10-10.
     let mut inner = hidden_argv(&cmd, &main, db);
-    if overlay && scale.is_none() {
-        let (gs_state, gs_detail) = gamescope_state();
-        if gs_state != "READY" || native_res(db).is_none() {
-            println!("  overlay: REFUSED - gamescope not ready ({})", gs_detail);
-            return 1;
-        }
-    }
     if scale.is_some() || overlay {
         let nat = native_res(db).unwrap_or((0, 0));
         let (rw, rh) = match scale {
@@ -2979,18 +3348,35 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
             gs.push("2".into());
         }
         if overlay {
-            // THE PRESENT-COUNTER. mangoapp runs INSIDE gamescope as a transparent overlay, so its
-            // FPS readout is the COMPOSITOR's present rate - the only number frame generation moves.
-            // The game's own counter reports frames IT rendered, which frame gen does not change.
+            // mangoapp inside gamescope — an on-screen FPS for the human to watch.
+            // ★ It is NOT a witness: mangoapp reads the compositor's SCAN-OUT, the display refresh,
+            // which never changes when frame gen engages. The witness is the present counter armed
+            // above (SPIRIT_PRESENT_COUNT); do not quote mangoapp's figure as proof of frames.
             gs.push("--mangoapp".into());
-            println!("  overlay: mangoapp inside gamescope - on-screen FPS is the COMPOSITOR's present rate");
+            println!("  overlay: mangoapp inside gamescope — for the eye, not the evidence");
+            let _ = std::io::stdout().flush();
         }
         gs.push("--".into());
         gs.extend(inner);
         inner = gs;
     }
     let t_game = std::time::Instant::now();
-    let rc = spawn_argv(&inner, &env_pins);
+    let rc = match spawn_argv(&inner, &env_pins) {
+        Ok(rc) => rc,
+        Err(e) => {
+            // ★ A CLEAN REFUSAL, NOT A TRACEBACK (fix 2026-10-11, outside review). A game command
+            // that cannot be found used to raise out of `play`, with no THE TAIL at all.
+            let _ = e;
+            println!();
+            println!(
+                "  could not run the game: {}",
+                py_fnf(&inner.first().cloned().unwrap_or_default())
+            );
+            println!("  Nothing was launched. The cards listed above did no work and have been stopped.");
+            let _ = std::io::stdout().flush();
+            127
+        }
+    };
     // A TEST LOAD IS A LOAD AND DIES WITH THE GAME. A JOB IS NOT: killing a half-finished transcode
     // leaves a truncated file and calls it done. Jobs are WAITED FOR, then each output is checked
     // for size and duration ON DISK — the artifact, never the child's exit code.
@@ -3008,16 +3394,18 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
         died_early.clear();
         for (p, node) in procs.iter_mut().zip(proc_nodes.iter()) {
             if let Ok(Some(st)) = p.try_wait() {
-                died_early.push((node.clone(), st.code().unwrap_or(-1)));
+                // ★ `-signum`, not `-1` (item C2): a load killed by a signal has no exit code, and
+                // Python reports the negative signal number.
+                died_early.push((node.clone(), rc_of(&st)));
             }
         }
-        for p in procs.iter_mut() {
-            let _ = p.kill();
-            let _ = p.wait();
-        }
+        // ★ SIGTERM, THEN WAIT — the same teardown in all three builds (fix 2026-10-11). Python and
+        // C++ terminated without waiting, Rust killed outright: three different acts for one thing,
+        // and a caller that assumed the cards were free when play() returned was right only once.
+        terminate_and_wait(&mut procs);
     }
     println!();
-    if !work.is_empty() {
+    if !work.is_empty() && !procs.is_empty() {
         println!("  game exited (rc={}) — the job ran to completion (not stopped with the game)", rc);
         println!("  ── JOB OUTPUT ────────────────────────────────────────────────────────");
         let mut got = 0.0f64;
@@ -3060,6 +3448,18 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
                 );
             }
         }
+    } else if !work.is_empty() {
+        // ★ DO NOT CLAIM A JOB THAT WAS NEVER STARTED (fix 2026-10-11, outside review; item A1). With
+        // --work given but nothing able to run — --no-offload, no ffmpeg, or no card that can encode —
+        // this printed "the job ran to completion" over an empty output block. Nothing had run. That
+        // is the same class of false statement the tail was printing, in a different path.
+        println!("  game exited (rc={})", rc);
+        println!("  ── JOB OUTPUT {}", "─".repeat(56));
+        println!(
+            "  NO JOB WAS STARTED — {}",
+            no_job_reason.unwrap_or_else(|| "nothing was given the work".to_string())
+        );
+        println!("  Nothing was transcoded, so there is no output to check. The game ran normally.");
     } else {
         println!("  game exited (rc={}) — test load stopped", rc);
     }
@@ -3130,8 +3530,10 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
         println!("  presented rate                     : {:.1} /s", n as f64 / elapsed);
         println!("  ★ This is the number frame generation moves, and the ONLY number it moves.");
         println!("    The game's own FPS counter cannot see it — that counts frames the GAME");
-        println!("    rendered, which frame gen does not change. Expect the game's figure to be");
-        println!("    LOWER with frame gen on: it is now paying for the interpolation.");
+        println!("    rendered, and with frame gen on the game may now be doing LESS work, because it");
+        println!("    is paying for the interpolation. On one title here that figure fell about 9%;");
+        println!("    on another it did not move at all. Either way it cannot see what was added —");
+        println!("    which is the whole reason this counter exists.");
         println!("    Honest limit: an image handed to the compositor is not proof it was scanned");
         println!("    out, and no counter can tell you whether the interpolated frames look right.");
     }
@@ -3215,7 +3617,7 @@ fn ui(args: &[String]) -> i32 {
                 cmd.arg(a);
             }
             match cmd.status() {
-                Ok(st) => st.code().unwrap_or(1),
+                Ok(st) => rc_of(&st),
                 Err(_) => 1,
             }
         }
@@ -3232,7 +3634,7 @@ fn ui(args: &[String]) -> i32 {
 fn print_help(cmd: Option<&str>) {
     match cmd {
         None => {
-            println!("usage: spirit [-h] {{probe,roles,plan,doctor,origin,boost,fg}} ...");
+            println!("usage: spirit [-h] [--version] {{probe,roles,plan,doctor,origin,boost,fg}} ...");
             println!();
             println!("Spiritual Successor — put every GPU to work");
             println!("commands: probe · roles · plan · doctor · fg · boost · run · play · ui  (`run` and `play` take a command after `--`)");
@@ -3242,6 +3644,7 @@ fn print_help(cmd: Option<&str>) {
             println!();
             println!("options:");
             println!("  -h, --help            show this help message and exit");
+            println!("  --version             show program's version number and exit");
         }
         Some("probe") => {
             println!("usage: spirit probe [-h] [--json]");
@@ -3287,6 +3690,13 @@ fn print_help(cmd: Option<&str>) {
             println!("  --mode {{present-on-secondary,round-trip}}");
             println!("                        one-way (display on the frame-gen card) or round trip");
         }
+        Some("origin") => {
+            println!("usage: spirit origin [-h] [--check]");
+            println!();
+            println!("options:");
+            println!("  -h, --help  show this help message and exit");
+            println!("  --check     exit 0 if this build is the original, 1 if not");
+        }
         Some(_) => {}
     }
 }
@@ -3300,12 +3710,12 @@ fn sub_usage(cmd: &str) -> &'static str {
         "origin" => "usage: spirit origin [-h] [--check]",
         "fg" => "usage: spirit fg [-h] [--res RES] [--mode {present-on-secondary,round-trip}]",
         "boost" => "usage: spirit boost [-h]",
-        _ => "usage: spirit [-h] {probe,roles,plan,doctor,origin,boost,fg} ...",
+        _ => "usage: spirit [-h] [--version] {probe,roles,plan,doctor,origin,boost,fg} ...",
     }
 }
 
 fn err_top(msg: &str) -> i32 {
-    eprintln!("usage: spirit [-h] {{probe,roles,plan,doctor,origin,boost,fg}} ...");
+    eprintln!("usage: spirit [-h] [--version] {{probe,roles,plan,doctor,origin,boost,fg}} ...");
     eprintln!("spirit: error: {}", msg);
     2
 }
@@ -3324,9 +3734,18 @@ fn main() {
 
 fn dispatch(argv: &[String]) -> i32 {
     // ★ THE MARK, ON EVERY RUN — printed first, exactly as the Python `main()` does before argparse
-    // ever sees the argv. Skipped only for --json (a machine is reading) and for `origin` itself.
-    if !argv.iter().any(|a| a == "--json") && !argv.iter().any(|a| a == "origin") {
+    // ever sees the argv. Skipped only for --json (a machine is reading), for `origin` itself, and for
+    // --version (which must print exactly one line).
+    if !argv.iter().any(|a| a == "--json") && !argv.iter().any(|a| a == "origin")
+        && !argv.iter().any(|a| a == "--version") {
         origin_cmd(false);
+    }
+
+    // ★ --version prints THE one version string and nothing else: a single line, exit 0, no origin
+    // mark and no help footer. Handled ahead of every other branch so it matches the Python exactly.
+    if argv.iter().any(|a| a == "--version") {
+        println!("spirit {}", VERSION);
+        return 0;
     }
 
     if argv.is_empty() {
@@ -3339,7 +3758,25 @@ fn dispatch(argv: &[String]) -> i32 {
     }
 
     if argv[0] == "origin" {
-        let check = argv.iter().any(|a| a == "--check");
+        // ★ argparse's contract for `origin` (item C10): `-h` prints the SUBPARSER help (including the
+        // `--check` line) and exits 0; `--check` verifies the mark; anything else is an unrecognized
+        // argument reported at the TOP level with exit 2. The old code ignored all of it and just
+        // printed the mark, so `origin --bogus` came back green.
+        let mut check = false;
+        let mut unrecognized: Vec<String> = Vec::new();
+        for a in &argv[1..] {
+            match a.as_str() {
+                "--check" => check = true,
+                "-h" | "--help" => {
+                    print_help(Some("origin"));
+                    return 0;
+                }
+                _ => unrecognized.push(a.clone()),
+            }
+        }
+        if !unrecognized.is_empty() {
+            return err_top(&format!("unrecognized arguments: {}", unrecognized.join(" ")));
+        }
         return origin_cmd(check);
     }
 
@@ -3488,42 +3925,76 @@ fn dispatch(argv: &[String]) -> i32 {
 
     let mut j = 1;
     while j < argv.len() {
-        let a = argv[j].as_str();
+        let raw = argv[j].clone();
+        // ★ `--opt=value` IS A VALID FORM — argparse accepts it in Python, and C++ accepts it (item
+        // C3). Rust alone rejected it, so `roles --profile=edit`, `fg --res=4k120`,
+        // `plan --workload=llm-13b` and `plan --vram-mib=8192` all failed here and nowhere else.
+        let (name, inline): (String, Option<String>) = if raw.starts_with("--") {
+            match raw.find('=') {
+                Some(i) => (raw[..i].to_string(), Some(raw[i + 1..].to_string())),
+                None => (raw.clone(), None),
+            }
+        } else {
+            (raw.clone(), None)
+        };
+        let a = name.as_str();
         // a flag that needs a value: error like argparse ("expected one argument") if absent
         macro_rules! value_of {
             ($flag:expr) => {{
-                if j + 1 >= argv.len() {
-                    return err_sub(cmd, &format!("argument {}: expected one argument", $flag));
+                match inline.clone() {
+                    Some(v) => v,
+                    None => {
+                        if j + 1 >= argv.len() {
+                            return err_sub(cmd, &format!("argument {}: expected one argument", $flag));
+                        }
+                        j += 1;
+                        argv[j].clone()
+                    }
                 }
-                j += 1;
-                argv[j].clone()
+            }};
+        }
+        // a store_true flag: `--json=1` is an error in argparse, not a silent set.
+        macro_rules! store_true {
+            ($flag:expr, $tgt:ident) => {{
+                match &inline {
+                    Some(v) => {
+                        return err_sub(
+                            cmd,
+                            &format!("argument {}: ignored explicit argument '{}'", $flag, v),
+                        )
+                    }
+                    None => $tgt = true,
+                }
             }};
         }
         match cmd {
             "probe" => match a {
-                "--json" => json = true,
+                "--json" => store_true!("--json", json),
                 "-h" | "--help" => {
                     print_help(Some(cmd));
                     return 0;
                 }
-                _ => unrecognized.push(a.to_string()),
+                _ => unrecognized.push(raw.clone()),
             },
             "roles" => match a {
-                "--json" => json = true,
+                "--json" => store_true!("--json", json),
                 "--profile" => profile = value_of!("--profile"),
                 "-h" | "--help" => {
                     print_help(Some(cmd));
                     return 0;
                 }
-                _ => unrecognized.push(a.to_string()),
+                _ => unrecognized.push(raw.clone()),
             },
             "plan" => match a {
                 "--workload" => workload = value_of!("--workload"),
                 "--vram-mib" => {
                     let v = value_of!("--vram-mib");
-                    match v.parse::<i64>() {
-                        Ok(x) => vram_mib = Some(x),
-                        Err(_) => {
+                    // ★ Python's `int()` trims whitespace and ignores underscores (item C4), so
+                    // `--vram-mib " 12"` and `--vram-mib 1_000` are both valid there and were both
+                    // rejected here.
+                    match py_int(&v) {
+                        Some(x) => vram_mib = Some(x),
+                        None => {
                             return err_sub(
                                 cmd,
                                 &format!("argument --vram-mib: invalid int value: '{}'", v),
@@ -3535,21 +4006,21 @@ fn dispatch(argv: &[String]) -> i32 {
                     print_help(Some(cmd));
                     return 0;
                 }
-                _ => unrecognized.push(a.to_string()),
+                _ => unrecognized.push(raw.clone()),
             },
             "doctor" => match a {
                 "-h" | "--help" => {
                     print_help(Some(cmd));
                     return 0;
                 }
-                _ => unrecognized.push(a.to_string()),
+                _ => unrecognized.push(raw.clone()),
             },
             "boost" => match a {
                 "-h" | "--help" => {
                     print_help(Some(cmd));
                     return 0;
                 }
-                _ => unrecognized.push(a.to_string()),
+                _ => unrecognized.push(raw.clone()),
             },
             "fg" => match a {
                 "--res" => res = value_of!("--res"),
@@ -3570,7 +4041,7 @@ fn dispatch(argv: &[String]) -> i32 {
                     print_help(Some(cmd));
                     return 0;
                 }
-                _ => unrecognized.push(a.to_string()),
+                _ => unrecognized.push(raw.clone()),
             },
             _ => unreachable!(),
         }

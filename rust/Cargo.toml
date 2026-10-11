@@ -1,8 +1,8 @@
 [package]
 name = "spirit"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2021"
-description = "spiritual-successor — put EVERY GPU in a machine to work (Rust port, v0.2)"
+description = "spiritual-successor — put EVERY GPU in a machine to work (Rust port, v1.0.0)"
 
 [[bin]]
 name = "spirit"

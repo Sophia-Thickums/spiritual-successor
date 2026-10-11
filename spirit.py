@@ -33,6 +33,11 @@ EFF = 0.85             # measured efficiency of the theoretical ceiling on this 
 PLAN_HEADROOM = 0.60   # use at most 60% of a link
 CARD_RE = re.compile(r"^card\d+$")
 
+# ★ THE ONE VERSION STRING. Every surface that names a version reads it from here: `--version`,
+# the Rust crate manifest, and the UI's Server header. It is deliberately a plain literal so all
+# three builds (Python, C++, Rust) can carry the identical string by hand.
+VERSION = "1.0.0"
+
 
 def _read(p):
     try:
@@ -126,9 +131,23 @@ def _render_node(card):
 # ── probe: enumerate every GPU, fleet-scale (N cards, any vendor mix) ──────────────────
 def probe():
     fake = os.environ.get("SPIRIT_DEVICES")
-    if fake and os.path.exists(fake):
-        db = json.load(open(fake))
-        db.setdefault("gpufan", "probe/0.1")
+    if fake:
+        # ★ A FIXTURE THAT CANNOT BE READ MUST NOT SILENTLY BECOME THE REAL MACHINE (fix 2026-10-11,
+        # outside review). This used to fall through to the live probe whenever the path did not
+        # exist, or crash with a traceback when the JSON was malformed — so a typo in the variable
+        # name for `spirit probe` meant you were reading your actual hardware and thought you were
+        # reading a fixture. That is the ambient-state trap this whole project has a law about.
+        if not os.path.exists(fake):
+            sys.stderr.write("SPIRIT_DEVICES is set to %r, which does not exist. Refusing to "
+                             "silently read the real machine instead.\n" % fake)
+            raise SystemExit(2)
+        try:
+            db = json.load(open(fake))
+        except (OSError, ValueError) as exc:
+            sys.stderr.write("SPIRIT_DEVICES is set to %r, which is not readable JSON (%s). "
+                             "Refusing to silently read the real machine instead.\n" % (fake, exc))
+            raise SystemExit(2)
+        db.setdefault("gpufan", "probe/1.0.0")
         return db
     gpus = []
     cards = [c for c in glob.glob("/sys/class/drm/card*")
@@ -172,7 +191,7 @@ def probe():
             },
         })
     gpus.sort(key=lambda g: -(g["link"]["gbps_max"] or 0))
-    return {"gpufan": "probe/0.1", "gpus": gpus}
+    return {"gpufan": "probe/1.0.0", "gpus": gpus}
 
 
 def score(g):
@@ -480,8 +499,20 @@ def doctor(db, as_json=False):
 
     # F. FRAME GENERATION — reported honestly; UNKNOWN is never green, and absent is not a failure
     #    of THIS machine (it needs software the user must own). Only a broken install is a FAIL.
+    #
+    # ★ THE VERDICT MUST BE DERIVED FROM THE STATES THIS FUNCTION ACTUALLY RETURNS (fix 2026-10-11,
+    # outside review). This mapped only "READY" and "NOT-WORKING" — and _lsfg_state() returns NEITHER,
+    # so the check printed UNKNOWN on every machine that ever ran it, including a working one. A check
+    # that can never reach a verdict is not a cautious check; it is a dead one wearing one's clothes.
     ls_state, ls_detail = _lsfg_state()
-    ls_verdict = {"READY": "PASS", "NOT-WORKING": "FAIL"}.get(ls_state, "UNKNOWN")
+    ls_verdict = {
+        "INSTALLED": "PASS",        # layer present AND the shaders are actually there
+        "NEEDS-BRANCH": "FAIL",     # installed but the shaders are absent — it will die at startup
+        "PARTIAL": "FAIL",          # layer present without its helper
+        "STANDS-DOWN": "UNKNOWN",   # installed but disabled at the loader; not this machine's fault
+        "ABSENT": "UNKNOWN",        # not installed — it requires software we do not ship
+        "NEEDS-GAME": "UNKNOWN",    # the game that carries the shaders is not in the library
+    }.get(ls_state, "UNKNOWN")
     checks.append({"check": "frame-generation", "verdict": ls_verdict,
                    "detail": "%s — %s" % (ls_state, ls_detail)})
 
@@ -489,7 +520,7 @@ def doctor(db, as_json=False):
     overall = "READY" if not bad else "PROBLEMS FOUND"
 
     if as_json:
-        print(json.dumps({"spirit": "doctor/0.1", "overall": overall, "checks": checks}, indent=2))
+        print(json.dumps({"spirit": "doctor/1.0.0", "overall": overall, "checks": checks}, indent=2))
         return 1 if bad else 0
 
     print("spirit doctor — verifying this machine's multi-GPU readiness\n")
@@ -510,15 +541,20 @@ FRAME_MIB = {"1080p": 8.29, "1440p": 14.75, "4k": 33.18}
 
 def fg(db, res="1440p60", mode="present-on-secondary"):
     """Frame budget arithmetic: can a rendered frame reach this card in time, one way or round trip?"""
-    try:
-        r, hz = res.rsplit("@", 1) if "@" in res else (res[:-2], res[-2:])
-    except Exception:
-        r, hz = "1440p", "60"
-    r = r.rstrip("@")
-    res = r if r in FRAME_MIB else "1440p"
-    try:
-        hz = int(hz)
-    except ValueError:
+    # ★ PARSE THE RESOLUTION AND THE REFRESH AS TWO FIELDS (fix 2026-10-11, outside review). The old
+    # parser split the last two characters off the end, so the two examples the help text itself
+    # advertises were silently wrong: `4k120` became `4k1` at 20 Hz and fell back to 1440p (`1080p144`
+    # likewise), and `1440p@0` divided by zero. Both of those examples are now correct, and a refresh
+    # of zero falls back rather than crashing.
+    m = re.match(r"^\s*(1080p|1440p|4k)\s*@?\s*(\d+)?\s*$", res or "", re.IGNORECASE)
+    if m:
+        res = m.group(1).lower()
+        hz = int(m.group(2)) if m.group(2) else 60
+    else:
+        print("  fg: could not read %r as <1080p|1440p|4k>[@][Hz]; using 1440p60." % res
+              if res else "  fg: no resolution given; using 1440p60.")
+        res, hz = "1440p", 60
+    if hz <= 0:
         hz = 60
     payload = FRAME_MIB[res]
     budget = 1000.0 / hz
@@ -701,8 +737,11 @@ def _ensure_lsfg_profile(multiplier):
             shutil.copy2(LSFG_CONF, bak)
         with open(LSFG_CONF, "a", encoding="utf-8") as fh:
             fh.write(block)
-    except OSError as exc:
-        return None, "could not write the profile (%s)" % exc
+    except OSError:
+        # ★ NO RUNTIME ERROR TEXT (fix 2026-10-11, outside review). Same class as the compatdata and
+        # work-outdir branches: each language spells its own error differently, so interpolating it
+        # makes this a line the three builds can never agree on.
+        return None, "could not write the profile — check that %s is writable" % LSFG_CONF
     return name, "added profile %r (backup: %s.bak-spirit)" % (name, LSFG_CONF)
 
 
@@ -1128,6 +1167,11 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
         print("usage: spirit play [--no-offload] [--scale F] [--framegen N] [--overlay] "
               "[--work FILE [--work-outdir DIR] [--split]] [--spare NODE,...] -- <game command...>", file=sys.stderr)
         return 1
+    if not db.get("gpus"):
+        # ★ NO CARDS IS NOT A CRASH (fix 2026-10-11, outside review). This used to reach max() on an
+        # empty sequence and raise ValueError with a traceback.
+        print("  no GPUs were found, so there is nothing to render on and nothing to work on.")
+        return 1
     main = _main_card(db)
     spares = [g for g in db["gpus"] if g["card"] != main["card"]]
     if only_spares:
@@ -1226,6 +1270,17 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
     died_early = {}          # render node -> rc, for loads that were already gone at game exit
     job_outputs = []
     job_expect = None
+    no_job_reason = None     # set when --work was asked for but nothing could be started
+
+    # ★ REFUSE --overlay BEFORE ANYTHING IS SPAWNED (fix 2026-10-11, outside review). This check used
+    # to run AFTER the spare cards had already been put to work, so refusing the overlay left the
+    # encoders running with no game to stop them — orphaned processes on a machine the user is about
+    # to keep using. A refusal that leaves work running is not a refusal.
+    if do_offload and overlay and not scale:
+        gs_state, gs_detail = _gamescope_state()
+        if gs_state != "READY" or not _native_res(db):
+            print("  overlay: REFUSED — gamescope is not ready (%s)" % gs_detail)
+            return 1
     # ★ WHICH SPARES CAN ACTUALLY ENCODE, decided from each card's own kernel driver, before anything
     # is launched. A card we cannot drive is left out and NAMED — the alternative is an ffmpeg that
     # dies instantly with its output going to /dev/null, which looks exactly like a card doing work.
@@ -1242,11 +1297,17 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
     if do_offload and shutil.which("ffmpeg"):
         for node, nm, why in skipped:
             print("  spare: SKIPPED %s (%s) — %s" % (node, nm, why))
+        if work and not encoders:
+            no_job_reason = "no spare card on this machine can encode (see the SKIPPED lines above)"
+            print("  work: no job started — %s" % no_job_reason)
         if work:
             # ★ A REAL JOB. Real input, real output, on cards that are NOT the one running the game.
             if not os.path.isfile(work):
-                print("  work: REFUSED — %r is not a file. A job needs a real input; the synthetic "
-                      "test load is what runs when you do not give one." % work)
+                # One shape for every refusal in this file, so a reader learns it once — and so the
+                # three builds can share it verbatim (they previously each printed something else).
+                print("  work: REFUSED — %s is not a file" % work)
+                print("          (a job needs a real input; without one the spare cards run a test "
+                      "load, which produces nothing)")
                 return 1
             # ★ BESIDE THE INPUT, which is what --work-outdir's own help text has always promised.
             # It used to default to the CURRENT DIRECTORY, so `spirit play --work film.mkv -- game`
@@ -1314,15 +1375,19 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                 print("         (ffmpeg's own testsrc2 test pattern -> /dev/null). This proves the")
                 print("         cards can be DRIVEN; it is not a job and produces nothing.")
                 print("         For real work: spirit play --work <file> [--work-outdir DIR] -- <game>")
+    elif work and do_offload:
+        # ★ An absent tool must be SAID, not silently skipped (the README promises exactly this, and
+        # the promise was false for ffmpeg). Found 2026-10-11 by an outside review.
+        no_job_reason = "ffmpeg is not installed, so no card can be given a job here"
+        print("  work: no job started — %s" % no_job_reason)
+    elif work:
+        no_job_reason = "--no-offload was given, so no card was asked to do anything"
+        print("  work: no job started — %s" % no_job_reason)
+
     print("\n  launching…\n")
     sys.stdout.flush()
 
     inner = _hidden_argv(cmd, main, db)
-    if overlay and not scale:
-        gs_state, gs_detail = _gamescope_state()
-        if gs_state != "READY" or not _native_res(db):
-            print("  overlay: REFUSED - gamescope not ready (%s)" % gs_detail)
-            return 1
     if scale or overlay:
         nat = _native_res(db)
         rw, rh = _render_res(nat, scale) if scale else nat
@@ -1346,6 +1411,13 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
     t0 = time.time()
     try:
         rc = subprocess.call(inner, env=env)
+    except FileNotFoundError as exc:
+        # ★ A CLEAN REFUSAL, NOT A TRACEBACK (fix 2026-10-11, outside review). A game command that
+        # cannot be found used to raise out of `play` as a Python traceback with no THE TAIL at all.
+        rc = 127
+        print("\n  could not run the game: %s" % exc)
+        print("  Nothing was launched. The cards listed above did no work and have been stopped.")
+        sys.stdout.flush()
     finally:
         # ★ A TEST LOAD IS A LOAD AND DIES WITH THE GAME. A JOB IS NOT: terminating a half-finished
         # transcode leaves a truncated file and calls it done, which is the corrupt-quietly failure
@@ -1370,8 +1442,20 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                     died_early[node] = p.returncode
             for p in procs:
                 p.terminate()
+            # ★ AND WAIT, so the process is actually gone when this returns (fix 2026-10-11, outside
+            # review). Python and C++ terminated without waiting, Rust killed outright; three different
+            # teardowns for the same act. A caller that assumes the cards are free when play() returns
+            # was right only on one of the three. SIGTERM, then wait, everywhere.
+            for p in procs:
+                try:
+                    p.wait(timeout=5)
+                except Exception:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
     elapsed = max(time.time() - t0, 1e-6)
-    if work:
+    if work and procs:
         print("\n  game exited (rc=%s) — the job ran to completion (not stopped with the game)" % rc)
         print("  ── JOB OUTPUT " + "─" * 56)
         got = []
@@ -1400,7 +1484,17 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
                 print("  ⇒ INCOMPLETE — %.1fs of %.1fs. The split LOST footage; do not report it as ok."
                       % (job_expect - total, job_expect))
     else:
-        print("\n  game exited (rc=%s) — test load stopped" % rc)
+        # ★ DO NOT CLAIM A JOB THAT WAS NEVER STARTED (fix 2026-10-11, outside review). With --work
+        # given but nothing able to run — --no-offload, no ffmpeg, or no card that can encode — this
+        # printed "the job ran to completion" over an empty output block. Nothing had run. That is the
+        # same class of false statement the tail was printing, in a different path.
+        if work:
+            print("\n  game exited (rc=%s)" % rc)
+            print("  ── JOB OUTPUT " + "─" * 56)
+            print("  NO JOB WAS STARTED — %s" % (no_job_reason or "nothing was given the work"))
+            print("  Nothing was transcoded, so there is no output to check. The game ran normally.")
+        else:
+            print("\n  game exited (rc=%s) — test load stopped" % rc)
 
     # ★ THE TAIL — what the OTHER cards actually did. A feature you cannot see is indistinguishable
     # from one that is broken, and the loads are silent by design (ffmpeg's output goes to /dev/null).
@@ -1442,8 +1536,10 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
         print("  presented rate                     : %.1f /s" % (n / elapsed))
         print("  ★ This is the number frame generation moves, and the ONLY number it moves.")
         print("    The game's own FPS counter cannot see it — that counts frames the GAME")
-        print("    rendered, which frame gen does not change. Expect the game's figure to be")
-        print("    LOWER with frame gen on: it is now paying for the interpolation.")
+        print("    rendered, and with frame gen on the game may now be doing LESS work, because it")
+        print("    is paying for the interpolation. On one title here that figure fell about 9%;")
+        print("    on another it did not move at all. Either way it cannot see what was added —")
+        print("    which is the whole reason this counter exists.")
         print("    Honest limit: an image handed to the compositor is not proof it was scanned")
         print("    out, and no counter can tell you whether the interpolated frames look right.")
     return 0 if rc == 0 else rc
@@ -1452,9 +1548,15 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
 def main():
     argv = sys.argv[1:]
     # ★ THE MARK, ON EVERY RUN. Skipped only for --json, where a machine is reading and a
-    # stray line would break it. A tampered build cannot silence the warning below.
-    if "--json" not in argv and "origin" not in argv:
+    # stray line would break it, and for --version, which must print exactly one line. A tampered
+    # build cannot silence the warning below.
+    if "--json" not in argv and "origin" not in argv and "--version" not in argv:
         origin()
+    # ★ --version prints THE one version string and nothing else: a single line, exit 0, no origin
+    # mark and no argparse footer. Handled here (before argparse) so the ports can match it exactly.
+    if "--version" in argv:
+        print("spirit %s" % VERSION)
+        return 0
     if argv and argv[0] == "ui":
         return ui(argv[1:])
 
@@ -1542,17 +1644,33 @@ def main():
         description="Spiritual Successor — put every GPU to work\n"
                     "commands: probe · roles · plan · doctor · fg · boost · run · play · ui  "
                     "(`run` and `play` take a command after `--`)",
-        formatter_class=argparse.RawDescriptionHelpFormatter)
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        # ★ NO ABBREVIATIONS (fix 2026-10-11, outside review). argparse accepts any unambiguous prefix
+        # by default, so `probe --js` worked while the hand-written ports rejected it — a divergence in
+        # a place nobody looks. Turning it off makes the three builds agree on what a valid argument
+        # is, and "type the flag you mean" is the better contract anyway.
+        allow_abbrev=False)
+    # ★ --version lives on the TOP-LEVEL parser so it shows up in `spirit --help`. main() already
+    # intercepts `--version` before argparse ever runs, so this action never fires twice; it exists
+    # for the help text, and its wording is argparse's own conventional string.
+    ap.add_argument("--version", action="version", version="spirit " + VERSION)
     sub = ap.add_subparsers(dest="cmd")
-    p = sub.add_parser("probe"); p.add_argument("--json", action="store_true")
-    r = sub.add_parser("roles"); r.add_argument("--profile", default="game"); r.add_argument("--json", action="store_true")
-    pl = sub.add_parser("plan"); pl.add_argument("--workload", default="1440p60-framegen")
+    # ★ allow_abbrev ON THE PARENT DOES NOT REACH THE SUBPARSERS (found 2026-10-11; my first attempt at
+    # this was inert and BOTH builders caught it). argparse builds each subparser with its own
+    # default, so `spirit probe --js` kept working while the C++ and Rust builds rejected it — a
+    # divergence created *by the fix for a divergence*. It has to be passed to every subparser, which is
+    # what _sp does, so a new subcommand cannot silently opt out.
+    def _sp(name):
+        return sub.add_parser(name, allow_abbrev=False)
+    p = _sp("probe"); p.add_argument("--json", action="store_true")
+    r = _sp("roles"); r.add_argument("--profile", default="game"); r.add_argument("--json", action="store_true")
+    pl = _sp("plan"); pl.add_argument("--workload", default="1440p60-framegen")
     pl.add_argument("--vram-mib", type=int, default=None, help="VRAM the workload needs on its card")
-    sub.add_parser("doctor")
-    o = sub.add_parser("origin"); o.add_argument("--check", action="store_true",
-                                                help="exit 0 if this build is the original, 1 if not")
-    sub.add_parser("boost")
-    f = sub.add_parser("fg")
+    _sp("doctor")
+    o = _sp("origin"); o.add_argument("--check", action="store_true",
+                                      help="exit 0 if this build is the original, 1 if not")
+    _sp("boost")
+    f = _sp("fg")
     f.add_argument("--res", default="1440p60", help="resolution@refresh, e.g. 1440p60 / 4k120 / 1080p144")
     f.add_argument("--mode", default="present-on-secondary",
                    choices=["present-on-secondary", "round-trip"],
