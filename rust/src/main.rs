@@ -2500,8 +2500,13 @@ fn ensure_compatdata(cmd: &[String]) {
         return; // a real prefix is already there; touch nothing
     }
     let made = !d.is_dir();
-    if let Err(e) = fs::create_dir_all(&d) {
-        println!("  prefix: could not create {} ({})", d.to_string_lossy(), e);
+    // ★ THE ERROR TEXT IS DELIBERATELY NOT INTERPOLATED HERE. Each language spells its own runtime's
+    // error differently (Rust an io::Error Display, Python an OSError, C++ strerror), so including it
+    // makes this the one branch the three builds CANNOT agree on — and a read-only Steam directory or a
+    // full disk reaches it. Same words in every build instead, naming the thing to check.
+    if fs::create_dir_all(&d).is_err() {
+        println!("  prefix: could not create {}", d.to_string_lossy());
+        println!("          (Proton needs this directory for its prefix; check that you can write to it)");
         return;
     }
     if made {
