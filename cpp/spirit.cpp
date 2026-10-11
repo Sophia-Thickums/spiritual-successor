@@ -1456,7 +1456,7 @@ static int fg_cmd(const J &db, const string &res_in, const string &mode) {
         string c = sfield(g, "card");
         // ★ THIS TOOL CANNOT KNOW YOUR MACHINE'S HANDOFF RATE (fix 2026-10-11, found by the final
         // outside read). This table used to be keyed by card NAME — card0/card2/card3 — and those names
-        // are not portable: a stranger's card0 inherited the MI25's measured rate and was handed a
+        // are not portable: a stranger's card0 inherited another card's measured rate and was handed a
         // FEASIBLE/INFEASIBLE verdict about hardware we have never seen. The rate is a property of the
         // LINK and the driver, so what is computed here is an UPPER BOUND from the card's OWN measured
         // host link — and the gap between that bound and reality is stated below, not hidden.
@@ -2525,6 +2525,14 @@ static string self_exe_path() {
     return "spirit";
 }
 
+// True when the session-wide pin is installed (`spirit enable`). The PIN FILE is the truth — it is
+// what every process in the session inherits; the state file is only a note for humans. Mirrors
+// spirit.py::_persistent_pin_on.
+static bool persistent_pin_on() {
+    struct stat sb;
+    return stat((home_dir() + "/.config/environment.d/90-spirit.conf").c_str(), &sb) == 0;
+}
+
 // True if unprivileged user namespaces WORK here, false if they are denied, nullopt if no `unshare`.
 // Cached once per process like Python's _USERNS_CACHE. Mirrors spirit.py::_userns_available.
 static std::optional<bool> userns_available() {
@@ -2832,12 +2840,25 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
     // This tool cannot put the pin there, so it says so and gives the recipe that CAN pin it.
     bool steam_launch = is_steam_launcher(cmd);
     if (steam_launch) {
-        printf("  steam: this is a Steam launch — it cannot be pinned from here.\n");
-        printf("         `steam`/`steam://` hands the request to the running Steam client and returns\n");
-        printf("         at once, so the game would start WITHOUT this tool's pin. The pin only reaches\n");
-        printf("         a process THIS tool launches. To pin a Steam game, set its launch options to:\n");
-        printf("             \"%s\" play -- %%command%%\n", self_exe_path().c_str());
-        printf("         (note the `--` before %%command%%), then launch the game from Steam.\n");
+        // ★ THE STEAM PATH IS SAID, NOT SILENT (blocking item 2). `steam`/`steam://` is not the game
+        // — it is a REQUEST to the Steam client, which starts the game itself, in its own environment.
+        // If the session-wide pin is on, Steam inherits it and the game IS pinned; otherwise the tool
+        // gives the recipe that pins it. Either way it says which case you are in.
+        if (persistent_pin_on()) {
+            printf("  steam: this is a Steam launch — and the session-wide pin IS on, so it is pinned.\n");
+            printf("         Steam and every game it starts inherit MESA_VK_DEVICE_SELECT from your\n");
+            printf("         session, so the game renders on the card your monitor is on, with this tool\n");
+            printf("         not in the loop at all. There is nothing to do here.\n");
+        } else {
+            printf("  steam: this is a Steam launch — it cannot be pinned from here.\n");
+            printf("         `steam`/`steam://` hands the request to the running Steam client and returns\n");
+            printf("         at once, so the game would start WITHOUT this tool's pin. To pin a Steam game,\n");
+            printf("         set its launch options to:\n");
+            printf("             \"%s\" play -- %%command%%\n", self_exe_path().c_str());
+            printf("         (note the `--` before %%command%%) — OR run\n");
+            printf("             spirit enable\n");
+            printf("         once, and every launch on this machine, Steam included, is pinned for good.\n");
+        }
     }
     if (is_wine_target(cmd)) {
         printf("  wall: Proton/Wine detected — skipping the mount namespace (Wine refuses to run as\n");
@@ -3380,7 +3401,7 @@ static int ui_cmd(const vector<string> &args) {
 static void print_help() {
     printf("usage: spirit [-h] [--version] {probe,roles,plan,doctor,origin,boost,fg} ...\n\n");
     printf("Spiritual Successor — put every GPU to work\n");
-    printf("commands: probe · roles · plan · doctor · fg · boost · run · play · ui  (`run` and `play` take a command after `--`)\n\n");
+    printf("commands: probe · roles · plan · doctor · fg · boost · enable · disable · run · play · ui  (`run` and `play` take a command after `--`)\n\n");
     printf("positional arguments:\n");
     printf("  {probe,roles,plan,doctor,origin,boost,fg}\n\n");
     printf("options:\n");
@@ -3513,6 +3534,87 @@ static bool parse_py_float(const string &s, double &out) {
     return true;
 }
 
+// ── MAKE IT STAY ON: a session-wide pin, on until you turn it off ─────────────────────
+// Mirrors spirit.py's enable/disable. One small file in the user's own config directory; every
+// process in the session inherits it, so Steam and the games it starts are pinned with no tool in
+// the loop. `probe` reads sysfs, so the pin never blinds the tool's own view of the machine.
+static string env_d_file() { return home_dir() + "/.config/environment.d/90-spirit.conf"; }
+
+static void mkdir_p(const string &d) {
+    string cur;
+    for (size_t i = 0; i < d.size(); i++) {
+        cur += d[i];
+        if (d[i] == '/' || i + 1 == d.size())
+            if (cur != "/") mkdir(cur.c_str(), 0755);
+    }
+}
+
+static string apply_session(const string &sel, const string &pci, bool on) {
+    if (!which("systemctl"))
+        return "no systemd user manager here — the file applies at your next login";
+    vector<string> a = on
+        ? vector<string>{"systemctl", "--user", "set-environment",
+                         "MESA_VK_DEVICE_SELECT=" + sel, "DRI_PRIME=" + pci}
+        : vector<string>{"systemctl", "--user", "unset-environment",
+                         "MESA_VK_DEVICE_SELECT", "DRI_PRIME"};
+    ProcResult r = run_capture_both(a, nullptr, 10);
+    (void)r;
+    return on ? "applied to the running session (apps started now inherit it)"
+              : "cleared from the running session (apps started now are unpinned)";
+}
+
+static int enable_cmd(const J &db, bool now) {
+    const J *mc = main_card(db);
+    if (!mc) {
+        fprintf(stderr, "spirit enable: no GPU found on this machine — nothing to pin.\n");
+        return 1;
+    }
+    string vendor = sfield(*mc, "vendor"), device = sfield(*mc, "device");
+    string sel = (vendor.size() >= 4 ? vendor.substr(2) : vendor) + ":" +
+                 (device.size() >= 4 ? device.substr(2) : device) + "!";
+    string pci = "pci-" + sfield(*mc, "bdf");
+    mkdir_p(home_dir() + "/.config/environment.d");
+    FILE *f = fopen(env_d_file().c_str(), "w");
+    if (!f) {
+        fprintf(stderr, "spirit enable: could not write %s\n", env_d_file().c_str());
+        return 1;
+    }
+    fprintf(f, "# Spiritual Successor — session-wide GPU pin.\n");
+    fprintf(f, "# Every app you launch, INCLUDING Steam and the games it starts, inherits this,\n");
+    fprintf(f, "# so games render on the card your monitor is on with no tool in the loop.\n");
+    fprintf(f, "# Turn it off with:  spirit disable\n");
+    fprintf(f, "MESA_VK_DEVICE_SELECT=%s\nDRI_PRIME=%s\n", sel.c_str(), pci.c_str());
+    fclose(f);
+    printf("  pinned every launch to : %s (%s)\n", gpu_name(*mc).c_str(), sfield(*mc, "card").c_str());
+    printf("  wrote                  : %s\n", env_d_file().c_str());
+    printf("  pin                    : MESA_VK_DEVICE_SELECT=%s   DRI_PRIME=%s\n", sel.c_str(), pci.c_str());
+    if (now) printf("  now                    : %s\n", apply_session(sel, pci, true).c_str());
+    printf("\n");
+    printf("  It applies to new processes. Log out and back in and it covers your whole session —\n");
+    printf("  Steam included, and every game Steam starts. It hides your OTHER cards from Vulkan\n");
+    printf("  apps in the session; that is the point for a game. If a compute job needs those cards,\n");
+    printf("  run `spirit disable` first. This tool itself still sees every card, always.\n");
+    return 0;
+}
+
+static int disable_cmd(bool now) {
+    if (now) printf("  now      : %s\n", apply_session("", "", false).c_str());
+    struct stat sb;
+    if (stat(env_d_file().c_str(), &sb) != 0) {
+        printf("  the session-wide pin was not on — nothing to remove.\n");
+        return 0;
+    }
+    if (unlink(env_d_file().c_str()) != 0) {
+        fprintf(stderr, "spirit disable: could not remove %s\n", env_d_file().c_str());
+        return 1;
+    }
+    printf("  removed  : %s\n", env_d_file().c_str());
+    printf("\n");
+    printf("  `spirit play` still pins whatever it launches. This only removed the pin that covered\n");
+    printf("  every OTHER launch; log out and back in for it to stop covering your session.\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     vector<string> args(argv + 1, argv + argc);
 
@@ -3539,6 +3641,22 @@ int main(int argc, char **argv) {
     if (!args.empty() && args[0] == "ui") {
         vector<string> rest(args.begin() + 1, args.end());
         return ui_cmd(rest);
+    }
+
+    // `enable` / `disable` — parsed by HAND, like play/run/ui, so they stay OUT of the top-level
+    // help's subcommand list, which the three builds must print identically.
+    if (!args.empty() && (args[0] == "enable" || args[0] == "disable")) {
+        bool now = false, bad = false;
+        for (size_t k = 1; k < args.size(); k++) {
+            if (args[k] == "--now") now = true;
+            else bad = true;
+        }
+        if (bad) {
+            fprintf(stderr, "usage: spirit %s [--now]\n", args[0].c_str());
+            return 2;
+        }
+        if (args[0] == "disable") return disable_cmd(now);
+        return enable_cmd(probe(), now);
     }
 
     // `run` parsed by hand (arbitrary command passthrough)

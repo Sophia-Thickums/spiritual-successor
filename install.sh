@@ -32,3 +32,4 @@ echo
 echo "Now run:    spirit doctor"
 echo "Then try:   spirit ui          (a local page, if you would rather click than type)"
 echo "       or:  spirit play -- ./yourgame"
+echo "       or:  spirit enable     (pin every launch on this machine, Steam included, until you turn it off)"

@@ -80,30 +80,39 @@ What does a job cost the game? Our own runs found a few percent at most in one t
 difference in another — but each side of those comparisons was only two runs, so the honest reading is
 *small or none*, not a percentage. Measure it on your own machine.
 
-### Launching a game you own on Steam
+### Playing everything, Steam included, without thinking about it
 
-If you launch a game by clicking Play in Steam, this tool is not in the loop — Steam starts the game
-itself, in its own environment, and the card is chosen before anything here sees it. `steam://` and
-`steam -applaunch` just hand the request to the running client and return immediately, so the game would
-start **without** the pin. The tool detects that and says so rather than reporting a normal session.
+Run this once:
 
-The pin only reaches a process this tool launches, so put the tool *inside* Steam's launch line. Right-click
-the game → Properties → Launch Options, and paste:
+```
+spirit enable
+```
+
+It writes one small file in your own config directory that puts the pin in your **user session's
+environment**. From your next login, *everything* you launch inherits it — including Steam, and every
+game Steam starts when you click Play. No launch options to edit, nothing to remember. It hides your
+other cards from Vulkan apps in the session; that is the point for a game, and `spirit disable` removes
+it in one command. The tool itself still sees every card — `probe` reads the kernel, not the Vulkan
+loader — so the pin never blinds it.
+
+If you would rather pin a single game by hand, put the tool *inside* Steam's launch line instead:
+right-click the game → Properties → Launch Options, and paste
 
 ```
 "/full/path/to/spirit.py" play -- %command%
 ```
 
-Note the `--` before `%command%` — the game's own command line goes after it, untouched. Then launch the
-game from Steam as normal, and `spirit` will pin it and print the tail when it exits.
+Note the `--` before `%command%` — the game's own command line goes after it, untouched. Without either
+of these, a game launched from Steam starts **without** the pin, and the tool says so rather than
+reporting a normal session.
 
 ## How you can see it happened
 
-When your game exits, the tool prints what each card actually did. Run on the test machine with a
-12-second clip and two usable spare cards:
+When your game exits, the tool prints what each card actually did. Here is the shape — an example machine
+with a 12-second clip and two usable spare cards:
 
 ```
-  job: NOT using renderD130 (Vega 10 XTX) — x1 link at the host — too narrow to use unasked
+  job: NOT using renderD130 (GPU D) — x1 link at the host — too narrow to use unasked
        Add --spare renderD130 to include it anyway.
   ── JOB OUTPUT ────────────────────────────────────────────────────────
   renderD131     clip.renderD131_part1.mp4  (5.4 MB, 6.0s)
@@ -114,8 +123,8 @@ When your game exits, the tool prints what each card actually did. Run on the te
   original duration   : 12.0s
   ⇒ COMPLETE — the pieces reconstruct the whole input (within 1%).
   ── THE TAIL — what the other cards did ───────────────────────────────
-  renderD131   Granite Ridge          REAL JOB  …/clip.renderD131_part1.mp4
-  renderD129   Vega 10                REAL JOB  …/clip.renderD129_part2.mp4
+  renderD131   GPU C                   REAL JOB  …/clip.renderD131_part1.mp4
+  renderD129   GPU A                   REAL JOB  …/clip.renderD129_part2.mp4
 ```
 
 Every job output is checked on disk afterwards — it exists, it was written by *this* run, and under
@@ -126,8 +135,8 @@ takes a process's exit code for an answer. Without `--split` each card transcode
 shortened file will still report as present; the `--split` check is the one that proves the pieces
 reconstruct.
 
-(Card names are whatever `lspci` calls them, shortened — the 2017 cards here print as `Vega 10` and
-`Vega 10 XTX`, not as their market names.)
+(Card names are whatever `lspci` calls them, shortened — shown here as placeholders. Run `spirit probe` on
+your own machine to see yours.)
 
 A card the tool cannot drive is named rather than quietly left out, in this shape:
 
@@ -154,6 +163,7 @@ you look at.
 ```
 curl -fsSL https://raw.githubusercontent.com/Sophia-Thickums/spiritual-successor/main/install.sh | sh
 spirit doctor
+spirit enable     # optional: pin every launch on this machine, Steam included, until you turn it off
 ```
 
 `doctor` does not describe your machine — it tests it. It launches a real program on every card and
@@ -172,6 +182,8 @@ and a box to launch your game from. It listens on your own machine only.
 
 ```
 spirit doctor        test that it really works on your machine — run this first
+spirit enable        pin every launch on this machine, for good (Steam included); --now also applies it now
+spirit disable       remove that pin (nothing else changes)
 spirit --version     print the version and exit
 spirit probe         list your cards and how each one is actually wired (the GB/s column is an estimate)
 spirit roles         describe what each card is and what it could take
@@ -230,15 +242,14 @@ actually happened. A wall of detail beats a one-line report.
   `x1`. `spirit probe` reports the **minimum negotiated width along the sysfs chain**, which is the
   minimum link *width* the chain will allow — capability, not the rate it has currently negotiated; the
   negotiated one is shown separately when a card is sitting idle. The `GB/s` column beside it is an *estimate* — theoretical per-lane rate times width times a
-  fixed efficiency — not a measurement; treat it as a ranking, not a speed. On the dev box `probe`
-  prints: RX 9070 XT `x16 Gen5` 54.4, Instinct MI25 `x4 Gen3` 3.4, Vega FE `x1 Gen3` 0.85, integrated
-  `x16 Gen4` 26.79.
+  fixed efficiency — not a measurement; treat it as a ranking, not a speed.
 - **Never split the frame.** A 1440p frame is 14.7 MB; at 60 fps an `x1` card needs 17 ms to move one,
   which is more than the whole frame budget. Per-pixel, per-frame work across these links is dead by
   arithmetic. Cross the wire once per job, or at frame rate — never per pixel.
 - **The pin is load-bearing.** `MESA_VK_DEVICE_SELECT=<vid:did>!` — the trailing `!` is the exclusive
   flag. Without it the loader only *reorders* and a child still sees every GPU; with it, a child sees
-  exactly one. Measured: an unpinned UE5 game rendered on the docked card while the main card sat at 0%.
+  exactly one. Measured: an unpinned UE5 game rendered on a card it should not have, while the card
+  driving the display sat at 0%.
 - **Two walls.** The exclusive pin, plus a mount namespace that hides the other cards' `/dev/dri` nodes
   from the game. `spirit doctor` reports both: it tests the pin per card, and it says plainly whether
   unprivileged namespaces are available on your system. Where they are not, only the pin separates the

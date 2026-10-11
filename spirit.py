@@ -846,7 +846,7 @@ def fg(db, res="1440p60", mode="present-on-secondary"):
         c = g["card"]
         # ★ THIS TOOL CANNOT KNOW YOUR MACHINE'S HANDOFF RATE (fix 2026-10-11, found by the final
         # outside read). This table used to be keyed by card NAME — card0/card2/card3 — and those names
-        # are not portable: a stranger's card0 inherited the MI25's measured rate and was handed a
+        # are not portable: a stranger's card0 inherited another card's measured rate and was handed a
         # FEASIBLE/INFEASIBLE verdict about hardware we have never seen. The rate is a property of the
         # LINK and the driver, so what is computed here is an UPPER BOUND from the card's OWN measured
         # host link — and the gap between that bound and reality is stated below, not hidden.
@@ -1430,7 +1430,7 @@ def _hidden_argv(cmd, main, db):
 
     Two walls, both measured on the dev box: the EXCLUSIVE device-select (a child then sees exactly
     one GPU) and a mount namespace that makes the other cards' nodes invisible. The pin alone is
-    load-bearing — WITHOUT it a Vulkan game chose the docked card outright on our box (2026-10-09).
+    load-bearing — WITHOUT it a Vulkan game chose the wrong card outright on the test machine.
 
     ★ KEEP THE NAMESPACE INSIDE ANY OUTER WRAPPER. `unshare -r` maps our uid to root, so the
     ROOT-OWNED `/tmp/.X11-unix` presents as the overflow uid inside — and a nested gamescope then
@@ -1689,13 +1689,22 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
     if steam_launch:
         # ★ THE STEAM PATH IS SAID, NOT SILENT (blocking item 2). `steam`/`steam://` is not the game
         # — it is a REQUEST to the Steam client, which starts the game itself, in its own environment.
-        # This tool cannot put the pin there, so it says so and gives the recipe that CAN pin it.
-        print("  steam: this is a Steam launch — it cannot be pinned from here.")
-        print("         `steam`/`steam://` hands the request to the running Steam client and returns")
-        print("         at once, so the game would start WITHOUT this tool's pin. The pin only reaches")
-        print("         a process THIS tool launches. To pin a Steam game, set its launch options to:")
-        print("             \"%s\" play -- %%command%%" % os.path.abspath(__file__))
-        print("         (note the `--` before %command%), then launch the game from Steam.")
+        # If the session-wide pin is on, Steam inherits it and the game IS pinned; otherwise the tool
+        # gives the recipe that pins it. Either way it says which case you are in.
+        if _persistent_pin_on():
+            print("  steam: this is a Steam launch — and the session-wide pin IS on, so it is pinned.")
+            print("         Steam and every game it starts inherit MESA_VK_DEVICE_SELECT from your")
+            print("         session, so the game renders on the card your monitor is on, with this tool")
+            print("         not in the loop at all. There is nothing to do here.")
+        else:
+            print("  steam: this is a Steam launch — it cannot be pinned from here.")
+            print("         `steam`/`steam://` hands the request to the running Steam client and returns")
+            print("         at once, so the game would start WITHOUT this tool's pin. To pin a Steam game,")
+            print("         set its launch options to:")
+            print("             \"%s\" play -- %%command%%" % os.path.abspath(__file__))
+            print("         (note the `--` before %command%) — OR run")
+            print("             spirit enable")
+            print("         once, and every launch on this machine, Steam included, is pinned for good.")
     if _is_wine_target(cmd):
         print("  wall: Proton/Wine detected — skipping the mount namespace (Wine refuses to run as")
         print("        root, and `unshare -r` makes us root); the exclusive pin still applies.")
@@ -2111,6 +2120,96 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
     return 0 if rc == 0 else rc
 
 
+# ── MAKE IT STAY ON: a session-wide pin, on until you turn it off ─────────────────────
+# The tool's promise is "your game gets the card your monitor is on." That holds for anything
+# launched through `spirit play`. This makes it hold for EVERYTHING you launch — including a game
+# you start by clicking Play in Steam — by putting the pin in the USER SESSION's environment, where
+# every process you start inherits it. Nothing privileged: one small file in your own config
+# directory, and one command removes it. The tool still sees every card, because `probe` reads
+# sysfs, not the Vulkan loader — so the pin never blinds the tool's own view of the machine.
+_ENV_D_DIR = os.path.join(os.path.expanduser("~"), ".config", "environment.d")
+_ENV_D_FILE = os.path.join(_ENV_D_DIR, "90-spirit.conf")
+
+
+def _persistent_pin_on():
+    """True when the session-wide pin is installed. The PIN FILE is the truth — it is what every
+    process in the session inherits."""
+    return os.path.exists(_ENV_D_FILE)
+
+
+def enable(db, now=False):
+    main_card = _main_card(db)
+    if main_card is None:
+        print("spirit enable: no GPU found on this machine — nothing to pin.", file=sys.stderr)
+        return 1
+    sel = "%s:%s!" % (main_card["vendor"][2:], main_card["device"][2:])
+    pci = "pci-%s" % main_card["bdf"]
+    try:
+        os.makedirs(_ENV_D_DIR)
+    except OSError:
+        pass
+    try:
+        with open(_ENV_D_FILE, "w") as f:
+            f.write("# Spiritual Successor — session-wide GPU pin.\n"
+                    "# Every app you launch, INCLUDING Steam and the games it starts, inherits this,\n"
+                    "# so games render on the card your monitor is on with no tool in the loop.\n"
+                    "# Turn it off with:  spirit disable\n"
+                    "MESA_VK_DEVICE_SELECT=%s\n"
+                    "DRI_PRIME=%s\n" % (sel, pci))
+    except OSError as exc:
+        print("spirit enable: could not write %s (%s)" % (_ENV_D_FILE, exc), file=sys.stderr)
+        return 1
+    print("  pinned every launch to : %s (%s)" % (_gpu_name(main_card), main_card["card"]))
+    print("  wrote                  : %s" % _ENV_D_FILE)
+    print("  pin                    : MESA_VK_DEVICE_SELECT=%s   DRI_PRIME=%s" % (sel, pci))
+    if now:
+        print("  now                    : %s" % _apply_session(sel, pci, True))
+    print()
+    print("  It applies to new processes. Log out and back in and it covers your whole session —")
+    print("  Steam included, and every game Steam starts. It hides your OTHER cards from Vulkan")
+    print("  apps in the session; that is the point for a game. If a compute job needs those cards,")
+    print("  run `spirit disable` first. This tool itself still sees every card, always.")
+    return 0
+
+
+def disable(now=False):
+    if now:
+        print("  now      : %s" % _apply_session("", "", False))
+    if not os.path.exists(_ENV_D_FILE):
+        print("  the session-wide pin was not on — nothing to remove.")
+        return 0
+    try:
+        os.remove(_ENV_D_FILE)
+    except OSError as exc:
+        print("spirit disable: could not remove %s (%s)" % (_ENV_D_FILE, exc), file=sys.stderr)
+        return 1
+    print("  removed  : %s" % _ENV_D_FILE)
+    print()
+    print("  `spirit play` still pins whatever it launches. This only removed the pin that covered")
+    print("  every OTHER launch; log out and back in for it to stop covering your session.")
+    return 0
+
+
+def _apply_session(sel, pci, on):
+    """Best-effort live apply through the systemd user manager, so the change reaches newly started
+    apps without a re-login. Where systemd is absent this is a no-op and the file still applies at the
+    next login — said plainly, never silently."""
+    sc = shutil.which("systemctl")
+    if not sc:
+        return "no systemd user manager here — the file applies at your next login"
+    try:
+        if on:
+            subprocess.run([sc, "--user", "set-environment",
+                            "MESA_VK_DEVICE_SELECT=%s" % sel, "DRI_PRIME=%s" % pci],
+                           capture_output=True, timeout=10)
+            return "applied to the running session (apps started now inherit it)"
+        subprocess.run([sc, "--user", "unset-environment", "MESA_VK_DEVICE_SELECT", "DRI_PRIME"],
+                       capture_output=True, timeout=10)
+        return "cleared from the running session (apps started now are unpinned)"
+    except (OSError, subprocess.SubprocessError):
+        return "could not reach the session manager — the file change still applies at next login"
+
+
 def main():
     argv = sys.argv[1:]
     # ★ ONLY OUR OWN FLAGS COUNT, NOT THE GAME'S (fix 2026-10-11, found by the final outside read).
@@ -2131,6 +2230,19 @@ def main():
         return 0
     if argv and argv[0] == "ui":
         return ui(argv[1:])
+
+    # `enable` / `disable` are parsed by HAND, like play/run/ui — so they stay OUT of argparse's
+    # subcommand list and the top-level help stays byte-identical across the three builds.
+    if argv and argv[0] in ("enable", "disable"):
+        rest = argv[1:]
+        bad = [a for a in rest if a != "--now"]
+        if bad:
+            print("usage: spirit %s [--now]" % argv[0], file=sys.stderr)
+            return 2
+        now = "--now" in rest
+        if argv[0] == "disable":
+            return disable(now)
+        return enable(probe(), now)
 
     # `run` needs to pass an arbitrary command through untouched (it may contain -i, --flags, `--`).
     # argparse's REMAINDER mangles option-like args, so parse `run` by hand.
@@ -2230,7 +2342,7 @@ def main():
     ap = argparse.ArgumentParser(
         prog="spirit",
         description="Spiritual Successor — put every GPU to work\n"
-                    "commands: probe · roles · plan · doctor · fg · boost · run · play · ui  "
+                    "commands: probe · roles · plan · doctor · fg · boost · enable · disable · run · play · ui  "
                     "(`run` and `play` take a command after `--`)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         # ★ NO ABBREVIATIONS (fix 2026-10-11, outside review). argparse accepts any unambiguous prefix

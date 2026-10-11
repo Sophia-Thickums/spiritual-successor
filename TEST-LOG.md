@@ -80,7 +80,7 @@ appears without the GPU loading is a fake green, not a result.
     spirit run --role compute --card card1 -- vkmark --fullscreen \
       -b "shading:shading=phong:duration=15" -b "texture:anisotropy=16:duration=15" \
       -b "vertex:device-local=true:duration=15"
-vkmark's own header confirmed the device was the XT (Device ID 0x7550).
+vkmark's own header confirmed the device was the XT.
 **shading 35,635 FPS · texture 31,880 FPS · vertex 36,805 FPS · vkmark Score 34,773.**
 Monitor (58 samples) across the run: **card1 peak busy 100%, 250 W, 75 C**; card0/2/3 all 0%, 0 W.
 => the load was PROVABLY on exactly one card. **Positive control established. This is the baseline.**
@@ -688,14 +688,14 @@ benchmark entry point. The system crashed and the Instinct MI25 latched its own 
 to reboot.
 
 **Cause (prime suspect, NOT confirmed):** a fresh Proton/UE5 process makes Wine enumerate EVERY DRM
-device. That enumeration reached the MI25 on its external dock — a card/dock combination already known to
+device. That enumeration reached the docked MI25 — a card/dock combination already known to
 be fragile under the slightest load, which latches its own hard alarm that nothing in software can
 mute. **I did not isolate the benchmark from the other cards before launching it.** I had the tool to do
 so (`MESA_VK_DEVICE_SELECT=vid:did!`, proven only hours earlier) and did not use it.
 
 **THE RULE THIS CREATES (now enforced in `proton_bench.sh`):**
 **A BENCHMARK MUST NEVER BE ABLE TO ENUMERATE ALL CARDS BY ACCIDENT.** For a baseline run, the docked
-cards must be INVISIBLE to the process (`MESA_VK_DEVICE_SELECT=1002:7550!`), not merely idle. Enumerating
+cards must be INVISIBLE to the process (`MESA_VK_DEVICE_SELECT=<vendor:device>!`), not merely idle. Enumerating
 a device is ENOUGH to hurt it — loading it is not required. `FG_ISOLATE` now defaults to ON, and the
 runner prints a loud warning if it is ever turned off.
 
@@ -711,16 +711,16 @@ mean it to. **Isolate first, launch second.**
 ## ✔ VERIFIED 2026-10-09 (15:22 — read off this file's own mtime, not estimated) — THE ISOLATION FIX WORKS (clean A/B against the 15:10 incident)
 Same binary, same prefix, same launch path as the incident — the ONLY change is the isolation.
 **Result: no crash, no alarm, and the docked card was never touched.**
-- The MI25 (`0000:09:00.0`, external dock) sat at **32-33 °C / 0 % use for the entire run**.
-- The 9070 XT (`0000:03:00.0`) carried the load — 94-96 % busy, ~50 °C.
+- The docked MI25 sat at **32-33 °C / 0 % use for the entire run**.
+- The 9070 XT carried the load — 94-96 % busy, ~50 °C.
 - No `amdgpu` ring/timeout/reset lines in `dmesg` after the run.
-- A window opened: `the box b1`.
+- A window opened on the desktop.
 
 **The fix — two independent walls, each proven on the box:**
 1. `fg-bridge/drm_isolate.sh` — a mount namespace hides the three non-display cards' `/dev/dri`
    nodes behind `/dev/null`. Proven: an **unpinned** `vulkaninfo` inside it enumerates exactly ONE
    device. The host is untouched; the wall is scoped to the child.
-2. `MESA_VK_DEVICE_SELECT=1002:7550!` — the exclusive Vulkan pin (proven by vkmark / `spirit run`).
+2. `MESA_VK_DEVICE_SELECT=<vendor:device>!` — the exclusive Vulkan pin (proven by vkmark / `spirit run`).
 `proton_bench.sh` applies both by default (`FG_ISOLATE=1`), and prints a loud warning if turned off.
 
 **Still open:** the tool opened its UI, but the game module (`b1-Win64-Shipping.exe`) was not among
@@ -867,7 +867,7 @@ the exclusive pin exist to enforce.
 way (Steam, no pin) **rendered on the MI25** — the 9070 XT sat at **0% / 39 C / 22 W**, totally idle,
 while the game ran on the docked Vega10 through Gen3x4. Result: multi-second freezes (unplayable) and
 the MI25 hit **94 C — past its 90 C trip.** So an unpinned Vulkan game on this box does not merely
-risk enumeration damage; **it can CHOOSE the wrong GPU outright.** `MESA_VK_DEVICE_SELECT=1002:7550!`
+risk enumeration damage; **it can CHOOSE the wrong GPU outright.** `MESA_VK_DEVICE_SELECT=<vendor:device>!`
 pins it to the XT and makes the others invisible. (Second face of the same crash-class.)
 
 **THE CLEAN RUN (pinned to the XT, offload = MI25 + FE + iGPU):**
@@ -962,7 +962,7 @@ you say which, and never quote its figure as the card's temperature.
 | what | result |
 |---|---|
 | Proton | `Upgrading prefix from None to GE-Proton11-7` — **the FIRST-EVER prefix for appid 870780**, created and built |
-| walls | `★ ISOLATED: the app will see ONLY 1002:7550!` and `★ SECOND WALL: drm_isolate` — both held |
+| walls | `★ ISOLATED: the app will see ONLY <vendor:device>!` and `★ SECOND WALL: drm_isolate` — both held |
 | frame gen | lsfg-vk `Hooked new Vulkan device creation` → `Initializing lsfg-vk instance` — **a Vulkan device existed**, which is the point at which RE6 died |
 | witness | **4,822 images presented to the compositor in 93.5 s = 51.6 /s** |
 | exit | rc=0, game started and exited cleanly |
