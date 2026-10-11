@@ -1982,15 +1982,23 @@ static string dir_name(const string &path) {
 
 // Duration in seconds, or -1. -1 is returned, never a guess: a split whose extent is guessed drops
 // the tail silently.
+//
+// ★ NO SHELL. THIS USED TO BE A COMMAND INJECTION (found 2026-10-11 by an outside review; reproduced
+// here by construction). It built the string `ffprobe … '<filename>'` and handed it to popen(), so a
+// filename containing a single quote closed the quoting and everything after it was executed as a
+// separate command. `spirit play --work "x.mkv'; rm -rf ~; echo '"` was a live hazard in published
+// source. It now passes an argv vector straight to exec, the way Python's subprocess does, so the
+// filename is never seen by a shell. There is no quoting to get wrong because there is no shell.
 static double media_duration(const string &src) {
-    string cmd = "ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 '" + src +
-                 "' 2>/dev/null";
-    FILE *f = popen(cmd.c_str(), "r");
-    if (!f) return -1.0;
-    char buf[128] = {0};
-    if (!fgets(buf, sizeof(buf), f)) { pclose(f); return -1.0; }
-    pclose(f);
-    try { return std::stod(string(buf)); } catch (...) { return -1.0; }
+    vector<string> argv = {"ffprobe", "-v", "error", "-show_entries", "format=duration",
+                           "-of", "default=nw=1:nk=1", src};
+    std::optional<string> out = run_capture(argv, nullptr);
+    if (!out) return -1.0;
+    try {
+        return std::stod(trim(*out));
+    } catch (...) {
+        return -1.0;
+    }
 }
 
 // A REAL job on a spare card, to a real file — the WHOLE input, or one SEGMENT of it.
