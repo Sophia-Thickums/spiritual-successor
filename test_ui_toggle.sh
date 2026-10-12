@@ -41,7 +41,14 @@ export HOME="$FH" FAKEHOME="$FH"
 export PATH="$FH/bin:$PATH"
 
 cd "$SS"
-python3 spirit_ui.py --print-url --no-open --port 8899 > "$FH/ui.log" 2>&1 &
+# ★ THE SERVER MUST NOT INHERIT A PIN FROM THE SHELL THAT RUNS THE SUITE. `_pin_state()` reads
+#   `os.environ` FIRST and the manager second, so whatever this shell happens to carry decided the
+#   page's opening state — and a person who has ever run `spirit on` in their shell (or whose session
+#   manager carries it, which is the very thing this switch turns on) saw this suite fail on the line
+#   below. That is a check whose result depended on ambient state it never controlled. The manager is
+#   faked; the environment must be cleared to match, or the fake is not a fake.
+env -u MESA_VK_DEVICE_SELECT \
+    python3 spirit_ui.py --print-url --no-open --port 8899 > "$FH/ui.log" 2>&1 &
 UIPID=$!
 for i in $(seq 1 40); do sleep 0.5; grep -q "http" "$FH/ui.log" && break; done
 URL=$(grep -o 'http://127.0.0.1:[0-9]*/[^ ]*/' "$FH/ui.log" | head -1)
