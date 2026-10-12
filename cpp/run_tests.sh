@@ -273,28 +273,28 @@ print(json.dumps(d,indent=2,sort_keys=True))'
 # when set, replace the child's PATH / HOME for a single case (special stubs, isolated config).
 run_py() {
     if [ -n "$CHILD_PATH" ] && [ -n "$CHILD_HOME" ]; then
-        if [ -n "$FAKE" ]; then env HOME="$CHILD_HOME" PATH="$CHILD_PATH" SPIRIT_DEVICES="$FAKE" timeout 60 "$PYTHON" "$PYSPIRIT" "$@"
-        else env HOME="$CHILD_HOME" PATH="$CHILD_PATH" timeout 60 "$PYTHON" "$PYSPIRIT" "$@"; fi
+        if [ -n "$FAKE" ]; then env -u MESA_VK_DEVICE_SELECT HOME="$CHILD_HOME" PATH="$CHILD_PATH" SPIRIT_DEVICES="$FAKE" timeout 60 "$PYTHON" "$PYSPIRIT" "$@"
+        else env -u MESA_VK_DEVICE_SELECT HOME="$CHILD_HOME" PATH="$CHILD_PATH" timeout 60 "$PYTHON" "$PYSPIRIT" "$@"; fi
     elif [ -n "$CHILD_PATH" ]; then
-        if [ -n "$FAKE" ]; then env PATH="$CHILD_PATH" SPIRIT_DEVICES="$FAKE" timeout 60 "$PYTHON" "$PYSPIRIT" "$@"
-        else env PATH="$CHILD_PATH" timeout 60 "$PYTHON" "$PYSPIRIT" "$@"; fi
+        if [ -n "$FAKE" ]; then env -u MESA_VK_DEVICE_SELECT PATH="$CHILD_PATH" SPIRIT_DEVICES="$FAKE" timeout 60 "$PYTHON" "$PYSPIRIT" "$@"
+        else env -u MESA_VK_DEVICE_SELECT PATH="$CHILD_PATH" timeout 60 "$PYTHON" "$PYSPIRIT" "$@"; fi
     elif [ -n "$CHILD_HOME" ]; then
-        if [ -n "$FAKE" ]; then env HOME="$CHILD_HOME" SPIRIT_DEVICES="$FAKE" timeout 60 "$PYTHON" "$PYSPIRIT" "$@"
-        else env HOME="$CHILD_HOME" timeout 60 "$PYTHON" "$PYSPIRIT" "$@"; fi
-    elif [ -n "$FAKE" ]; then env SPIRIT_DEVICES="$FAKE" timeout 60 "$PYTHON" "$PYSPIRIT" "$@"
+        if [ -n "$FAKE" ]; then env -u MESA_VK_DEVICE_SELECT HOME="$CHILD_HOME" SPIRIT_DEVICES="$FAKE" timeout 60 "$PYTHON" "$PYSPIRIT" "$@"
+        else env -u MESA_VK_DEVICE_SELECT HOME="$CHILD_HOME" timeout 60 "$PYTHON" "$PYSPIRIT" "$@"; fi
+    elif [ -n "$FAKE" ]; then env -u MESA_VK_DEVICE_SELECT SPIRIT_DEVICES="$FAKE" timeout 60 "$PYTHON" "$PYSPIRIT" "$@"
     else timeout 60 "$PYTHON" "$PYSPIRIT" "$@"; fi
 }
 run_cpp() {
     if [ -n "$CHILD_PATH" ] && [ -n "$CHILD_HOME" ]; then
-        if [ -n "$FAKE" ]; then env HOME="$CHILD_HOME" PATH="$CHILD_PATH" SPIRIT_DEVICES="$FAKE" timeout 60 "$CPP" "$@"
-        else env HOME="$CHILD_HOME" PATH="$CHILD_PATH" timeout 60 "$CPP" "$@"; fi
+        if [ -n "$FAKE" ]; then env -u MESA_VK_DEVICE_SELECT HOME="$CHILD_HOME" PATH="$CHILD_PATH" SPIRIT_DEVICES="$FAKE" timeout 60 "$CPP" "$@"
+        else env -u MESA_VK_DEVICE_SELECT HOME="$CHILD_HOME" PATH="$CHILD_PATH" timeout 60 "$CPP" "$@"; fi
     elif [ -n "$CHILD_PATH" ]; then
-        if [ -n "$FAKE" ]; then env PATH="$CHILD_PATH" SPIRIT_DEVICES="$FAKE" timeout 60 "$CPP" "$@"
-        else env PATH="$CHILD_PATH" timeout 60 "$CPP" "$@"; fi
+        if [ -n "$FAKE" ]; then env -u MESA_VK_DEVICE_SELECT PATH="$CHILD_PATH" SPIRIT_DEVICES="$FAKE" timeout 60 "$CPP" "$@"
+        else env -u MESA_VK_DEVICE_SELECT PATH="$CHILD_PATH" timeout 60 "$CPP" "$@"; fi
     elif [ -n "$CHILD_HOME" ]; then
-        if [ -n "$FAKE" ]; then env HOME="$CHILD_HOME" SPIRIT_DEVICES="$FAKE" timeout 60 "$CPP" "$@"
-        else env HOME="$CHILD_HOME" timeout 60 "$CPP" "$@"; fi
-    elif [ -n "$FAKE" ]; then env SPIRIT_DEVICES="$FAKE" timeout 60 "$CPP" "$@"
+        if [ -n "$FAKE" ]; then env -u MESA_VK_DEVICE_SELECT HOME="$CHILD_HOME" SPIRIT_DEVICES="$FAKE" timeout 60 "$CPP" "$@"
+        else env -u MESA_VK_DEVICE_SELECT HOME="$CHILD_HOME" timeout 60 "$CPP" "$@"; fi
+    elif [ -n "$FAKE" ]; then env -u MESA_VK_DEVICE_SELECT SPIRIT_DEVICES="$FAKE" timeout 60 "$CPP" "$@"
     else timeout 60 "$CPP" "$@"; fi
 }
 
@@ -541,6 +541,14 @@ cmp_steam() { # label args...
 }
 # isolate HOME so the session-pin state is OFF for these cases regardless of the dev box
 PINOFF="$WORK/pinoff"; mkdir -p "$PINOFF"; CHILD_HOME="$PINOFF"
+# ★ THE ENVIRONMENT IS THE ISOLATION, AND THIS SUITE USED TO THINK HOME WAS. `_pin_active()` reads
+#   `os.environ` FIRST and the systemd user manager second; HOME is neither. So on a shell that
+#   carried the pin, the recipe line was never printed and the check below went red — a result that
+#   depended on ambient state this suite never controlled. The child env is now cleared of
+#   MESA_VK_DEVICE_SELECT in the runners above, which is the whole of it: the tool reads exactly one
+#   of these from the environment, and clearing the other two would shrink the differential for
+#   nothing. The manager needs no help here — `systemctl` is already stubbed to FAIL for every case
+#   on purpose, which the tool reads as "no manager", i.e. not active.
 cmp_steam "play -- steam:// (says it cannot be pinned; prints the recipe)" \
         play --no-offload -- steam://rungameid/123
 cmp_steam "play -- steam (fast clean exit -> session did NOT route the game)" \

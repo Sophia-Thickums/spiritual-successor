@@ -290,16 +290,16 @@ kill_stubs() {
 run_side() {
   bin=$1; shift
   if [ -n "$DEV" ] && [ -n "$CHILD_HOME" ]; then
-    env SPIRIT_DEVICES="$DEV" HOME="$CHILD_HOME" PATH="$PATHVAL" \
+    env -u MESA_VK_DEVICE_SELECT SPIRIT_DEVICES="$DEV" HOME="$CHILD_HOME" PATH="$PATHVAL" \
         STUB_UN="$UNLOG" STUB_FF="$FFLOG" STUB_GS="$GSLOG" "$bin" "$@"
   elif [ -n "$DEV" ]; then
-    env SPIRIT_DEVICES="$DEV" PATH="$PATHVAL" STUB_UN="$UNLOG" STUB_FF="$FFLOG" STUB_GS="$GSLOG" \
+    env -u MESA_VK_DEVICE_SELECT SPIRIT_DEVICES="$DEV" PATH="$PATHVAL" STUB_UN="$UNLOG" STUB_FF="$FFLOG" STUB_GS="$GSLOG" \
         "$bin" "$@"
   elif [ -n "$CHILD_HOME" ]; then
-    env -u SPIRIT_DEVICES HOME="$CHILD_HOME" PATH="$PATHVAL" \
+    env -u MESA_VK_DEVICE_SELECT -u SPIRIT_DEVICES HOME="$CHILD_HOME" PATH="$PATHVAL" \
         STUB_UN="$UNLOG" STUB_FF="$FFLOG" STUB_GS="$GSLOG" "$bin" "$@"
   else
-    env -u SPIRIT_DEVICES PATH="$PATHVAL" STUB_UN="$UNLOG" STUB_FF="$FFLOG" STUB_GS="$GSLOG" \
+    env -u MESA_VK_DEVICE_SELECT -u SPIRIT_DEVICES PATH="$PATHVAL" STUB_UN="$UNLOG" STUB_FF="$FFLOG" STUB_GS="$GSLOG" \
         "$bin" "$@"
   fi
 }
@@ -491,7 +491,14 @@ compare_steam() {
   else echo "PASS: $label   (rc=$prc)"; pass=$((pass+1)); fi
 }
 # isolate HOME so the session-pin state is OFF regardless of what this dev box has enabled
-PINOFF="$TMP/pinoff"; mkdir -p "$PINOFF"; CHILD_HOME="$PINOFF"
+# ★ THE ENVIRONMENT IS THE ISOLATION, AND THIS SUITE USED TO THINK HOME WAS. `pin_active` reads
+#   the ENVIRONMENT first and the systemd user manager second; HOME is neither. So on a shell that
+#   carried the pin, the recipe line was never printed and the check below went red — a result that
+#   depended on ambient state this suite never controlled. `run_side` now clears
+#   MESA_VK_DEVICE_SELECT from the child env, which is the whole of it: the tool reads exactly one of
+#   these from the environment, and clearing the other two would shrink the differential for nothing.
+#   The manager needs no help here — `systemctl` is already stubbed to FAIL for every case on purpose,
+#   which the tool reads as "no manager", i.e. not active.
 compare_steam "play -- steam:// (says it cannot be pinned; prints the recipe)" \
         "$FLEET10" play --no-offload -- steam://rungameid/123
 compare_steam "play -- steam (fast clean exit -> session did NOT route the game)" \
