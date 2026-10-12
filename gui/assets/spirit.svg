@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- one card driving the monitor, the others at work beside it -->
+  <rect x="6" y="6" width="116" height="116" rx="26" fill="#1b1a18"/>
+  <rect x="22" y="28" width="84" height="18" rx="7" fill="#8ad4ff"/>
+  <rect x="22" y="55" width="84" height="18" rx="7" fill="#3d3c39"/>
+  <rect x="22" y="82" width="84" height="18" rx="7" fill="#3d3c39"/>
+  <circle cx="36" cy="64" r="3.4" fill="#f0b357"/>
+  <circle cx="52" cy="64" r="3.4" fill="#8ad4ff"/>
+  <circle cx="36" cy="91" r="3.4" fill="#f0b357"/>
+  <circle cx="52" cy="91" r="3.4" fill="#8ad4ff"/>
+</svg>

@@ -194,7 +194,7 @@ def probe():
         cn = os.path.basename(card)
         online, nconn = connectors(cn)
         integrated = total is not None and total < 2 * 1024 ** 3
-        gpus.append({
+        g = {
             "card": cn, "bdf": bdf,
             "name": _lspci_name(bdf) or ("%s:%s" % (vendor[2:], device[2:])),
             "driver": driver, "vendor": vendor, "device": device,
@@ -215,7 +215,18 @@ def probe():
                 "own_reports_width": own_w,
                 "capped_by_topology": (own_w is not None and xw is not None and own_w > xw),
             },
-        })
+        }
+        # ★ THE TOOL'S OWN ANSWER ABOUT THIS CARD, PUBLISHED SO NO FRONT END HAS TO GUESS (2026-10-12,
+        # from the outside read of the desktop app). Both front ends re-derived "can this card take a
+        # job" from the driver name and a hardcoded link threshold — a second and a third copy of a rule
+        # that already lives here, and a copy can promise a job on a card this tool refuses. The answer
+        # travels with the card instead: a card, then can_encode, then marginal (the reason it is left
+        # out by default, or null).
+        _va, _why = _va_driver(g)
+        g["va_driver"] = _va
+        g["can_encode"] = _va is not None
+        g["marginal"] = _marginal(g)
+        gpus.append(g)
     gpus.sort(key=lambda g: -(g["link"]["gbps_max"] or 0))
     return {"gpufan": "probe/1.0.0", "gpus": gpus}
 

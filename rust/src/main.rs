@@ -1167,7 +1167,7 @@ fn probe() -> Json {
             _ => Json::Null,
         };
 
-        let g = Json::Obj(vec![
+        let mut g = Json::Obj(vec![
             ("card".into(), Json::Str(cn.clone())),
             ("bdf".into(), Json::Str(bdf.clone())),
             ("name".into(), Json::Str(name)),
@@ -1186,6 +1186,18 @@ fn probe() -> Json {
             ("has_output".into(), Json::Bool(online > 0)),
             ("link".into(), link),
         ]);
+        // ★ THE TOOL'S OWN ANSWER ABOUT THIS CARD, PUBLISHED (2026-10-12, from the outside read of the
+        // desktop app). Both front ends re-derived "can this card take a job" from the driver name and a
+        // hardcoded link threshold — a second and a third copy of a rule that already lives here, and a
+        // copy can promise a job on a card this tool refuses. The answer travels with the card instead.
+        let (vd, _why) = va_driver(&g);
+        let can = vd.is_some();
+        let marg = marginal(&g);
+        if let Json::Obj(ref mut m) = g {
+            m.push(("va_driver".into(), vd.map(Json::Str).unwrap_or(Json::Null)));
+            m.push(("can_encode".into(), Json::Bool(can)));
+            m.push(("marginal".into(), marg.map(Json::Str).unwrap_or(Json::Null)));
+        }
         gpus.push(g);
     }
 
