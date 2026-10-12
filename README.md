@@ -33,14 +33,17 @@ card is — its driver, its link, whether it can encode at all — and gives it 
 interrogate the card's encoder capabilities; that is honest scope, not a claim. What is *verified* so far is narrower than what is written: the
 encoder path has only ever been run on AMD hardware.
 
-Linux. No root. No packages to install — it is two Python files (`spirit.py` and the local page). It
-drives tools your machine may already have: ffmpeg for the jobs, gamescope for upscaling, `unshare` for
-the second wall, and `vulkaninfo` if you want `doctor` to be able to test device routing. It says so when
-one is missing rather than failing quietly, where it can. The optional frame-gen witness is the only piece that wants
-root, and you do not have to install it.
+Linux. No root either way. The command itself is two Python files (`spirit.py` and the local page) and
+needs nothing installed. The desktop app is a compiled program, so building it does need `cargo` and the
+GTK4 headers — the installer checks for them, says plainly if they are missing, and everything else works
+without it. The tool drives things your machine may already have: ffmpeg for the jobs, gamescope for
+upscaling, `unshare` for the second wall, and `vulkaninfo` if you want `doctor` to be able to test device
+routing. It says so when one is missing rather than failing quietly, where it can. The optional frame-gen
+witness is the only piece that wants root, and you do not have to install it.
 
-Three builds of the same tool: Python, C++, Rust. All three are held to byte-identical output by two
-differential test suites that compare each against the reference, on a fake fleet and on the live box.
+Three builds of the same tool: Python, C++, Rust. Two differential test suites compare each of them against
+the reference — on a fake fleet and on the live box. **They were last run in full at 1.0.0.** The only change
+since is the version string, and all three builds were checked by hand to print the same one.
 The page's on/off switch has its own test (`test_ui_toggle.sh`), which checks what actually happened — the
 session manager's environment and the file — against a fake home and a stub, so it never arms the machine
 it runs on.
@@ -52,11 +55,13 @@ it runs on.
 - **Not Lossless Scaling.** That scales one frame up and invents frames between them. This tool does
   neither — it moves work *off your game's card* onto the others. If you own Lossless Scaling, this
   tool can *drive* it (see **More frames**), but it does not include it, copy it, or reimplement it.
-- **Not SLI or CrossFire.** Those tried to make several cards behave like one faster card. They needed
-  matched cards, a bridge, and games rewritten to support them. This needs none of that.
-- **Not PRIME, DRI_PRIME, or "multi-GPU".** Every one of those moves your game's *rendering* to the big
-  card so that a smaller card can run the display. This is the opposite: your game keeps the card it
-  should have, and the other cards go and do something else entirely.
+- **Not SLI or CrossFire.** Those tried to make several cards behave like one faster card. They usually
+  needed matched cards and a bridge — though later CrossFire did not — and games had to be written to
+  support them. This needs none of that.
+- **Not PRIME, DRI_PRIME, or "multi-GPU".** The usual job of those is the opposite of this one: they move
+  your game's *rendering* to the big card so that a smaller card can run the display. (PRIME is a general
+  mechanism and can be pointed the other way; that is just not the common case.) Here, your game keeps the
+  card it should have, and the other cards go and do something else entirely.
 - **Not a way to make your game faster.** Your spare cards do not add frames to it. The win is the work
   they do while you play.
 - **Not Nvidia.** The pinning is Mesa-based, and the jobs run on a card's own video encoder — today
@@ -316,6 +321,20 @@ so the multiplier should be sized so base × N lands near your panel's refresh (
 4x from ~41). Beyond that you are paying for frames you will never see. Run `spirit boost` first: it says
 what is and is not available here. Frame generation can look wrong on fast movement — that is the
 technology, not this tool.
+
+**Three things to know before you try it, so it does not look broken when it is not.**
+
+1. **You install it, not this tool.** Frame generation is a separate project (`lsfg-vk`) and it needs your
+   own paid copy of Lossless Scaling. This tool does not include it, copy it, or reimplement it. If you do
+   not own it, nothing here will make frame generation appear.
+2. **It does nothing until something tells it which settings to use.** The layer loads into every Vulkan
+   game on your machine and then sits there silently. `--framegen` is what wakes it: it makes sure a
+   profile exists for the multiplier you asked for, and points the layer at it. If you have never opened
+   lsfg-vk's own settings program, this tool will say so and then launch your game **without** frame
+   generation — it will not write a settings file for a program it does not own.
+3. **The numbers above are this machine's, not yours.** They come from one card on one 2560x1440 screen.
+   Your card and your screen decide your multiplier — which is why the tool asks you for one instead of
+   choosing for you.
 
 ## Who this is for
 
