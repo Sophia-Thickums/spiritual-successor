@@ -41,6 +41,9 @@ root, and you do not have to install it.
 
 Three builds of the same tool: Python, C++, Rust. All three are held to byte-identical output by two
 differential test suites that compare each against the reference, on a fake fleet and on the live box.
+The page's on/off switch has its own test (`test_ui_toggle.sh`), which checks what actually happened — the
+session manager's environment and the file — against a fake home and a stub, so it never arms the machine
+it runs on.
 
 ---
 
