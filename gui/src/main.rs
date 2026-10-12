@@ -171,6 +171,195 @@ fn run_streaming(args: Vec<String>, ui: &Ui, header: &str, on_done: Option<Rc<dy
     });
 }
 
+/// Run SEVERAL jobs at once, one per card — the other shape from a split. `--split` divides ONE job
+/// across cards; this gives each card its own job. Both are real; they answer different questions.
+///
+/// ★ WHY THE APP DOES THIS AND NOT `spirit play` ON ITS OWN: the command takes one `--work FILE`
+/// (as it should — one job, one output, checked on disk). Running several at once means several
+/// commands, so the app starts one per card and shows them together. Each line is prefixed with the
+/// card it came from, because otherwise two jobs interleave into one unreadable stream — and that
+/// prefix is the only thing about the output that is not the tool's own words.
+fn run_batch(jobs: Vec<(String, Vec<String>)>, ui: &Ui, on_done: Rc<dyn Fn()>) {
+    let ui0 = ui.clone();
+    (ui.set_busy)(true);
+    let (tx, rx) = async_channel::unbounded::<String>();
+    let total = jobs.len();
+    for (label, argv) in jobs {
+        let tx = tx.clone();
+        let shown: Vec<String> = argv.iter().map(|a| shell_quote(a)).collect();
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(format!("$ spirit {}\n", shown.join(" ")));
+            let bin = spirit_bin();
+            match Command::new(&bin).args(&argv).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+                Ok(mut child) => {
+                    let mut handles = vec![];
+                    if let Some(out) = child.stdout.take() {
+                        let t = tx.clone();
+                        let l = label.clone();
+                        handles.push(std::thread::spawn(move || {
+                            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                                let _ = t.send_blocking(format!("[{}] {}", l, line));
+                            }
+                        }));
+                    }
+                    if let Some(err) = child.stderr.take() {
+                        let t = tx.clone();
+                        let l = label.clone();
+                        handles.push(std::thread::spawn(move || {
+                            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                                let _ = t.send_blocking(format!("[{}] {}", l, line));
+                            }
+                        }));
+                    }
+                    let code = child.wait().ok().and_then(|s| s.code());
+                    for h in handles {
+                        let _ = h.join();
+                    }
+                    let _ = tx.send_blocking(format!(
+                        "[{}] — finished (rc={}) —",
+                        label,
+                        code.map(|c| c.to_string()).unwrap_or_else(|| "?".into())
+                    ));
+                }
+                Err(e) => {
+                    let _ = tx.send_blocking(format!("[{}] could not run: {}", label, e));
+                }
+            }
+            // ★ A COMPLETION TOKEN PER JOB, so the pane knows when ALL of them are done rather than
+            //   guessing from a timer or from one child. ★★ THIS MUST STAY THE LAST THING A WORKER SENDS.
+            //   The reader stops as soon as it has counted one token per job, so anything sent after a
+            //   token would be silently dropped. That is not a latent bug today — it is a constraint on
+            //   anyone editing this function later. (Outside read, 2026-10-12.)
+            let _ = tx.send_blocking(format!("\u{1}DONE\u{1}{}", label));
+        });
+    }
+
+    let seen = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    glib::spawn_future_local(async move {
+        while let Ok(line) = rx.recv().await {
+            if let Some(rest) = line.strip_prefix('\u{1}') {
+                if rest.starts_with("DONE\u{1}") {
+                    seen.set(seen.get() + 1);
+                    if seen.get() >= total {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            let mut end = ui0.buf.end_iter();
+            ui0.buf.insert(&mut end, &(line + "\n"));
+            if ui0.buf.char_count() > 400_000 {
+                let mut start = ui0.buf.start_iter();
+                let mut cut = ui0.buf.start_iter();
+                cut.forward_chars(ui0.buf.char_count() / 4);
+                ui0.buf.delete(&mut start, &mut cut);
+            }
+            ui0.buf.move_mark(&ui0.mark, &ui0.buf.end_iter());
+            ui0.view.scroll_mark_onscreen(&ui0.mark);
+        }
+        (ui0.set_busy)(false);
+        on_done();
+    });
+}
+
+/// Decide WHICH cards, then start one job per card. Split out so the card lookup can happen off the
+/// main thread — the same freeze that was fixed in the card list, and reintroduced here by accident.
+fn cards_for_jobs(files: Vec<String>, named: Vec<String>, ui: &Ui) {
+    if !named.is_empty() {
+        start_jobs(files, named, ui);
+        return;
+    }
+    // ★ OFF THE MAIN THREAD. `probe` touches hardware. Calling it inline here froze the window on
+    //   exactly the machine that most needed to show something — the same fault the card list was
+    //   moved off-thread for. (Caught by the outside read, 2026-10-12.)
+    (ui.set_busy)(true);
+    let (tx, rx) = async_channel::bounded::<(String, String)>(1);
+    std::thread::spawn(move || {
+        let p = run_spirit(&["probe", "--json"]).1;
+        let r = run_spirit(&["roles", "--json"]).1;
+        let _ = tx.send_blocking((p, r));
+    });
+    let ui2 = ui.clone();
+    glib::spawn_future_local(async move {
+        let (pt, rt) = rx.recv().await.unwrap_or_default();
+        let probe: serde_json::Value = serde_json::from_str(&pt).unwrap_or(serde_json::Value::Null);
+        let roles: serde_json::Value = serde_json::from_str(&rt).unwrap_or(serde_json::Value::Null);
+        let main = roles
+            .as_array()
+            .and_then(|a| {
+                a.iter()
+                    .find(|r| {
+                        r.get("roles").and_then(|v| v.as_array())
+                            .map(|x| x.iter().any(|y| y.as_str() == Some("display")))
+                            .unwrap_or(false)
+                    })
+                    .and_then(|r| r.get("card"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default();
+        // ★ A USABLE CARD WITH NO RENDER NODE IS COUNTED, NOT DROPPED SILENTLY. It used to vanish in a
+        //   filter_map, which is the one thing this app is built not to do. (Outside read.)
+        let mut cards: Vec<String> = Vec::new();
+        let mut no_node = 0usize;
+        if let Some(arr) = probe.get("gpus").and_then(|g| g.as_array()) {
+            for g in arr {
+                let usable = g.get("can_encode").and_then(|v| v.as_bool()).unwrap_or(false)
+                    && g.get("marginal").map(|m| m.is_null()).unwrap_or(false)
+                    && g.get("card").and_then(|v| v.as_str()) != Some(main.as_str());
+                if !usable {
+                    continue;
+                }
+                match g.get("render_node").and_then(|v| v.as_str()) {
+                    Some(n) => cards.push(n.to_string()),
+                    None => no_node += 1,
+                }
+            }
+        }
+        if no_node > 0 {
+            let mut end = ui2.buf.end_iter();
+            ui2.buf.insert(&mut end, &format!(
+                "— {} card(s) can encode but reported no render node, so they were not used. Said here \
+                 rather than dropped. —\n", no_node));
+            ui2.buf.move_mark(&ui2.mark, &ui2.buf.end_iter());
+            ui2.view.scroll_mark_onscreen(&ui2.mark);
+        }
+        start_jobs(files, cards, &ui2);
+    });
+}
+
+/// One job per card, all at once. Never more jobs than cards, and what will not run is SAID.
+fn start_jobs(files: Vec<String>, mut cards: Vec<String>, ui: &Ui) {
+    let mut end = ui.buf.end_iter();
+    if cards.is_empty() {
+        ui.buf.insert(&mut end,
+            "No card can take a job here. Either there is no spare card, or the spares are on narrow \
+             links — name one in \"Extra cards\" to use it anyway.\n");
+        ui.buf.move_mark(&ui.mark, &ui.buf.end_iter());
+        ui.view.scroll_mark_onscreen(&ui.mark);
+        return;
+    }
+    let overflow = files.len().saturating_sub(cards.len());
+    cards.truncate(files.len());
+    let mut jobs: Vec<(String, Vec<String>)> = Vec::new();
+    for (i, card) in cards.iter().enumerate() {
+        jobs.push((
+            card.clone(),
+            vec!["play".into(), "--work".into(), files[i].clone(),
+                 "--spare".into(), card.clone(), "--".into(), "true".into()],
+        ));
+    }
+    ui.buf.insert(&mut end, &format!("— {} job(s), one per card, all at once —\n", jobs.len()));
+    if overflow > 0 {
+        ui.buf.insert(&mut end, &format!(
+            "— {} chosen file(s) were NOT started: there are only {} usable card(s). Said here so \
+             nothing disappears quietly. —\n", overflow, cards.len()));
+    }
+    ui.buf.move_mark(&ui.mark, &ui.buf.end_iter());
+    ui.view.scroll_mark_onscreen(&ui.mark);
+    run_batch(jobs, ui, Rc::new(|| {}));
+}
+
 // ── the window ───────────────────────────────────────────────────────────────────────────────────
 fn build_ui(app: &adw::Application) {
     let window = adw::ApplicationWindow::builder()
@@ -225,7 +414,10 @@ fn build_ui(app: &adw::Application) {
                       encoders, the slices are joined back into one file, and every output is checked on \
                       disk afterwards. Any card left out is named.")
         .build();
-    let file_row = adw::ActionRow::builder().title("Video file").subtitle("none chosen").build();
+    let file_row = adw::ActionRow::builder()
+        .title("Files")
+        .subtitle("none chosen — choose one or several; one job goes to each spare card")
+        .build();
     let choose = gtk::Button::with_label("Choose…");
     choose.set_valign(gtk::Align::Center);
     file_row.add_suffix(&choose);
@@ -488,73 +680,73 @@ fn build_ui(app: &adw::Application) {
     // choose a file
     {
         let file_row = file_row.clone();
-        let chosen: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let chosen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let chosen2 = chosen.clone();
         let window2 = window.clone();
         let has_file2 = has_file.clone();
         let set_busy2 = set_busy.clone();
         let busy2 = busy.clone();
         choose.connect_clicked(move |_| {
-            let dlg = gtk::FileDialog::builder().title("Choose a video file").build();
+            // ★ SEVERAL FILES AT ONCE. `open` returns one file; a batch needs `open_multiple`.
+            let dlg = gtk::FileDialog::builder().title("Choose one or more video files").build();
             let file_row = file_row.clone();
             let chosen3 = chosen2.clone();
             let has_file3 = has_file2.clone();
             let set_busy3 = set_busy2.clone();
             let busy3 = busy2.clone();
-            dlg.open(Some(&window2), gio::Cancellable::NONE, move |res| {
-                if let Ok(f) = res {
-                    if let Some(p) = f.path() {
-                        // ★ MUST BE A FILE. A dialog can return a directory; the old code enabled the
-                        // button on anything and handed a directory to the job.
-                        if !p.is_file() {
-                            file_row.set_subtitle("that is not a file — choose a video");
-                            *chosen3.borrow_mut() = None;
-                            has_file3.set(false);
-                        } else {
-                            let ps = p.display().to_string();
-                            file_row.set_subtitle(&glib::markup_escape_text(&ps));
-                            *chosen3.borrow_mut() = Some(ps);
-                            has_file3.set(true);
+            dlg.open_multiple(Some(&window2), gio::Cancellable::NONE, move |res| {
+                if let Ok(list) = res {
+                    let mut picked: Vec<String> = Vec::new();
+                    let mut skipped = 0usize;
+                    for i in 0..list.n_items() {
+                        let Some(obj) = list.item(i) else { continue };
+                        let Ok(f) = obj.downcast::<gio::File>() else { continue };
+                        if let Some(p) = f.path() {
+                            if p.is_file() {
+                                picked.push(p.display().to_string());
+                            } else {
+                                skipped += 1;   // a directory; counted, never silently ignored
+                            }
                         }
-                        // ★ RE-APPLY THE ONE GATE, never force a control on. Calling set_busy(false) here
-                        // re-enabled Run, Doctor and the switches MID-JOB (outside read, 2026-10-12).
-                        (set_busy3)(busy3.get());
                     }
+                    if picked.is_empty() {
+                        file_row.set_subtitle("nothing usable chosen — that was not a file");
+                        *chosen3.borrow_mut() = Vec::new();
+                        has_file3.set(false);
+                    } else {
+                        let shown = if picked.len() == 1 {
+                            picked[0].clone()
+                        } else {
+                            format!("{} files chosen — first is {}", picked.len(), picked[0])
+                        };
+                        file_row.set_subtitle(&glib::markup_escape_text(&shown));
+                        *chosen3.borrow_mut() = picked;
+                        has_file3.set(true);
+                    }
+                    let _ = skipped;
+                    // ★ RE-APPLY THE ONE GATE, never force a control on. Calling set_busy(false) here
+                    // re-enabled Run, Doctor and the switches MID-JOB (outside read, 2026-10-12).
+                    (set_busy3)(busy3.get());
                 }
             });
         });
         let ui2 = ui.clone();
         let spare_entry = spare_entry.clone();
         run.connect_clicked(move |_| {
-            if let Some(p) = chosen.borrow().clone() {
-                let mut argv = vec![
-                    "play".to_string(),
-                    "--work".to_string(),
-                    p,
-                    "--split".to_string(),
-                ];
-                // ★ ONE NAME PER PIECE, TRIMMED, EMPTIES DROPPED. The tool itself splits on commas and
-                //   spaces and trims each name, so "renderD131, renderD130" already worked — but a
-                //   trailing or doubled comma ("renderD130,", "a,,b") would hand it an empty token, and
-                //   a field that accepts a card name the machine does not have is the one place in this
-                //   app where a user can express something untrue. TODO: replace this field with a
-                //   checkbox per card built from the same rows that already say "left out by default —
-                //   … (name it with --spare)", which would make an unmatchable name unrepresentable.
-                let named: String = spare_entry
-                    .text()
-                    .split(',')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                if !named.is_empty() {
-                    argv.push("--spare".to_string());
-                    argv.push(named);
-                }
-                argv.push("--".to_string());
-                argv.push("true".to_string());
-                run_streaming(argv, &ui2, "job on the other cards", None);
+            let files = chosen.borrow().clone();
+            if files.is_empty() {
+                return;
             }
+            // ★ ONE NAME PER PIECE, TRIMMED, EMPTIES DROPPED: a trailing or doubled comma must not hand
+            //   the tool an empty token. Named cards are used exactly as given, in order, and the card
+            //   lookup for the unnamed case happens off the main thread inside `cards_for_jobs`.
+            let named: Vec<String> = spare_entry
+                .text()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            cards_for_jobs(files, named, &ui2);
         });
     }
 
