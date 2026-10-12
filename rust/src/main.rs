@@ -59,7 +59,7 @@ const PCI: &str = "/sys/bus/pci/devices";
 
 // ★ THE ONE VERSION STRING — identical to the Python `VERSION` and the C++ `VERSION`. `--version`
 // prints it as `spirit 1.0.0`; it is the value a bug report should quote back.
-const VERSION: &str = "1.0.0";
+const VERSION: &str = "1.1.0";
 
 fn gen_name(speed: f64) -> Option<&'static str> {
     match speed {

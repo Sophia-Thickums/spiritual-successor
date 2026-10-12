@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     viewBox="0 0 128 128" width="128" height="128">
+  <!-- OPTION 4 (GPU, v3) — REAL PROPORTIONS, taken from published dimensions and product photographs.
+       ★ WHAT CHANGED FROM v2 AND WHY: v2's cards were nearly square (52 x 56). Real graphics cards are
+       LONG AND LOW. From the manufacturers' own sheets: PowerColor RX 9070 XT 289 x 111 mm (2.60:1),
+       Intel Arc B580 272 x 115 (2.37:1), AMD RX 7900 XTX 287 x 123 (2.33:1), Intel Arc A750 LE
+       280 x 115 (2.43:1). Every card below is drawn at 2.5:1.
+       Three more things every photo agreed on: two big axial fans whose diameter is 75-85% of the
+       card's height (they almost touch the top and bottom edges), and a silver I/O bracket standing at
+       the LEFT END with a screw tab.
+       ★ THE GOLD PCIe CONNECTOR STRIP IS DELIBERATELY ABSENT — do not "restore" it. It was drawn
+       (a #c9a227 bar along the bottom-left third) and the owner had it removed on sight, on both the cyan
+       and the amber cards: at icon scale a yellow line under the card reads as an artefact, not as a
+       connector. Realism lost to legibility, on purpose. The I/O bracket stays; the gold does not.
+       Fans are FILLED DISCS, not outlines — an outlined ring is under one pixel at 32 px and
+       disappears completely at 22 px (measured on v1). -->
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="#1b1a18"/>
+
+  <defs>
+    <!-- one card drawn in a 100 x 40 box = 2.5 : 1, then placed three times at different scales -->
+    <g id="cardCyan">
+      <rect x="0" y="0" width="100" height="40" rx="5" fill="#8ad4ff"/>
+      <rect x="-4" y="-3" width="4" height="43" rx="1" fill="#c9ccd4"/>
+      <g transform="translate(27,20)">
+        <circle r="16.5" fill="#10303f"/>
+        <g stroke="#8ad4ff" stroke-width="3.4" stroke-linecap="round" fill="none">
+          <line x1="6" y1="0" x2="13.5" y2="0"/>
+          <line x1="1.85" y1="5.71" x2="4.17" y2="12.84"/>
+          <line x1="-4.85" y1="3.53" x2="-10.92" y2="7.94"/>
+          <line x1="-4.85" y1="-3.53" x2="-10.92" y2="-7.94"/>
+          <line x1="1.85" y1="-5.71" x2="4.17" y2="-12.84"/>
+        </g>
+        <circle r="3.4" fill="#8ad4ff"/>
+      </g>
+      <g transform="translate(62,20)">
+        <circle r="16.5" fill="#10303f"/>
+        <g stroke="#8ad4ff" stroke-width="3.4" stroke-linecap="round" fill="none">
+          <line x1="6" y1="0" x2="13.5" y2="0"/>
+          <line x1="1.85" y1="5.71" x2="4.17" y2="12.84"/>
+          <line x1="-4.85" y1="3.53" x2="-10.92" y2="7.94"/>
+          <line x1="-4.85" y1="-3.53" x2="-10.92" y2="-7.94"/>
+          <line x1="1.85" y1="-5.71" x2="4.17" y2="-12.84"/>
+        </g>
+        <circle r="3.4" fill="#8ad4ff"/>
+      </g>
+    </g>
+    <g id="cardAmber">
+      <rect x="0" y="0" width="100" height="40" rx="5" fill="#f0b357"/>
+      <rect x="-4" y="-3" width="4" height="43" rx="1" fill="#c9ccd4"/>
+      <g transform="translate(27,20)">
+        <circle r="16.5" fill="#3a2a0c"/>
+        <g stroke="#f0b357" stroke-width="3.4" stroke-linecap="round" fill="none">
+          <line x1="6" y1="0" x2="13.5" y2="0"/>
+          <line x1="1.85" y1="5.71" x2="4.17" y2="12.84"/>
+          <line x1="-4.85" y1="3.53" x2="-10.92" y2="7.94"/>
+          <line x1="-4.85" y1="-3.53" x2="-10.92" y2="-7.94"/>
+          <line x1="1.85" y1="-5.71" x2="4.17" y2="-12.84"/>
+        </g>
+        <circle r="3.4" fill="#f0b357"/>
+      </g>
+      <g transform="translate(62,20)">
+        <circle r="16.5" fill="#3a2a0c"/>
+        <g stroke="#f0b357" stroke-width="3.4" stroke-linecap="round" fill="none">
+          <line x1="6" y1="0" x2="13.5" y2="0"/>
+          <line x1="1.85" y1="5.71" x2="4.17" y2="12.84"/>
+          <line x1="-4.85" y1="3.53" x2="-10.92" y2="7.94"/>
+          <line x1="-4.85" y1="-3.53" x2="-10.92" y2="-7.94"/>
+          <line x1="1.85" y1="-5.71" x2="4.17" y2="-12.84"/>
+        </g>
+        <circle r="3.4" fill="#f0b357"/>
+      </g>
+    </g>
+  </defs>
+
+  <!-- THE WIRING between the cards, drawn first so its ends tuck behind them.
+       ★ THE SPINE NOW REACHES THE LINE FROM YOUR CARD. It used to stop at y=53.6 (the centre of the
+       lower card) while the run from your card arrived at y=67.6 — a 14-unit gap, so the two yellow
+       cards hung off a spine that never met your card. Extended to 67.6: one connected path. -->
+  <path d="M51 72 V67.6 H67 M67 21.6 V67.6 M67 21.6 H74 M67 53.6 H74"
+        stroke="#8a8e99" stroke-width="4" stroke-linecap="round" fill="none"/>
+
+  <!-- YOUR CARD (2.5:1, 86 wide) -->
+  <!-- ★ `xlink:href` AND `href` BOTH, deliberately (outside read, 2026-10-12). Plain `href` is SVG 2;
+       librsvg is the library that renders freedesktop icons, and older versions on LTS desktops honour
+       only `xlink:href`. Since this file is installed into other people's icon themes, both attributes
+       are given so no panel shows a blank square. -->
+  <use xlink:href="#cardCyan" href="#cardCyan" transform="translate(8,72) scale(0.86)"/>
+  <!-- THE OTHERS, TAKING WORK (2.5:1, 48 wide) -->
+  <use xlink:href="#cardAmber" href="#cardAmber" transform="translate(74,12) scale(0.48)"/>
+  <use xlink:href="#cardAmber" href="#cardAmber" transform="translate(74,44) scale(0.48)"/>
+</svg>

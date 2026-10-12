@@ -51,9 +51,11 @@ using std::vector;
 
 extern char **environ;
 
-// ★ THE ONE VERSION STRING — identical to the Python `VERSION` and the Rust `VERSION`. `--version`
-// prints it as `spirit 1.0.0`; it is the value a bug report should quote back.
-static const char *VERSION = "1.0.0";
+// ★ THE ONE VERSION STRING — identical to the Python `VERSION` and the Rust `VERSION`.
+// `--version` prints it as `spirit <version>`, and that is the value a bug report should quote back.
+// ★ No version number is written into this comment on purpose: a comment that quotes one goes stale
+//   every release (it did, at the 1.1.0 bump), and the constant below is the only place it belongs.
+static const char *VERSION = "1.1.0";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // tiny ordered JSON DOM (key order preserved; int/float distinguished)

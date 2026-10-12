@@ -8,7 +8,7 @@ human-readable output text, the same JSON structure and the same exit codes.
 promise). The binary shells out to `lspci`, `vulkaninfo`, `gamescope`, `unshare`,
 `ffmpeg` *only when they are present*, exactly as the Python does.
 
-Current parity target: **spirit.py v1.0.0** (the `boost` command, `play --scale` /
+Current parity target: **spirit.py v1.1.0** (the `boost` command, `play --scale` /
 `play --framegen`, the two new `doctor` checks, and `--version`).
 
 ## Build

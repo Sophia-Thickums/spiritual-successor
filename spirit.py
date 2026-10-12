@@ -47,7 +47,7 @@ CARD_RE = re.compile(r"^card\d+$")
 # ★ THE ONE VERSION STRING. Every surface that names a version reads it from here: `--version`,
 # the Rust crate manifest, and the UI's Server header. It is deliberately a plain literal so all
 # three builds (Python, C++, Rust) can carry the identical string by hand.
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 def _read(p):
