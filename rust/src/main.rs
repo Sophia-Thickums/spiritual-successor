@@ -3169,7 +3169,7 @@ fn va_driver(g: &Json) -> (Option<String>, Option<String>) {
 ///
 /// ★ THE DEFAULT REQUIRES AN x8-OR-WIDER HOST LINK (tightened 2026-10-12). It used to require only
 /// "wider than x4", which excluded an x1 card but let an x4 card through — and x4 is exactly the shape
-/// the incident was: an externally-docked card, an M.2/external adapter, or a shared-port card. Width is
+/// the incident was: an externally-docked card, an M.2-to-PCIe adapter, or a shared-port card. Width is
 /// read from the HOST link only. Matches Python's `_marginal` byte for byte.
 fn marginal(g: &Json) -> Option<String> {
     let link = g.get("link");

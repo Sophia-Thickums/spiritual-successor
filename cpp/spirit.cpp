@@ -2360,7 +2360,7 @@ static std::pair<string, string> va_driver(const J &g) {
 // the threshold is in the ★ block below. This matches Python's `_marginal` byte for byte.
 // ★ THE DEFAULT REQUIRES AN x8-OR-WIDER HOST LINK (tightened 2026-10-12). It used to require only
 // "wider than x4", which excluded an x1 card but let an x4 card through — and x4 is exactly the shape
-// the incident was: an externally-docked card, an M.2/external adapter, or a shared-port card. The rule
+// the incident was: an externally-docked card, an M.2-to-PCIe adapter, or a shared-port card. The rule
 // is on the HOST link width, never on the card's own bridge. This matches Python's `_marginal` byte
 // for byte.
 static std::optional<string> marginal_reason(const J &g) {

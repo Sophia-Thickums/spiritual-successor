@@ -1164,7 +1164,7 @@ def _marginal(g):
 
     ★ THE DEFAULT REQUIRES AN x8-OR-WIDER HOST LINK. It used to require only "wider than x4", which
     excluded an x1 card but let an x4 card through — and x4 is exactly the shape the incident was:
-    an externally-docked card, an M.2/external adapter, or a shared-port card. The rule is on the
+    an externally-docked card, an M.2-to-PCIe adapter, or a shared-port card. The rule is on the
     HOST link width, never on the card's own bridge ( see below), so a stranger's x4 slot card is
     caught by the same line — it is usable, just not assumed. Name it with --spare to include it.
 
