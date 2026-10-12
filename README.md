@@ -219,14 +219,17 @@ spirit enable     # optional: arm the pin for every launch from now on, Steam in
 `doctor` does not describe your machine — it tests it. It launches a real program on every card and
 checks that the card can be seen, read, and pinned. Give it a minute.
 
-There is also a small local page if you would rather not use a terminal:
+There is also a small local page if you would rather not use a terminal — and the installer puts it in
+your applications menu, so it is usually one click and no typing at all:
 
 ```
-spirit ui
+spirit ui                 # from a terminal
+                          # or: find "Spiritual Successor" in your applications menu
 ```
 
 It shows your cards, what each one is for, whether upscaling and frame generation are available here,
-and a box to launch your game from. It listens on your own machine only.
+a box to launch your game from, a button to give your other cards a job, and the on/off switch for the
+whole thing. It listens on your own machine only.
 
 ## Known limits
 
