@@ -2997,6 +2997,25 @@ fn boost(db: &Json) -> i32 {
 // ── play: the game path — the strongest card renders, every other card works the tail ──
 fn main_card(db: &Json) -> Option<Json> {
     let gpus = gpus_of(db);
+    // ★ THE CARD ACTUALLY DRIVING A DISPLAY OUTRANKS A CARD MERELY PLUGGED IN (fix 2026-10-12, from the
+    // outside read). See the Python `_main_card` docstring: `has_output` is "a connector reads
+    // connected", while doctor judges the display card by the ACTIVE CRTC. Two definitions of the one
+    // decision that matters most. Order: active CRTC, then connected, then top scorer. (A fixture has
+    // no sysfs, so enabled_connectors is empty and this falls through as before.)
+    let driving: Vec<Json> = gpus
+        .iter()
+        .filter(|g| !enabled_connectors(&card_of(g)).is_empty())
+        .cloned()
+        .collect();
+    if !driving.is_empty() {
+        let mut best: Option<&Json> = None;
+        for c in &driving {
+            if best.is_none() || score(c) > score(best.unwrap()) {
+                best = Some(c);
+            }
+        }
+        return best.cloned();
+    }
     let panel: Vec<Json> = gpus.iter().filter(|g| has_output(g)).cloned().collect();
     let pool: Vec<Json> = if !panel.is_empty() { panel } else { gpus.clone() };
     let mut best: Option<&Json> = None;
@@ -3145,13 +3164,18 @@ fn va_driver(g: &Json) -> (Option<String>, Option<String>) {
 /// ★ `capped_by_topology` IS NOT A PROXY FOR "BEHIND AN EXTERNAL BRIDGE" ( blocking item
 /// 12). It fires whenever the card's OWN bridge reports wider than the host gives — which is the
 /// NORMAL case for every modern AMD card, because Vega, Navi and RDNA all contain an internal PCIe
-/// switch. A wide-but-capped card is not the dock shape. A genuinely NARROW link (below x4) is, and
-/// that is the only rule left here.
+/// switch. A wide-but-capped card is not the dock shape. Width is read from the HOST link only; the
+/// threshold is in the ★ block below.
+///
+/// ★ THE DEFAULT REQUIRES AN x8-OR-WIDER HOST LINK (tightened 2026-10-12). It used to require only
+/// "wider than x4", which excluded an x1 card but let an x4 card through — and x4 is exactly the shape
+/// the incident was: an externally-docked card, an M.2/external adapter, or a shared-port card. Width is
+/// read from the HOST link only. Matches Python's `_marginal` byte for byte.
 fn marginal(g: &Json) -> Option<String> {
     let link = g.get("link");
     let w = link.and_then(|l| l.get("max_width")).and_then(|v| v.as_i64());
     if let Some(w) = w {
-        if w < 4 {
+        if w < 8 {
             return Some(format!("x{} link at the host — too narrow to use unasked", w));
         }
     }
@@ -3266,6 +3290,37 @@ fn start_work(
         .stderr(Stdio::null())
         .spawn()?;
     Ok((out, ch))
+}
+
+/// Join the split pieces into ONE file, stream-copy (no re-encode). See Python's `_join_slices` for the
+/// why: `--split` proved the work was DIVIDED, and this gives the user their video back as ONE file.
+/// Returns (ok, detail); `detail` carries NO interpolated runtime error text so the builds agree.
+fn join_slices(parts: &[String], out_path: &str) -> (bool, String) {
+    let lst = format!("{}.concat.txt", out_path);
+    let mut body = String::new();
+    for p in parts {
+        let esc = abspath_os(p).replace('\'', "'\\''");
+        body.push_str(&format!("file '{}'\n", esc));
+    }
+    if fs::write(&lst, body).is_err() {
+        return (false, "the join could not be started (check ffmpeg and the output path)".into());
+    }
+    let _ = fs::remove_file(out_path);
+    let st = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
+               "-i", lst.as_str(), "-c", "copy", out_path])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = fs::remove_file(&lst);
+    let rc = match st {
+        Ok(s) => rc_of(&s),
+        Err(_) => return (false, "the join could not be started (check ffmpeg and the output path)".into()),
+    };
+    if rc != 0 || !std::path::Path::new(out_path).is_file() {
+        return (false, format!("ffmpeg could not join the pieces (rc={})", rc));
+    }
+    (true, String::new())
 }
 
 /// The card's short name, as the role table prints it. Python `_gpu_name`:
@@ -3815,6 +3870,10 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
     }
     let want_work = !work.is_empty();
     let want_load = test_load.is_some();
+    // ★ The normalised job output directory, hoisted to the function body so the join block below
+    // (which prints ONE OUTPUT FILE after the game exits) can name the joined path. Without this the
+    // join has no directory to write into — `outdir` is only in scope inside the work block.
+    let mut job_outdir = String::new();
     if do_offload && (want_work || want_load) && which("ffmpeg").is_some() {
         for (node, nm, why) in &skipped {
             println!("  spare: SKIPPED {} ({}) — {}", node, nm, why);
@@ -3867,6 +3926,7 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
                 println!("          (the job needs a directory it can write to; check the path)");
                 return 1;
             }
+            job_outdir = outdir.clone();
             job_start_time = Some(epoch_secs()); // anything older than this is a STALE output
             let stem = stem_of(work);
             if split && targets.len() > 1 {
@@ -4123,7 +4183,12 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
                 && job_start_time
                     .map(|t| mtime_secs(out).map(|m| m >= t - 1.0).unwrap_or(false))
                     .unwrap_or(true);
-            let d = if fresh && rcode == 0 { media_duration(out) } else { 0.0 };
+            // ★ A NEGATIVE DURATION IS NOT A MEASUREMENT (parity fix 2026-10-12, surfaced by the release
+            // candidate's fleet change). `media_duration` returns -1.0 when ffprobe cannot read the file,
+            // and Python stores `d or 0.0` (None -> 0.0). This printed the raw -1.0, so the same run read
+            // `(0.0 MB, -1.0s)` here against `(0.0 MB, 0.0s)` in the other two builds. Clamp, like they do.
+            let d0 = if fresh && rcode == 0 { media_duration(out) } else { 0.0 };
+            let d = if d0 > 0.0 { d0 } else { 0.0 };
             results.push((node.clone(), out.clone(), fresh && rcode == 0, d));
         }
         let got: f64 = results.iter().map(|(_, _, _, d)| *d).sum();
@@ -4156,6 +4221,43 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
             let tol = if job_expect * 0.01 < 1.0 { 1.0 } else { job_expect * 0.01 };
             if written == job_outputs.len() && (got - job_expect).abs() <= tol {
                 println!("  ⇒ COMPLETE — the pieces reconstruct the whole input (within 1%).");
+                // ★ ONE FILE BACK (a held-release defect, 2026-10-12). The split above proved the work
+                // was DIVIDED; this gives the user their video as ONE file again. The pieces stay on
+                // disk as the evidence.
+                let parts: Vec<String> = job_outputs.iter().map(|(_n, o)| o.clone()).collect();
+                let joined = format!("{}/{}.joined.mp4", job_outdir, stem_of(work));
+                let (ok_j, why_j) = join_slices(&parts, &joined);
+                println!("  ── ONE OUTPUT FILE {}", "─".repeat(52));
+                if ok_j {
+                    let jd = media_duration(&joined);
+                    let jsz = std::fs::metadata(&joined).map(|m| m.len()).unwrap_or(0);
+                    let jtol = if job_expect * 0.01 < 1.0 { 1.0 } else { job_expect * 0.01 };
+                    if jd > 0.0 && (jd - job_expect).abs() <= jtol {
+                        println!(
+                            "  {}  ({:.1} MB, {:.1}s)",
+                            base_of(&joined),
+                            jsz as f64 / 1048576.0,
+                            jd
+                        );
+                        println!(
+                            "  The whole input as one file, built from the {} slices above.",
+                            job_outputs.len()
+                        );
+                    } else {
+                        println!(
+                            "  {} was written but runs {:.1}s against the input's {:.1}s — keep the slices; the join may have dropped the tail.",
+                            base_of(&joined),
+                            if jd > 0.0 { jd } else { 0.0 },
+                            job_expect
+                        );
+                    }
+                } else {
+                    println!("  join FAILED — {}.", why_j);
+                    println!(
+                        "  The {} slices above are intact; concatenate them yourself or re-run.",
+                        job_outputs.len()
+                    );
+                }
             } else {
                 println!(
                     "  ⇒ INCOMPLETE — {:.1}s of {:.1}s. The split LOST footage; do not report it as ok.",

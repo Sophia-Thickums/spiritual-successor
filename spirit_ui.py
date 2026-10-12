@@ -104,6 +104,49 @@ def _short(name, limit=46):
     return n if len(n) <= limit else n[:limit - 1] + "\u2026"
 
 
+# ★ KEEP IN STEP WITH spirit.py, deliberately mirrored rather than shelled out for: the page must never
+# promise a job on a card the tool will refuse. From the outside read (2026-10-12): the cards table
+# labelled an nvidia card "available for jobs" (it has no VAAPI encoder the tool knows) and a narrow-link
+# card too, in the one place the CLI is careful to name both.
+_VA_DRIVERS = {"amdgpu": "radeonsi", "i915": "iHD", "xe": "iHD"}   # == spirit.VA_DRIVERS
+_NARROW_BELOW = 8                                                  # == spirit._marginal's threshold
+
+
+def _pin_state():
+    """(on: bool, text) for this machine's GPU pin — the thing the page's On/Off buttons change.
+
+    ★ MIRRORS spirit.py's OWN DEFINITION, deliberately. The pin is ON when a process can actually
+    receive it: this process already carries it, or the systemd user manager does (which is what
+    apps started from now on inherit). "A file exists" is NOT the test — a file proves only that
+    someone wrote it, and a Steam that was already running never picked it up. Persisted-for-later
+    is reported as its own state so nobody reads it as "on right now".
+    """
+    live = bool(os.environ.get("MESA_VK_DEVICE_SELECT"))
+    if not live:
+        try:
+            r = subprocess.run(["systemctl", "--user", "show-environment"],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                live = any(l.startswith("MESA_VK_DEVICE_SELECT=")
+                           for l in (r.stdout or "").splitlines())
+        except Exception:
+            pass
+    persisted = False
+    try:
+        with open(os.path.join(os.path.expanduser("~"), ".config", "environment.d",
+                               "90-spirit.conf")) as f:
+            persisted = any(l.startswith("MESA_VK_DEVICE_SELECT=") for l in f)
+    except OSError:
+        pass
+    if live and persisted:
+        return True, "On — this session, and after every reboot."
+    if live:
+        return True, "On — this session only. A reboot turns it back off."
+    if persisted:
+        return True, "On — written for your next login; this running session does not have it yet."
+    return False, "Off — the tool pins only the games it launches itself."
+
+
 # ---------------------------------------------------------------------------------------------
 # background actions: doctor and play. A thread per action writes into a buffer; the page polls.
 # ---------------------------------------------------------------------------------------------
@@ -296,6 +339,24 @@ function giveWork() {
       poll(d.job, pre, btn);
     }).catch(function (e) { pre.textContent = "Could not start: " + e; btn.disabled = false; });
 }
+function togglePin(on) {
+  var btn = document.getElementById(on ? "onbtn" : "offbtn");
+  var other = document.getElementById(on ? "offbtn" : "onbtn");
+  var pre = document.getElementById("toggleout");
+  btn.disabled = true; other.disabled = true;
+  pre.classList.remove("hidden");
+  pre.textContent = "Working\\u2026";
+  var body = "on=" + (on ? "1" : "0") +
+             "&persist=" + (document.getElementById("persist").checked ? "1" : "0");
+  fetch("/__TOKEN__/api/toggle", { method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: body })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      pre.textContent = d.output || d.error || "";
+      if (d.state) { document.getElementById("togglestate").textContent = d.state; }
+      btn.disabled = false; other.disabled = false;
+    }).catch(function (e) { pre.textContent = "Could not run: " + e; btn.disabled = false; other.disabled = false; });
+}
 """
 
 PAGE = """<!doctype html>
@@ -311,6 +372,23 @@ PAGE = """<!doctype html>
   <h2>Your cards</h2>
   <table><thead><tr><th>Card</th><th>Link (estimated)</th><th>Doing</th></tr></thead>
   <tbody>__CARDS__</tbody></table>
+</section>
+
+<section>
+  <h2>Keep it on</h2>
+  <p class="hint">By default the tool pins only the game it launches itself. Turn it on and every
+  game you start &mdash; from Steam, from anywhere &mdash; renders on the card your monitor is
+  plugged into, leaving the others free for jobs. This is the whole program's switch, and it is a
+  switch on purpose: nothing is armed at boot unless you tick the box. The pin is written for the cards
+  as they are today &mdash; if you move the monitor cable, turn it off and on again.</p>
+  <p class="state" id="togglestate">__TOGGLESTATE__</p>
+  <p><label class="opt"><input type="checkbox" id="persist"> also keep it on after a reboot
+  <span class="honest">(this box applies to Turn on only)</span></label></p>
+  <p>
+    <button id="onbtn" onclick="togglePin(true)">Turn on</button>
+    <button id="offbtn" onclick="togglePin(false)">Turn off</button>
+  </p>
+  <pre id="toggleout" class="hidden"></pre>
 </section>
 
 <section>
@@ -344,10 +422,12 @@ PAGE = """<!doctype html>
 
 <section>
   <h2>Give your other cards a job</h2>
-  <p class="hint">Put the path to a video file here. Your other cards will encode it &mdash; on their
-  own, with no game running. Nothing to configure and no command line: pick the file, press the
-  button. Every output is then checked on disk, so you are told what was actually written rather
-  than that it &ldquo;worked&rdquo;.</p>
+  <p class="hint">Put the path to a video file here. The cards that can take a job will encode it
+  &mdash; on their own, with no game running. Nothing to configure and no command line: pick the file,
+  press the button. The pieces are joined back into <strong>one file</strong>, and every output is then
+  checked on disk, so you are told what was actually written rather than that it
+  &ldquo;worked&rdquo;. The output names every card it used &mdash; and every card it left out, and
+  why.</p>
   <input type="text" id="workfile" placeholder="/home/you/videos/lecture.mp4" style="width:100%">
   <p><button id="workbtn" onclick="giveWork()">Use my other cards</button></p>
   <pre id="workout" class="hidden"></pre>
@@ -402,8 +482,19 @@ def render_page():
         else:
             link_txt = "%s GB/s max" % r.get("link_gbps_max")
         is_main = "display" in (r.get("roles") or [])
-        doing = ('<span class="mine">your game</span>' if is_main
-                 else '<span class="spare">spare &mdash; available for jobs</span>')
+        driver = (g.get("driver") or "").lower()
+        if is_main:
+            doing = '<span class="mine">your game</span>'
+        elif driver not in _VA_DRIVERS:
+            doing = ('<span class="spare">spare &mdash; cannot take jobs: no VAAPI encoder for '
+                     '&ldquo;%s&rdquo;</span>' % html.escape(driver or "unknown"))
+        else:
+            w = link.get("max_width")
+            if w is not None and w < _NARROW_BELOW:
+                doing = ('<span class="spare">spare &mdash; x%s link, too narrow to use unasked '
+                         '(name it with --spare)</span>' % w)
+            else:
+                doing = '<span class="spare">spare &mdash; available for jobs</span>'
         rows.append("<tr><td>%s</td><td>%s</td><td>%s</td></tr>"
                     % (html.escape(name), html.escape(link_txt), doing))
     cards_html = "\n".join(rows) or '<tr><td colspan="3">No cards found.</td></tr>'
@@ -455,6 +546,7 @@ def render_page():
             .replace("__JS__", JS)
             .replace("__TOKEN__", TOKEN)
             .replace("__CARDS__", cards_html)
+            .replace("__TOGGLESTATE__", html.escape(_pin_state()[1]))
             .replace("__UPSCALE__", up_html)
             .replace("__FRAMEGEN__", fg_html)
             .replace("__WITNESS__", witness_html)
@@ -539,6 +631,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"job": start_work(path)})
         if rest == ["api", "doctor"]:
             return self._send_json({"job": start_doctor()})
+        if rest == ["api", "toggle"]:
+            # The whole program's on/off switch, from the page. It runs the tool's OWN `enable` /
+            # `disable` rather than re-implementing the pin here, so the two can never drift; and it
+            # reports the state back as the tool defines it, not as "the button was pressed".
+            on = (form.get("on") or ["0"])[0] == "1"
+            persist = (form.get("persist") or ["0"])[0] == "1"
+            if on:
+                args = ["enable"] + (["--persist"] if persist else [])
+            else:
+                args = ["disable"]
+            rc, text = _run(args, timeout=60)
+            return self._send_json({"output": text, "state": _pin_state()[1]})
         if rest == ["api", "play"]:
             cmd_text = (form.get("cmd") or [""])[0].strip()
             scale = (form.get("scale") or [""])[0].strip()

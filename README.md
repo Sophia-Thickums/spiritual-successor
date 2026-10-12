@@ -9,14 +9,15 @@ same time — encoding video, on their own hardware encoders:
 spirit play --work video.mp4 --split -- ./yourgame
 ```
 
-That cuts the video into pieces and encodes one piece on each card it will use. When the game exits, it
-checks on disk that the pieces add back up to the full length of the original.
+That cuts the video into pieces, encodes one piece on each card it will use, and then joins the pieces
+back into **one file**. When the game exits, it checks on disk that the pieces add up to the full length
+of the original — and the joined file is the output you keep.
 
-**By default it uses only cards on a wide host link.** A card behind a narrow slot or a slow riser is
-named and left out unless you ask for it:
+**By default it uses only cards on a wide host link.** Anything narrower than eight lanes — a card in a
+narrow slot, on a slow riser, or on a dock — is named and left out unless you ask for it:
 
 ```
-  job: NOT using renderD129 (Vega 10) — the host link is narrower than the card reports (x4)
+  job: NOT using renderD129 (Vega 10) — x4 link at the host — too narrow to use unasked
        Add --spare renderD129 to include it anyway.
 ```
 
@@ -124,6 +125,9 @@ with a 12-second clip and two usable spare cards:
   slice durations sum : 12.0s
   original duration   : 12.0s
   ⇒ COMPLETE — the pieces reconstruct the whole input (within 1%).
+  ── ONE OUTPUT FILE ───────────────────────────────────────────────────
+  clip.joined.mp4  (10.8 MB, 12.0s)
+  The whole input as one file, built from the 2 slices above.
   ── THE TAIL — what the other cards did ───────────────────────────────
   renderD131   GPU C                   REAL JOB  …/clip.renderD131_part1.mp4
   renderD129   GPU A                   REAL JOB  …/clip.renderD129_part2.mp4
@@ -133,9 +137,10 @@ Every job output is checked on disk afterwards — it exists, it was written by 
 `--split` its duration is added up against the input to within a second or one percent, whichever is
 larger — on a clip shorter than 100 seconds the rule applied is the one-second tolerance, not the
 percentage. A file that did not get written says `MISSING` and the split says `INCOMPLETE`. Nothing here
-takes a process's exit code for an answer. Without `--split` each card transcodes the whole input, so a
-shortened file will still report as present; the `--split` check is the one that proves the pieces
-reconstruct.
+takes a process's exit code for an answer. Under `--split` the pieces are then joined back into one file
+(`clip.joined.mp4`), whose own duration is checked against the input before it is announced; the pieces
+stay on disk beside it. Without `--split` each card transcodes the whole input, so a shortened file will
+still report as present; the `--split` check is the one that proves the pieces reconstruct.
 
 (Card names are whatever `lspci` calls them, shortened — shown here as placeholders. Run `spirit probe` on
 your own machine to see yours.)
@@ -236,6 +241,15 @@ and a box to launch your game from. It listens on your own machine only.
 - **A session-wide pin hides your other cards from Vulkan apps in the session**, a compute job included.
   That is the point for a game; on a machine that also computes on those cards, leave it off and use
   `spirit play` per launch.
+- **A split is joined by stream copy, so slices from *different* encoders are joined, not proven
+  seam-clean.** Each slice is encoded by the card that took it; on AMD cards they share an encoder, but a
+  split that spans AMD and Intel cards produces a file whose start, middle and end were written by
+  different encoders. The joined file's total duration is checked against the input; the seam between two
+  different encoders' output is not, because nothing here can verify it. If you split across makers and
+  the result looks wrong mid-file, re-encode the joined file once.
+- **Split boundaries land on keyframes.** The tool seeks by keyframe, so a slice may begin slightly before
+  or after its nominal second. The check adds the pieces up and compares them to the input, which catches a
+  missing or truncated slice — it cannot see a fraction of a second of overlap or gap at a seam.
 
 ## Commands
 
