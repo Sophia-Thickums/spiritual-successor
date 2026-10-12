@@ -3680,13 +3680,68 @@ static string manager_env_text() {
     return r.out;
 }
 
-// True when the manager's environment carries exactly K=V on a line of its own.
+// Undo the shell quoting systemd puts around a value it cannot print bare.
+// ★ PROVED AGAINST THE REAL MANAGER, 2026-10-12: `systemctl --user show-environment` prints
+// `MESA_VK_DEVICE_SELECT=$'1002:7550!'`. The `$'...'` wrapper appears for any value containing a
+// character outside systemd's safe set, and the exclusive-pin marker `!` is outside it — so is a
+// space, a quote, a backslash. Comparing the printed LINE made this build unable to recognise its own
+// pin, and the off switch removed the other two variables, said so, and left the session armed.
+static string unquote_manager_value(const string &v) {
+    if (v.size() >= 3 && v[0] == '$' && v[1] == '\'' && v[v.size() - 1] == '\'') {
+        const string body = v.substr(2, v.size() - 3);
+        string out;
+        // The whole set systemd emits, not three of it — octal and hex included. A table that stops at
+        // n/t/r decodes a numerically-escaped byte into its digits, the comparison fails, and the pin is
+        // left armed: the same silent skip, narrower. (Outside read, 2026-10-12.)
+        size_t i = 0;
+        while (i < body.size()) {
+            if (body[i] != '\\' || i + 1 >= body.size()) { out += body[i++]; continue; }
+            const char e = body[i + 1];
+            if (e >= '0' && e <= '7') {
+                string d; size_t j = i + 1;
+                while (j < body.size() && d.size() < 3 && body[j] >= '0' && body[j] <= '7') d += body[j++];
+                out += (char)(strtol(d.c_str(), nullptr, 8) & 0xFF);
+                i = j;
+            } else if (e == 'x') {
+                string d; size_t j = i + 2;
+                while (j < body.size() && d.size() < 2 && isxdigit((unsigned char)body[j])) d += body[j++];
+                if (!d.empty()) { out += (char)strtol(d.c_str(), nullptr, 16); i = j; }
+                else { out += 'x'; i += 2; }
+            } else {
+                switch (e) {
+                    case 'n': out += '\n'; break;
+                    case 't': out += '\t'; break;
+                    case 'r': out += '\r'; break;
+                    case 'a': out += '\a'; break;
+                    case 'b': out += '\b'; break;
+                    case 'f': out += '\f'; break;
+                    case 'v': out += '\v'; break;
+                    default:  out += e;    break;
+                }
+                i += 2;
+            }
+        }
+        return out;
+    }
+    return v;
+}
+
+// True when the manager's environment carries exactly K=V on a line of its own, with V compared as the
+// VALUE — not as the line systemd typed.
 static bool env_text_has(const string &txt, const string &kv) {
+    const size_t eq = kv.find('=');
+    if (eq == string::npos) return false;
+    const string want_k = kv.substr(0, eq), want_v = kv.substr(eq + 1);
     size_t i = 0;
     while (i <= txt.size()) {
         size_t j = txt.find('\n', i);
         if (j == string::npos) j = txt.size();
-        if (txt.compare(i, j - i, kv) == 0) return true;
+        const string line = txt.substr(i, j - i);
+        const size_t e2 = line.find('=');
+        if (e2 != string::npos && line.substr(0, e2) == want_k &&
+            unquote_manager_value(line.substr(e2 + 1)) == want_v) {
+            return true;
+        }
         if (j >= txt.size()) break;
         i = j + 1;
     }

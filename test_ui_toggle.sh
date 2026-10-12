@@ -10,10 +10,35 @@ rm -rf "$FH"; mkdir -p "$FH/.config" "$FH/bin"
 cat > "$FH/bin/systemctl" <<'EOS'
 #!/bin/sh
 # Minimal systemd-user-manager stand-in. Records every call.
+#
+# ★ IT QUOTES VALUES THE WAY THE REAL MANAGER DOES. The real `show-environment` prints a value in
+#   shell syntax — `$'1002:7550!'` — whenever it contains a character outside its safe set, and the
+#   exclusive-pin marker `!` is outside it. This fake used to print values raw, so it could never
+#   catch a parser that forgot to strip the wrapper. That is exactly how the off switch shipped
+#   broken on 2026-10-12: it removed DRI_PRIME and PROTON_FSR4_UPGRADE, said so, and walked past
+#   MESA_VK_DEVICE_SELECT, because that is the only one systemd quotes. A fake kinder than the real
+#   thing tests nothing.
+_quote_val() {
+  v=$1
+  if printf '%s' "$v" | grep -qE '^[A-Za-z0-9:/._=~+%@^#{}-]*$'; then
+    printf '%s' "$v"
+  else
+    esc=$(printf '%s' "$v" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")
+    printf "\$'%s'" "$esc"
+  fi
+}
 echo "$@" >> "$FAKEHOME/systemctl.log"
 if [ "$1" = "--user" ]; then
   case "$2" in
-    show-environment) cat "$FAKEHOME/manager.env" 2>/dev/null; exit 0 ;;
+    show-environment)
+      if [ -f "$FAKEHOME/manager.env" ]; then
+        while IFS= read -r line; do
+          k=${line%%=*}
+          if [ "$k" = "$line" ]; then printf '%s\n' "$line"; continue; fi
+          printf '%s=%s\n' "$k" "$(_quote_val "${line#*=}")"
+        done < "$FAKEHOME/manager.env"
+      fi
+      exit 0 ;;
     set-environment)  shift 2
         for kv in "$@"; do
           k=${kv%%=*}
