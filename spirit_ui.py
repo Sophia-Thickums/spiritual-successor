@@ -167,6 +167,22 @@ def start_play(cmd, scale, framegen):
     return jid
 
 
+def start_work(path):
+    """Give the other cards a job with no game involved.
+
+    ★ THE ACCESSIBLE PATH IS THE PAGE, NOT A COMMAND LINE. A person who wants their other cards to
+    work on a video should not have to compose an ffmpeg line, know a device-variable name, or pick
+    a card — so the page does it: this takes one file path and nothing else.
+
+    The 'game' is a no-op on purpose. A job is never killed with the game (jobs are WAITED FOR and
+    each output is checked on disk), so a no-op game means the job simply runs to completion and the
+    page reports what was really written."""
+    argv = [PY, SPIRIT, "play", "--work", path, "--split", "--", "true"]
+    jid = _new_job()
+    threading.Thread(target=_run_job, args=(jid, argv), daemon=True).start()
+    return jid
+
+
 # ---------------------------------------------------------------------------------------------
 # the page
 # ---------------------------------------------------------------------------------------------
@@ -263,6 +279,23 @@ function doctor() {
       poll(d.job, pre, btn);
     }).catch(function (e) { pre.textContent = "Could not start: " + e; btn.disabled = false; });
 }
+function giveWork() {
+  var btn = document.getElementById("workbtn");
+  var pre = document.getElementById("workout");
+  var f = document.getElementById("workfile").value.trim();
+  if (!f) { pre.classList.remove("hidden"); pre.textContent = "Choose the video file first."; return; }
+  btn.disabled = true;
+  pre.classList.remove("hidden");
+  pre.textContent = "Starting\\u2026";
+  fetch("/__TOKEN__/api/work", { method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: "file=" + encodeURIComponent(f) })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (d.error) { pre.textContent = d.error; btn.disabled = false; return; }
+      poll(d.job, pre, btn);
+    }).catch(function (e) { pre.textContent = "Could not start: " + e; btn.disabled = false; });
+}
 """
 
 PAGE = """<!doctype html>
@@ -307,6 +340,17 @@ PAGE = """<!doctype html>
   <textarea id="cmd" placeholder="./yourgame"></textarea>
   <p><button id="playbtn" onclick="launch()">Launch</button></p>
   <pre id="playout" class="hidden"></pre>
+</section>
+
+<section>
+  <h2>Give your other cards a job</h2>
+  <p class="hint">Put the path to a video file here. Your other cards will encode it &mdash; on their
+  own, with no game running. Nothing to configure and no command line: pick the file, press the
+  button. Every output is then checked on disk, so you are told what was actually written rather
+  than that it &ldquo;worked&rdquo;.</p>
+  <input type="text" id="workfile" placeholder="/home/you/videos/lecture.mp4" style="width:100%">
+  <p><button id="workbtn" onclick="giveWork()">Use my other cards</button></p>
+  <pre id="workout" class="hidden"></pre>
 </section>
 
 <section>
@@ -486,6 +530,13 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
         form = parse_qs(raw)
+        if rest == ["api", "work"]:
+            path = (form.get("file") or [""])[0].strip()
+            if not path:
+                return self._send_json({"error": "Choose the video file first."})
+            if not os.path.isfile(path):
+                return self._send_json({"error": "No file there: %s" % path})
+            return self._send_json({"job": start_work(path)})
         if rest == ["api", "doctor"]:
             return self._send_json({"job": start_doctor()})
         if rest == ["api", "play"]:
