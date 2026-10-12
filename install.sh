@@ -33,11 +33,14 @@ chmod +x "$BIN/spirit"
 # ---------------------------------------------------------------------------------------------
 GUI="$BIN/spirit-gui"
 if command -v cargo >/dev/null 2>&1 && command -v pkg-config >/dev/null 2>&1 \
-   && pkg-config --exists gtk4 2>/dev/null; then
+   && pkg-config --exists gtk4 2>/dev/null && pkg-config --exists libadwaita-1 2>/dev/null; then
   echo "Building the desktop app… (the first build takes a few minutes)"
   TMPGUI="$(mktemp -d)"
   # ★ A TRAP, so an interrupted build does not leave a few hundred MB of cargo target in /tmp.
-  trap 'rm -rf "$TMPGUI"' EXIT INT TERM
+  #   ★ INT/TERM MUST EXIT (outside read, 2026-10-12): a trap that only cleans up lets Ctrl-C kill
+  #   cargo and then the install CARRY ON as if nothing happened.
+  trap 'rm -rf "$TMPGUI"' EXIT
+  trap 'rm -rf "$TMPGUI"; exit 130' INT TERM
   mkdir -p "$TMPGUI/src"
   curl -fsSL "$BASE/gui/Cargo.toml"  -o "$TMPGUI/Cargo.toml"
   curl -fsSL "$BASE/gui/src/main.rs" -o "$TMPGUI/src/main.rs"
@@ -51,7 +54,7 @@ if command -v cargo >/dev/null 2>&1 && command -v pkg-config >/dev/null 2>&1 \
   rm -rf "$TMPGUI"
 else
   echo
-  echo "Desktop app: NOT built — it needs cargo and the GTK4 development headers."
+  echo "Desktop app: NOT built — it needs cargo and the GTK4 + libadwaita development headers."
   echo "             Arch/CachyOS:   sudo pacman -S rust gtk4 libadwaita"
   echo "             Debian/Ubuntu:  sudo apt install cargo libgtk-4-dev libadwaita-1-dev"
   echo "             Everything below still works without it."
@@ -87,7 +90,7 @@ write_entry() {   # $1 = file to write, $2 = extra lines
 Type=Application
 Name=Spiritual Successor
 GenericName=Multi-GPU offload
-Comment=Play on the card your monitor is on. Your other cards do the work beside you.
+Comment=Play on the card your monitor is on; give your other GPUs a job when you ask.
 Exec=$EXEC
 Icon=spirit
 Terminal=false
@@ -109,7 +112,10 @@ write_entry "$APPS/com.sophia.SpiritualSuccessor.desktop" ""
 #   leaving it true spins the launching cursor forever.
 write_entry "$APPS/spirit-gui.desktop" "NoDisplay=true"
 
-command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS" >/dev/null 2>&1
+# ★ `|| true`: under `set -e` a nonzero from update-desktop-database would ABORT the script here
+#   (outside read, 2026-10-12), silently skipping the PATH instructions below. A missing menu index
+#   is not a reason to fail an install.
+command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS" >/dev/null 2>&1 || true
 
 echo "Launcher:  $APPS/com.sophia.SpiritualSuccessor.desktop"
 echo "           (find 'Spiritual Successor' in your applications menu)"

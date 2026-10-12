@@ -4232,7 +4232,8 @@ fn play(db: &Json, cmd: &[String], do_offload: bool, scale: Option<f64>, framege
             println!("  original duration   : {:.1}s", job_expect);
             let tol = if job_expect * 0.01 < 1.0 { 1.0 } else { job_expect * 0.01 };
             if written == job_outputs.len() && (got - job_expect).abs() <= tol {
-                println!("  ⇒ COMPLETE — the pieces reconstruct the whole input (within 1%).");
+                println!("  ⇒ COMPLETE — the pieces reconstruct the whole input (within {}).",
+                         if job_expect < 100.0 { "1 second" } else { "1%" });
                 // ★ ONE FILE BACK (a held-release defect, 2026-10-12). The split above proved the work
                 // was DIVIDED; this gives the user their video as ONE file again. The pieces stay on
                 // disk as the evidence.
@@ -4743,8 +4744,8 @@ fn print_help(cmd: Option<&str>) {
         None => {
             println!("usage: spirit [-h] [--version] {{probe,roles,plan,doctor,origin,boost,fg}} ...");
             println!();
-            println!("Spiritual Successor — put every GPU to work");
-            println!("commands: probe · roles · plan · doctor · fg · boost · enable · disable · run · play · ui  (`run` and `play` take a command after `--`)");
+            println!("Spiritual Successor — give a machine's spare GPUs real work, when you ask for it");
+            println!("commands: probe · roles · plan · doctor · origin · boost · fg · enable · disable · run · play · ui  (`run` and `play` take a command after `--`)");
             println!();
             println!("positional arguments:");
             println!("  {{probe,roles,plan,doctor,origin,boost,fg}}");

@@ -261,6 +261,32 @@ ln -sf "$STUB/gamescope"  "$FASTLOAD/gamescope"
 ln -sf "$STUB/vulkaninfo" "$FASTLOAD/vulkaninfo"
 ln -sf "$STUB/ffprobe"    "$FASTLOAD/ffprobe"
 
+# ★ DROPB (regression, outside read 2026-10-12): a split where ONE slice is MISSING. The input reports
+# 1.000 s and each part reports 0.500 s, so the survivor is WITHIN the 1 s tolerance of the original —
+# the case where a verdict that checked only the duration sum would say COMPLETE while one that also
+# requires every slice written says INCOMPLETE. (C++ compared only the sum until 2026-10-12; Python and
+# Rust always required the count.) Durations are keyed on the FILENAME, not on file content, so the case
+# does not depend on how a build happens to probe.
+DROPB="$TMP/bin-dropb"; mkdir -p "$DROPB"
+cat > "$DROPB/ffmpeg" <<'EOF'
+#!/bin/sh
+last=""; for a in "$@"; do last="$a"; done
+case "$last" in
+    *_part1.mp4) [ -n "$last" ] && : > "$last"; exit 0 ;;
+    *) exit 1 ;;
+esac
+EOF
+cat > "$DROPB/ffprobe" <<'EOF'
+#!/bin/sh
+case "$*" in
+    *_part1.mp4|*_part2.mp4) echo 0.500 ;;
+    *)                       echo 1.000 ;;
+esac
+EOF
+chmod +x "$DROPB"/*
+ln -sf "$STUB/unshare"   "$DROPB/unshare"
+ln -sf "$STUB/gamescope" "$DROPB/gamescope"
+
 # normalizer for the live probe --json (drops the fields that legitimately flap run to run)
 NORM_JSON='import sys,json
 d=json.load(sys.stdin)
@@ -598,6 +624,13 @@ echo
 echo "== C: a real SPLIT — COMPLETE (2 parts sum back) vs INCOMPLETE (3 do not) (B3) =="
 compare "play --split 2 cards -> COMPLETE"    "$TMP/split2.json" play --work "$TMP/job.mkv" --split -- /bin/echo HI
 compare "play --split 3 cards -> INCOMPLETE"  "$TMP/split3.json" play --work "$TMP/job.mkv" --split -- /bin/echo HI
+# ★ THE DIVERGENCE ITSELF (regression, outside read 2026-10-12): a 2-slice split of a 1 s input where one
+# slice is MISSING. The survivor is 0.5 s — within the 1 s tolerance — so a verdict that checked only the
+# duration sum would say COMPLETE while one that also requires every slice written says INCOMPLETE.
+: > "$TMP/job_short.mkv"
+PATHVAL="$DROPB:$REAL_PATH"
+compare "play --split one MISSING slice inside tolerance (regression)" "$TMP/split2.json" play --work "$TMP/job_short.mkv" --split -- /bin/echo HI
+PATHVAL="$STUB:$REAL_PATH"
 compare "play --work replication writes output" "$TMP/split2.json" play --work "$TMP/job.mkv" -- /bin/echo HI
 compare "play --work non-file -> REFUSED (B3)" "$FLEET10" play --work "$TMP/nonfile-dir" -- /bin/echo HELLO
 

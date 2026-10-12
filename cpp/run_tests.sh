@@ -179,6 +179,31 @@ out=""; for a in "$@"; do out="$a"; done
 exit 0
 EOF
 chmod +x "$BADSUB"/*
+# FAILDROP: a split where ONE slice fails. ffmpeg writes a real output for _part1 only and exits nonzero
+# for the rest, so _part2 is MISSING on disk. The input reports 1.000 s and each part 0.500 s, so the
+# 0.5 s survivor is WITHIN the 1 s tolerance of the original — which is exactly the case where the C++
+# build once printed COMPLETE (it compared only the duration sum) while Python and Rust printed
+# INCOMPLETE (they also require every slice written). Durations are keyed on the FILENAME, not on file
+# content, so the case does not depend on how a build happens to probe. A regression case for that
+# divergence (outside read, 2026-10-12): it MUST go red against the pre-fix C++ binary.
+FAILDROP="$WORK/faildrop"; mkdir -p "$FAILDROP"
+cp "$STUB/unshare" "$STUB/gamescope" "$FAILDROP/"
+cat > "$FAILDROP/ffmpeg" <<'EOF'
+#!/bin/sh
+last=""; for a in "$@"; do last="$a"; done
+case "$last" in
+    *_part1.mp4) [ -n "$last" ] && : > "$last"; exit 0 ;;
+    *) exit 1 ;;
+esac
+EOF
+cat > "$FAILDROP/ffprobe" <<'EOF'
+#!/bin/sh
+case "$*" in
+    *_part1.mp4|*_part2.mp4) echo 0.500 ;;
+    *)                       echo 1.000 ;;
+esac
+EOF
+chmod +x "$FAILDROP"/*
 
 # ★ LAUNCHER TOOLS FOR THE SPECIAL PATH SETS (fix 2026-10-11). cmp_cmd_path REPLACES the child's PATH
 # wholesale, but every case that uses one is launched as `env PATH=$SPECIAL timeout 60 python3|./spirit …`.
@@ -188,7 +213,7 @@ chmod +x "$BADSUB"/*
 # and could not fail — a suite that tested nothing while looking green. Give them the launcher, and `sh`
 # (the unshare hide-wrapper runs `sh -c`), while leaving each set's DELIBERATE omissions intact
 # (NOPROBE's ffprobe, MINB's unshare/gamescope/vulkaninfo). MINB already carries the launcher.
-for d in "$FASTB" "$BADSUB" "$EARLY" "$DEADB"; do
+for d in "$FASTB" "$BADSUB" "$FAILDROP" "$EARLY" "$DEADB"; do
     for t in timeout python3 sh; do
         [ -e "$d/$t" ] || { p=$(command -v "$t") && ln -sf "$p" "$d/$t"; }
     done
@@ -196,6 +221,10 @@ done
 
 # ── fixtures, all inside $WORK (deleted at the end — we keep no test media) ────
 printf 'clip\n' > "$WORK/clip.mkv"
+# ★ a 1-SECOND fixture: the ffprobe stub reports a file's own numeric content as its duration, so "1.0"
+# makes a 1 s input — short enough that the split tolerance stays at one whole second. Used by the
+# one-slice-missing case below, where a 0.5 s survivor is still within tolerance of 1 s.
+printf '1.0\n' > "$WORK/short.mkv"
 # a fleet whose card names are multi-byte (★ C1): one longer than 22 code points (must NOT be cut
 # mid-character) and one shorter (must pad to 22 DISPLAY columns like Python, not 22 bytes).
 "$PYTHON" - "$WORK" <<'PYEOF'
@@ -643,6 +672,12 @@ cmp_cmd_path "$FASTB" "play --split (SPLIT JOB across cards)" \
 # so 2 slices sum to 10 s against a 60 s original — the split check must say INCOMPLETE, not ok.
 cmp_cmd_path "$BADSUB" "play --split INCOMPLETE (B3: arithmetic really checked)" \
         play --split --work "$WORK/clip.mkv" -- /bin/echo HI
+# ★ THE DIVERGENCE ITSELF: a 2-slice split of a 1 s input where one slice is MISSING. The survivor is
+# 0.5 s, within the 1 s tolerance, so a build that checked ONLY the duration sum would say COMPLETE while
+# a build that also requires every slice written says INCOMPLETE. C++ was the first kind until 2026-10-12;
+# this case pins them together (regression for the outside read's section-3 finding).
+cmp_cmd_path "$FAILDROP" "play --split one MISSING slice inside tolerance (regression)" \
+        play --split --work "$WORK/short.mkv" -- /bin/echo HI
 # split with an unreadable duration -> split: REFUSED, BASENAME (C8). No ffprobe stub here, so the
 # live ffprobe fails on a text file and _media_duration returns None.
 NOPROBE="$WORK/noprobe"; mkdir -p "$NOPROBE"; cp "$FASTB/unshare" "$FASTB/gamescope" "$FASTB/ffmpeg" "$NOPROBE/"
