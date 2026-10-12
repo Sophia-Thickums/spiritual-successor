@@ -4575,6 +4575,51 @@ fn apply_session(sel: &str, pci: &str) -> String {
     }
 }
 
+/// systemd wraps a value in shell syntax — `$'1002:7550!'` — when it contains a character outside its
+/// safe set, and the exclusive-pin marker `!` is outside it. Comparing the printed LINE against
+/// `KEY=value` therefore never matched the one variable that matters: the off switch removed
+/// DRI_PRIME and PROTON_FSR4_UPGRADE, said so, and left the pin armed with only one card visible to
+/// every program started afterwards. (Proved against the real manager, 2026-10-12.)
+fn unquote_manager_value(v: &str) -> String {
+    let b: Vec<char> = v.chars().collect();
+    if b.len() >= 3 && b[0] == '$' && b[1] == '\'' && b[b.len() - 1] == '\'' {
+        // The whole set systemd emits, not three of it — octal and hex included. A table that stops at
+        // n/t/r decodes a numerically-escaped byte into its digits, the comparison fails, and the pin is
+        // left armed: the same silent skip, narrower. (Outside read, 2026-10-12.)
+        let body: Vec<char> = b[2..b.len() - 1].to_vec();
+        let mut out = String::new();
+        let mut i = 0usize;
+        while i < body.len() {
+            if body[i] != '\\' || i + 1 >= body.len() { out.push(body[i]); i += 1; continue; }
+            let e = body[i + 1];
+            if ('0'..='7').contains(&e) {
+                let mut d = String::new();
+                let mut j = i + 1;
+                while j < body.len() && d.chars().count() < 3 && ('0'..='7').contains(&body[j]) {
+                    d.push(body[j]); j += 1;
+                }
+                let byte = u8::from_str_radix(&d, 8).unwrap_or(0);
+                out.push(byte as char);
+                i = j;
+            } else if e == 'x' {
+                let mut d = String::new();
+                let mut j = i + 2;
+                while j < body.len() && d.chars().count() < 2 && body[j].is_ascii_hexdigit() {
+                    d.push(body[j]); j += 1;
+                }
+                if d.is_empty() { out.push('x'); i += 2; }
+                else { out.push(u8::from_str_radix(&d, 16).unwrap_or(0) as char); i = j; }
+            } else {
+                out.push(match e { 'n' => '\n', 't' => '\t', 'r' => '\r', 'a' => '\u{7}',
+                                   'b' => '\u{8}', 'f' => '\u{c}', 'v' => '\u{b}', other => other });
+                i += 2;
+            }
+        }
+        return out;
+    }
+    v.to_string()
+}
+
 /// Disarm — but ONLY values that are ours. A value this tool did not write is left alone.
 fn unapply_session(sel: &str, pci: &str) -> String {
     if which("systemctl").is_none() {
@@ -4584,12 +4629,17 @@ fn unapply_session(sel: &str, pci: &str) -> String {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
         _ => String::new(),
     };
-    let selv = format!("MESA_VK_DEVICE_SELECT={}", sel);
-    let pciv = format!("DRI_PRIME={}", pci);
+    // compare the VALUE, not the line systemd typed — see `unquote_manager_value`
+    let has = |k: &str, val: &str| {
+        txt.lines().any(|l| match l.split_once('=') {
+            Some((lk, lv)) => lk == k && unquote_manager_value(lv) == val,
+            None => false,
+        })
+    };
     let mut ours: Vec<&str> = Vec::new();
-    if txt.lines().any(|l| l == selv.as_str()) { ours.push("MESA_VK_DEVICE_SELECT"); }
-    if txt.lines().any(|l| l == pciv.as_str()) { ours.push("DRI_PRIME"); }
-    if txt.lines().any(|l| l == "PROTON_FSR4_UPGRADE=1") { ours.push("PROTON_FSR4_UPGRADE"); }
+    if has("MESA_VK_DEVICE_SELECT", sel) { ours.push("MESA_VK_DEVICE_SELECT"); }
+    if has("DRI_PRIME", pci) { ours.push("DRI_PRIME"); }
+    if has("PROTON_FSR4_UPGRADE", "1") { ours.push("PROTON_FSR4_UPGRADE"); }
     if ours.is_empty() {
         return "the session carries no pin this tool set — left everything alone".to_string();
     }

@@ -2239,8 +2239,67 @@ def _pin_values(g):
     return ("%s:%s!" % (g["vendor"][2:], g["device"][2:]), _dri_prime(g["bdf"]))
 
 
+def _manager_value(v):
+    """Undo the shell quoting systemd puts around a value it cannot print bare.
+
+    ★ PROVED AGAINST THE REAL MANAGER, 2026-10-12. `systemctl --user show-environment` prints
+    `MESA_VK_DEVICE_SELECT=$'1002:7550!'` — the `$'...'` wrapper appears for any value containing a
+    character outside systemd's safe set, and the exclusive-pin marker `!` is outside it (so is a
+    space, a quote, a backslash). A parser that keeps the wrapper compares `"$'1002:7550!'"` against
+    `"1002:7550!"`, concludes the pin is not ours, and walks past the ONE variable that matters. The
+    off switch then removed DRI_PRIME and PROTON_FSR4_UPGRADE, said so, and left the session armed with
+    only one card visible to every program started from it — the exact harm this tool's own notes warn
+    about twice. `!` is the only reason it was the pin and not the other two: they need no quoting.
+    """
+    if len(v) >= 3 and v[0] == "$" and v[1] == "'" and v[-1] == "'":
+        body, out, i, n = v[2:-1], [], 0, len(v) - 3
+        while i < n:
+            c = body[i]
+            if c != "\\" or i + 1 >= n:
+                out.append(c)
+                i += 1
+                continue
+            e = body[i + 1]
+            if e in "01234567":
+                # ★ OCTAL AND HEX ARE PART OF THE SET, NOT AN EXOTIC EXTRA. The first version of this
+                #   decoded only n/t/r/\/' and passed everything else through, so a value containing any
+                #   byte systemd renders numerically would compare UNEQUAL, be judged "not ours", and be
+                #   left armed — the same silent skip this function exists to close, just narrower.
+                #   (Outside read, 2026-10-12: "the comment's confidence outruns the code.") The variables
+                #   compared here are ASCII by construction — `vendor:device!`, a PCI address, `1` — so
+                #   this is belt as well as braces. systemd emits only the `$'...'` form; there is no
+                #   double-quoted branch, and the three builds used to disagree inside one.
+                j, d = i + 1, ""
+                while j < n and len(d) < 3 and body[j] in "01234567":
+                    d += body[j]
+                    j += 1
+                out.append(chr(int(d, 8) & 0xFF))
+                i = j
+            elif e == "x":
+                j, d = i + 2, ""
+                while j < n and len(d) < 2 and body[j] in "0123456789abcdefABCDEF":
+                    d += body[j]
+                    j += 1
+                if d:
+                    out.append(chr(int(d, 16)))
+                    i = j
+                else:
+                    out.append("x")
+                    i += 2
+            else:
+                out.append({"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b",
+                            "f": "\f", "v": "\v", "\\": "\\", "'": "'", '"': '"'}.get(e, e))
+                i += 2
+        return "".join(out)
+    return v
+
+
 def _manager_env():
-    """The systemd user manager's environment as a dict, or None when there is no manager."""
+    """The systemd user manager's environment as a dict, or None when there is no manager.
+
+    Values are UNQUOTED: see `_manager_value` — the raw line is how systemd TYPES the value, not what
+    the value is, and comparing the raw line made this tool unable to recognise its own pin.
+    """
     sc = shutil.which("systemctl")
     if not sc:
         return None
@@ -2255,7 +2314,7 @@ def _manager_env():
     for line in r.stdout.splitlines():
         if "=" in line:
             k, v = line.split("=", 1)
-            env[k] = v
+            env[k] = _manager_value(v)
     return env
 
 
@@ -2373,10 +2432,14 @@ def _apply_session(sel, pci):
 
 
 def _unapply_session(sel, pci):
-    """Disarm — but ONLY values that are ours. A value this tool did not write is left alone. A
-    manager that is present but refuses to answer is an EMPTY environment, not a missing manager —
-    the ports draw that line the same way, and a divergence here is exactly what the suite exists
-    to catch."""
+    """Disarm — but only values that are ours. Two of the three carry a fingerprint: the pin names the
+    card and `DRI_PRIME` its bus address. ★ `PROTON_FSR4_UPGRADE=1` carries NONE — any tool that set it
+    to that exact value is indistinguishable from us, so we may remove a variable we did not write. It
+    is restoring a default rather than corrupting anything, and it was true before this change too, but
+    the old sentence claimed otherwise and now says what is actually true. (Outside read, 2026-10-12.)
+    A manager that is present but refuses to answer is an EMPTY environment, not a missing manager —
+    the ports draw that line the same way, and a divergence here is exactly what the suite exists to
+    catch."""
     sc = shutil.which("systemctl")
     if not sc:
         return "no systemd user manager here — nothing to disarm"
