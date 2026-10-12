@@ -866,6 +866,12 @@ static std::optional<string> card_render_node(const string &card) {
 // ─────────────────────────────────────────────────────────────────────────────
 // probe
 // ─────────────────────────────────────────────────────────────────────────────
+// Forward declarations: the probe PUBLISHES what these two decide (`can_encode`, `marginal`), and both
+// are defined further down in the jobs section. The probe already relies on their answer for every front
+// end, so it must be able to call them.
+static std::pair<string, string> va_driver(const J &g);
+static std::optional<string> marginal_reason(const J &g);
+
 static J probe() {
     const char *fake = getenv("SPIRIT_DEVICES");
     if (fake && *fake) {
@@ -1004,6 +1010,18 @@ static J probe() {
         g.put("connectors_total", J::integer(nconn));
         g.put("has_output", J::boolean(online > 0));
         g.put("link", std::move(link));
+        // ★ THE TOOL'S OWN ANSWER ABOUT THIS CARD, PUBLISHED (2026-10-12, from the outside read of the
+        // desktop app). Both front ends re-derived "can this card take a job" from the driver name and a
+        // hardcoded link threshold — a second and a third copy of a rule that already lives here, and a
+        // copy can promise a job on a card this tool refuses. The answer travels with the card instead.
+        // Must match Python's `probe` byte for byte.
+        {
+            auto vd = va_driver(g);
+            g.put("va_driver", vd.first.empty() ? J::nul() : J::str(vd.first));
+            g.put("can_encode", J::boolean(!vd.first.empty()));
+            auto mr = marginal_reason(g);
+            g.put("marginal", mr ? J::str(*mr) : J::nul());
+        }
         gpus.push_back(std::move(g));
     }
 

@@ -104,12 +104,10 @@ def _short(name, limit=46):
     return n if len(n) <= limit else n[:limit - 1] + "\u2026"
 
 
-# ★ KEEP IN STEP WITH spirit.py, deliberately mirrored rather than shelled out for: the page must never
-# promise a job on a card the tool will refuse. From the outside read (2026-10-12): the cards table
-# labelled an nvidia card "available for jobs" (it has no VAAPI encoder the tool knows) and a narrow-link
-# card too, in the one place the CLI is careful to name both.
-_VA_DRIVERS = {"amdgpu": "radeonsi", "i915": "iHD", "xe": "iHD"}   # == spirit.VA_DRIVERS
-_NARROW_BELOW = 8                                                  # == spirit._marginal's threshold
+# ★ THE CAPABILITY ANSWER NOW COMES FROM THE TOOL, NOT FROM HERE (2026-10-12). This page used to mirror
+# `spirit`'s encoder-driver table and its narrow-link threshold — a second copy of a rule that can drift,
+# and one that could promise a job on a card the tool refuses. `spirit probe --json` now publishes
+# `can_encode` and `marginal` per card, so the page reads those instead. Nothing to keep in step by hand.
 
 
 def _pin_state():
@@ -482,19 +480,17 @@ def render_page():
         else:
             link_txt = "%s GB/s max" % r.get("link_gbps_max")
         is_main = "display" in (r.get("roles") or [])
-        driver = (g.get("driver") or "").lower()
         if is_main:
             doing = '<span class="mine">your game</span>'
-        elif driver not in _VA_DRIVERS:
+        elif not g.get("can_encode"):
             doing = ('<span class="spare">spare &mdash; cannot take jobs: no VAAPI encoder for '
-                     '&ldquo;%s&rdquo;</span>' % html.escape(driver or "unknown"))
+                     '&ldquo;%s&rdquo;</span>'
+                     % html.escape((g.get("driver") or "").lower() or "unknown"))
+        elif g.get("marginal"):
+            doing = ('<span class="spare">spare &mdash; %s (name it with --spare)</span>'
+                     % html.escape(g["marginal"]))
         else:
-            w = link.get("max_width")
-            if w is not None and w < _NARROW_BELOW:
-                doing = ('<span class="spare">spare &mdash; x%s link, too narrow to use unasked '
-                         '(name it with --spare)</span>' % w)
-            else:
-                doing = '<span class="spare">spare &mdash; available for jobs</span>'
+            doing = '<span class="spare">spare &mdash; available for jobs</span>'
         rows.append("<tr><td>%s</td><td>%s</td><td>%s</td></tr>"
                     % (html.escape(name), html.escape(link_txt), doing))
     cards_html = "\n".join(rows) or '<tr><td colspan="3">No cards found.</td></tr>'
