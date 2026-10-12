@@ -234,8 +234,20 @@ fn build_ui(app: &adw::Application) {
     run.set_valign(gtk::Align::Center);
     run.set_sensitive(false);
     run_row.add_suffix(&run);
+    // ★ A FIELD FOR CARD NAMES, because the README tells you to name a card and the window gave you no way
+    //   to do it. Cards on a narrow link are left out by default on purpose; naming them here is how you
+    //   say "yes, that one, I know". Empty means "use whatever the tool considers safe", which is the
+    //   default everywhere else.
+    let spare_row = adw::ActionRow::builder()
+        .title("Extra cards")
+        .subtitle("optional — name cards the default leaves out, e.g. renderD130")
+        .build();
+    let spare_entry = gtk::Entry::builder().placeholder_text("renderD131,renderD130").width_chars(22).build();
+    spare_entry.set_valign(gtk::Align::Center);
+    spare_row.add_suffix(&spare_entry);
     job_group.add(&file_row);
     job_group.add(&run_row);
+    job_group.add(&spare_row);
 
     // ---- doctor ----------------------------------------------------------------------------------
     let doc_group = adw::PreferencesGroup::builder()
@@ -289,9 +301,9 @@ fn build_ui(app: &adw::Application) {
     // ★ ONE PLACE THAT DECIDES WHAT CAN BE PRESSED. Nothing here was disabled before a run, so a job
     // could be started twice — two transcodes writing the same output path and interleaving in one pane.
     let set_busy: Rc<dyn Fn(bool)> = {
-        let (b, d, r, rr, s1, s2, pc) =
+        let (b, d, r, rr, s1, s2, pc, se) =
             (refresh.clone(), doctor.clone(), run.clone(), run_row.clone(), switch_row.clone(),
-             persist_row.clone(), persist_check.clone());
+             persist_row.clone(), persist_check.clone(), spare_entry.clone());
         let busy = busy.clone();
         let has_file = has_file.clone();
         Rc::new(move |v: bool| {
@@ -302,6 +314,11 @@ fn build_ui(app: &adw::Application) {
             s2.set_sensitive(!v);
             rr.set_sensitive(!v);
             pc.set_sensitive(!v);
+            // ★ THE CARD-NAME FIELD IS PART OF THE GATE TOO. It was left out, so while a job ran every
+            //   other control greyed out and this one stayed live: the names of the job already running
+            //   could be edited, leaving the window describing something the machine was not doing.
+            //   (Found by the outside read, 2026-10-12.)
+            se.set_sensitive(!v);
             r.set_sensitive(!v && has_file.get());
         })
     };
@@ -507,14 +524,36 @@ fn build_ui(app: &adw::Application) {
             });
         });
         let ui2 = ui.clone();
+        let spare_entry = spare_entry.clone();
         run.connect_clicked(move |_| {
             if let Some(p) = chosen.borrow().clone() {
-                run_streaming(
-                    vec!["play".into(), "--work".into(), p, "--split".into(), "--".into(), "true".into()],
-                    &ui2,
-                    "job on the other cards",
-                    None,
-                );
+                let mut argv = vec![
+                    "play".to_string(),
+                    "--work".to_string(),
+                    p,
+                    "--split".to_string(),
+                ];
+                // ★ ONE NAME PER PIECE, TRIMMED, EMPTIES DROPPED. The tool itself splits on commas and
+                //   spaces and trims each name, so "renderD131, renderD130" already worked — but a
+                //   trailing or doubled comma ("renderD130,", "a,,b") would hand it an empty token, and
+                //   a field that accepts a card name the machine does not have is the one place in this
+                //   app where a user can express something untrue. TODO: replace this field with a
+                //   checkbox per card built from the same rows that already say "left out by default —
+                //   … (name it with --spare)", which would make an unmatchable name unrepresentable.
+                let named: String = spare_entry
+                    .text()
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                if !named.is_empty() {
+                    argv.push("--spare".to_string());
+                    argv.push(named);
+                }
+                argv.push("--".to_string());
+                argv.push("true".to_string());
+                run_streaming(argv, &ui2, "job on the other cards", None);
             }
         });
     }
