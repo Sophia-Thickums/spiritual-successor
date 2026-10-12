@@ -1473,3 +1473,47 @@ will (correctly) read the gap as a contradiction.**
 
 Still AMD-only on the encoder path; Intel remains written-and-unrun. A green suite is AGREEMENT between the
 builds and nothing more — the blocker above was agreed on by all three.
+
+
+---
+
+## 2026-10-12, afternoon — a NEW case, a NEW divergence it found, and the counts removed
+
+**The outside read asked for a regression case for the C++ written-count fix** ("otherwise the next
+divergence in this line is equally invisible"). Added to both suites: a 2-slice split of a 1-second
+input where ONE slice is MISSING — the survivor (0.5 s) is inside the 1 s tolerance, so a verdict that
+checks only the duration sum says COMPLETE while one that also requires every slice written says
+INCOMPLETE. Stub durations are keyed on the FILENAME, not on file content, so the case does not depend
+on how a build happens to probe.
+
+**It found a second divergence in that same line, one nobody had seen:** the C++ MISSING output read
+`MISSING — … was not written. The job failed; do not report it as done.` while Python and Rust read
+`MISSING/FAILED — … was not written by THIS run (or the job exited nonzero). Do not report it as done.`,
+and the tail line read `FAILED — no file` against `FAILED — no file from this run`. **No suite case had
+ever produced a MISSING output**, which is why it had been invisible while both suites read green.
+Fixed in C++; the wording is now identical in all three.
+
+**The case has teeth, proven non-vacuously:** against a C++ binary built with ONLY the written-count
+check reverted (the wording fix kept), it goes red exactly as designed — C++ prints `COMPLETE`, Python
+prints `INCOMPLETE — 0.5s of 1.0s`. Against the fixed binary it passes. The Rust case carries parity
+only: Rust already required the written count, so there is no pre-fix Rust binary to fail it against;
+its path was confirmed by hand (both builds print `MISSING/FAILED`, `slices written: 1 of 2`,
+`0.5s of 1.0s`, INCOMPLETE).
+
+**Suite totals now:** `cpp/run_tests.sh` **132 cases**, `rust/test.sh` **150 cases** (each grew by one).
+On a BUSY box three live-box cases time out and go red — `doctor (real)`, `doctor exit code 0` and
+`play --scale 0.7 (real)`. These are the BOX, not the build: the machine's own `doctor` was timed at
+**121 s** against the suite's 60 s limit, and its per-card test child did not run on any of the four
+cards during the pass. Every deterministic (fake-fleet) case is green. **Do not quote a suite count in
+public:** the counts were REMOVED from the README `<details>` block and the release body this round,
+because a hand-typed number goes stale the moment a case is added and nothing forces the doc and the
+suite to stay in sync. If a number is ever wanted public, generate it from the suite at release time.
+
+**Known cosmetic, recorded not changed:** the `usage:` brace-list shows only
+`{probe,roles,plan,doctor,origin,boost,fg}` because those are the real argparse subparsers; `play`,
+`run`, `ui`, `enable` and `disable` are dispatched BEFORE argparse, so they correctly are not
+subparsers. The full thirteen are printed on the `commands:` line directly below, and that adjacency
+was verified in all three builds and under a narrow `COLUMNS=20` terminal, so a reader of `--help` is
+not misled. Changing the brace-list would either refactor the command dispatch (a three-build parity
+sweep) or hard-code a `usage:` string that contradicts the `positional arguments:` block argparse
+prints under it. Not worth it; the redundancy is harmless.

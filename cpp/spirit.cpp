@@ -3227,7 +3227,8 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                 printf("  %-14s %s  (%.1f MB, %.1fs)\n", jo.first.c_str(), base_of(jo.second).c_str(),
                        (double)st.st_size / 1048576.0, d > 0 ? d : 0.0);
             } else {
-                printf("  %-14s MISSING — %s was not written. The job failed; do not report it as done.\n",
+                printf("  %-14s MISSING/FAILED — %s was not written by THIS run (or the job exited "
+                       "nonzero). Do not report it as done.\n",
                        jo.first.c_str(), jo.second.c_str());
             }
         }
@@ -3238,8 +3239,14 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
             printf("  original duration   : %.1fs\n", job_expect);
             double diff = got - job_expect; if (diff < 0) diff = -diff;
             double tol = job_expect * 0.01; if (tol < 1.0) tol = 1.0;
-            if (diff <= tol) {
-                printf("  ⇒ COMPLETE — the pieces reconstruct the whole input (within 1%%).\n");
+            // ★ THE WRITTEN COUNT IS PART OF THE VERDICT (outside read, 2026-10-12). Python and Rust
+            //   both require every slice to have been written before they will say COMPLETE; this build
+            //   only compared the duration sum, so a MISSING slice whose absence still left the total
+            //   within tolerance printed COMPLETE here and INCOMPLETE in the other two. A divergence in
+            //   the one line that decides whether a job is reported as done.
+            if (written == (int)job_outputs.size() && diff <= tol) {
+                printf("  ⇒ COMPLETE — the pieces reconstruct the whole input (within %s).\n",
+                       (job_expect < 100.0) ? "1 second" : "1%");
                 // ★ ONE FILE BACK (a held-release defect, 2026-10-12). The split above proved the work
                 // was DIVIDED; this gives the user their video as ONE file again. The pieces stay on
                 // disk as the evidence.
@@ -3350,7 +3357,7 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
                 string nm = "?";
                 for (auto *g : spares) if (base_of(sfield(*g, "render_node")) == jo.first) nm = gpu_name(*g);
                 printf("  %-12s %s REAL JOB  %s\n", jo.first.c_str(), pad_display(nm, 22).c_str(),
-                       ok ? jo.second.c_str() : "FAILED — no file");
+                       ok ? jo.second.c_str() : "FAILED — no file from this run");
             }
         } else if (want_load && !load_started) {
             // ★ NOTHING RAN, AND WE SAY SO ( blocking item 9). The old tail had no branch for
@@ -3519,8 +3526,8 @@ static int ui_cmd(const vector<string> &args) {
 
 static void print_help() {
     printf("usage: spirit [-h] [--version] {probe,roles,plan,doctor,origin,boost,fg} ...\n\n");
-    printf("Spiritual Successor — put every GPU to work\n");
-    printf("commands: probe · roles · plan · doctor · fg · boost · enable · disable · run · play · ui  (`run` and `play` take a command after `--`)\n\n");
+    printf("Spiritual Successor — give a machine's spare GPUs real work, when you ask for it\n");
+    printf("commands: probe · roles · plan · doctor · origin · boost · fg · enable · disable · run · play · ui  (`run` and `play` take a command after `--`)\n\n");
     printf("positional arguments:\n");
     printf("  {probe,roles,plan,doctor,origin,boost,fg}\n\n");
     printf("options:\n");

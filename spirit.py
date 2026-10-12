@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
-"""spirit — the Spiritual Successor: put EVERY GPU in a machine to work.
+"""spirit — the Spiritual Successor: give a machine's spare GPUs real work.
 
 CrossFire and SLI split one frame across cards and died for it. The Spiritual Successor does the
-opposite: it splits the WORK, not the frame, and gives each card the role its own link and silicon
-are actually good for — so a cheap second, third, or tenth GPU earns its slot instead of sitting
-idle. Scale is the point, not speed: the goal is that every card in the box is doing something
-useful by the time the game is running.
+opposite: it splits the WORK, not the frame, and gives each card the work its own link and silicon
+are actually good for — so a cheap second, third, or tenth GPU earns its slot. Scale is the point,
+not speed. ★ NOTHING RUNS ON A CARD UNLESS YOU ASK FOR IT: with no `--work` the other cards are left
+alone, and a card on a narrow host link is left out unless you name it with `--spare`.
 
-No root. No dependencies (stdlib Python 3.8+; `lspci` used only if present).
+No root. The command itself needs nothing but stdlib Python 3.8+ (`lspci` is used only if present).
+The jobs it runs need ffmpeg with VAAPI and the card's VA driver; the desktop app needs the GTK4
+toolchain to build. Linux only, and a card can only take a job if its kernel driver is one this tool
+knows a VA driver for (AMD amdgpu, Intel i915/xe).
 
 THE TWO TRUTHS THIS IS BUILT ON (both measured, see the project folder):
   1. Every normal surface lies about a GPU's host link. lspci / sysfs current_link_width /
      pp_dpm_pcie all report the link to the GPU's OWN bridge chip, not to the CPU. The truth is the
-     MINIMUM negotiated width along the sysfs chain from the root complex down. This probe reads it.
+     MINIMUM width along the sysfs chain from the root complex down. This probe reads it.
   2. Per-frame multi-GPU rendering is DEAD on consumer links (a 1440p frame is 14.7 MB; a Gen3 x1
      card needs 17 ms to move it, more than the frame budget). So: never split the frame. Split the
      process and the pipeline tail; cross the wire at frame rate or once.
 
-Commands:
+Commands (the full list is `spirit --help`):
     spirit probe [--json]                      every GPU: true link, VRAM, outputs, render node
-    spirit roles [--profile game|edit|compute] assign a role to each card so all are used
+    spirit roles [--profile game|edit|compute] what each card is and what it could take
     spirit plan  --workload 1440p60-framegen   honest feasibility of a workload per card
+    spirit doctor                              test THIS machine by running a program on every card
+    spirit play  --work FILE -- ./game         the game on the right card, a job on the others
     spirit run   --role encode --card card2 -- ffmpeg ...
 
 Copyright 2026 Sophia Marie DeClue. MIT.
@@ -2079,7 +2084,12 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
             print("  slice durations sum : %.1fs" % total)
             print("  original duration   : %.1fs" % job_expect)
             if written == len(job_outputs) and abs(total - job_expect) <= max(1.0, job_expect * 0.01):
-                print("  ⇒ COMPLETE — the pieces reconstruct the whole input (within 1%).")
+                # ★ THE MESSAGE MUST NAME THE TOLERANCE THAT WAS ACTUALLY APPLIED (outside read,
+                #   2026-10-12). It said "(within 1%)" while the rule for a clip under 100 s is one
+                #   SECOND — a false statement printed by the tool itself, on exactly the short clips a
+                #   user is most likely to try first. Say which rule ran.
+                print("  ⇒ COMPLETE — the pieces reconstruct the whole input (within %s)."
+                      % ("1 second" if job_expect < 100 else "1%"))
                 # ★ ONE FILE BACK (a held-release defect, 2026-10-12). The split above proved the
                 # work was DIVIDED; this gives the user their video as ONE file again. The pieces
                 # stay on disk as the evidence; see _join_slices.
@@ -2586,9 +2596,9 @@ def main():
 
     ap = argparse.ArgumentParser(
         prog="spirit",
-        description="Spiritual Successor — put every GPU to work\n"
-                    "commands: probe · roles · plan · doctor · fg · boost · enable · disable · run · play · ui  "
-                    "(`run` and `play` take a command after `--`)",
+        description="Spiritual Successor — give a machine's spare GPUs real work, when you ask for it\n"
+                    "commands: probe · roles · plan · doctor · origin · boost · fg · enable · disable · "
+                    "run · play · ui  (`run` and `play` take a command after `--`)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         # ★ NO ABBREVIATIONS (fix 2026-10-11, outside review). argparse accepts any unambiguous prefix
         # by default, so `probe --js` worked while the hand-written ports rejected it — a divergence in
