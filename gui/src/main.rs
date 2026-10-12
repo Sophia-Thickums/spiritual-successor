@@ -266,7 +266,9 @@ fn run_batch(jobs: Vec<(String, Vec<String>)>, ui: &Ui, on_done: Rc<dyn Fn()>) {
 /// main thread — the same freeze that was fixed in the card list, and reintroduced here by accident.
 fn cards_for_jobs(files: Vec<String>, named: Vec<String>, ui: &Ui) {
     if !named.is_empty() {
-        start_jobs(files, named, ui);
+        // no gate was raised on this path, and `start_jobs` cannot find the card list empty when the
+        // user named the cards themselves
+        let _ = start_jobs(files, named, ui);
         return;
     }
     // ★ OFF THE MAIN THREAD. `probe` touches hardware. Calling it inline here froze the window on
@@ -324,12 +326,25 @@ fn cards_for_jobs(files: Vec<String>, named: Vec<String>, ui: &Ui) {
             ui2.buf.move_mark(&ui2.mark, &ui2.buf.end_iter());
             ui2.view.scroll_mark_onscreen(&ui2.mark);
         }
-        start_jobs(files, cards, &ui2);
+        // ★ ONE OWNER OF THE BUSY GATE AT EVERY INSTANT. This function raised it; `start_jobs` hands
+        //   ownership to `run_batch` when it launches something, and we release it ourselves when it
+        //   does not. Without this, clicking Run on a machine with no usable spare card locked Run,
+        //   Doctor, both switches and the card field for the life of the window — the ordinary case, not
+        //   an exotic one. (Outside read, 2026-10-12.)
+        if !start_jobs(files, cards, &ui2) {
+            (ui2.set_busy)(false);
+        }
     });
 }
 
 /// One job per card, all at once. Never more jobs than cards, and what will not run is SAID.
-fn start_jobs(files: Vec<String>, mut cards: Vec<String>, ui: &Ui) {
+///
+/// ★ RETURNS WHETHER IT TOOK OWNERSHIP OF THE BUSY GATE. `true` = a batch was launched and `run_batch`
+/// will release the gate when every job finishes. `false` = nothing was started, so the CALLER must
+/// release it. Getting this wrong wedges the window: the caller raises the gate, this function declines
+/// to start anything on the ordinary "no usable card" path, and nothing ever lowers it. (Outside read,
+/// 2026-10-12 — the same fault as the one already fixed in the card list.)
+fn start_jobs(files: Vec<String>, mut cards: Vec<String>, ui: &Ui) -> bool {
     let mut end = ui.buf.end_iter();
     if cards.is_empty() {
         ui.buf.insert(&mut end,
@@ -337,7 +352,7 @@ fn start_jobs(files: Vec<String>, mut cards: Vec<String>, ui: &Ui) {
              links — name one in \"Extra cards\" to use it anyway.\n");
         ui.buf.move_mark(&ui.mark, &ui.buf.end_iter());
         ui.view.scroll_mark_onscreen(&ui.mark);
-        return;
+        return false;
     }
     let overflow = files.len().saturating_sub(cards.len());
     cards.truncate(files.len());
@@ -358,6 +373,7 @@ fn start_jobs(files: Vec<String>, mut cards: Vec<String>, ui: &Ui) {
     ui.buf.move_mark(&ui.mark, &ui.buf.end_iter());
     ui.view.scroll_mark_onscreen(&ui.mark);
     run_batch(jobs, ui, Rc::new(|| {}));
+    true
 }
 
 // ── the window ───────────────────────────────────────────────────────────────────────────────────
