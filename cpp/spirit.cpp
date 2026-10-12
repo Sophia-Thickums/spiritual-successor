@@ -2268,6 +2268,20 @@ static int run_cmd(const J &db, const string &role, const string &card, const ve
 static const J *main_card(const J &db) {
     const J *ga = gpus_arr(db);
     if (!ga || ga->arr.empty()) return nullptr;
+    // ★ THE CARD ACTUALLY DRIVING A DISPLAY OUTRANKS A CARD MERELY PLUGGED IN (fix 2026-10-12, from the
+    // outside read). `has_output` is built from a connector reading `connected`, and a cable in a port
+    // that is not driving (DPMS off, a KVM, a second seat) reads `connected` too. doctor judges the
+    // display card by the ACTIVE CRTC; play used `has_output` + score — two definitions of the single
+    // most important decision this tool makes. Order: active CRTC, then connected, then top scorer.
+    // (A fixture has no sysfs, so enabled_connectors is empty and this falls through as before.)
+    vector<const J *> driving;
+    for (auto &g : ga->arr)
+        if (!enabled_connectors(sfield(g, "card")).empty()) driving.push_back(&g);
+    if (!driving.empty()) {
+        const J *best = driving[0];
+        for (auto *c : driving) if (score(*c) > score(*best)) best = c;
+        return best;
+    }
     vector<const J *> pool;
     for (auto &g : ga->arr) if (bfield(g, "has_output")) pool.push_back(&g);
     if (pool.empty()) for (auto &g : ga->arr) pool.push_back(&g);
@@ -2342,12 +2356,17 @@ static std::pair<string, string> va_driver(const J &g) {
 //
 // ★ `capped_by_topology` IS NOT A PROXY FOR "BEHIND AN EXTERNAL BRIDGE". It fires whenever the card's
 // OWN bridge reports wider than the host gives — the NORMAL case for every modern AMD card, because
-// Vega, Navi and RDNA all contain an internal PCIe switch. Only a genuinely NARROW link (below x4) is
-// marginal; that is the only rule. This matches Python's `_marginal` byte for byte.
+// Vega, Navi and RDNA all contain an internal PCIe switch. Width is read from the HOST link only;
+// the threshold is in the ★ block below. This matches Python's `_marginal` byte for byte.
+// ★ THE DEFAULT REQUIRES AN x8-OR-WIDER HOST LINK (tightened 2026-10-12). It used to require only
+// "wider than x4", which excluded an x1 card but let an x4 card through — and x4 is exactly the shape
+// the incident was: an externally-docked card, an M.2/external adapter, or a shared-port card. The rule
+// is on the HOST link width, never on the card's own bridge. This matches Python's `_marginal` byte
+// for byte.
 static std::optional<string> marginal_reason(const J &g) {
     const J *L = jget(g, "link");
     auto w = L ? ifield(*L, "max_width") : std::nullopt;
-    if (w && *w < 4) return "x" + std::to_string(*w) + " link at the host — too narrow to use unasked";
+    if (w && *w < 8) return "x" + std::to_string(*w) + " link at the host — too narrow to use unasked";
     return std::nullopt;
 }
 
@@ -2474,6 +2493,31 @@ static std::pair<string, pid_t> start_work(const string &node, const string &src
     argv.push_back("-b:v"); argv.push_back("8M");
     argv.push_back(out);
     return {out, spawn_detached(argv, env)};
+}
+
+// Join the split pieces into ONE file, stream-copy (no re-encode). See Python's `_join_slices` for the
+// why: `--split` proved the work was DIVIDED, and this gives the user their video back as ONE file.
+// Returns {ok, detail}. `detail` carries NO interpolated runtime error text, so all three builds agree.
+static std::pair<bool, string> join_slices(const vector<string> &parts, const string &out_path) {
+    string lst = out_path + ".concat.txt";
+    FILE *f = fopen(lst.c_str(), "w");
+    if (!f) return {false, "the join could not be started (check ffmpeg and the output path)"};
+    for (const auto &p : parts) {
+        string ap = abspath(p), esc;
+        for (char c : ap) { if (c == '\'') esc += "'\\''"; else esc += c; }
+        fprintf(f, "file '%s'\n", esc.c_str());
+    }
+    fclose(f);
+    unlink(out_path.c_str());
+    ProcResult r = run_capture_both({"ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                                     "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", out_path},
+                                    nullptr, 3600);
+    unlink(lst.c_str());
+    if (!r.ok) return {false, "the join could not be started (check ffmpeg and the output path)"};
+    struct stat st;
+    if (r.rc != 0 || stat(out_path.c_str(), &st) != 0)
+        return {false, "ffmpeg could not join the pieces (rc=" + std::to_string(r.rc) + ")"};
+    return {true, ""};
 }
 
 // The card's short name, as the role table prints it.
@@ -3174,7 +3218,42 @@ static int play_cmd(const J &db, const vector<string> &cmd_in, bool do_offload,
             printf("  original duration   : %.1fs\n", job_expect);
             double diff = got - job_expect; if (diff < 0) diff = -diff;
             double tol = job_expect * 0.01; if (tol < 1.0) tol = 1.0;
-            if (diff <= tol) printf("  ⇒ COMPLETE — the pieces reconstruct the whole input (within 1%%).\n");
+            if (diff <= tol) {
+                printf("  ⇒ COMPLETE — the pieces reconstruct the whole input (within 1%%).\n");
+                // ★ ONE FILE BACK (a held-release defect, 2026-10-12). The split above proved the work
+                // was DIVIDED; this gives the user their video as ONE file again. The pieces stay on
+                // disk as the evidence.
+                vector<string> parts;
+                for (auto &jo : job_outputs) parts.push_back(jo.second);
+                string joined = work_outdir + "/" + stem_of(work) + ".joined.mp4";
+                auto jr = join_slices(parts, joined);
+                {
+                    string hdr = "  ── ONE OUTPUT FILE ";
+                    for (int i = 0; i < 52; i++) hdr += "─";
+                    printf("%s\n", hdr.c_str());
+                }
+                if (jr.first) {
+                    double jd = media_duration(joined);
+                    struct stat jst;
+                    long long jsz = (stat(joined.c_str(), &jst) == 0) ? (long long)jst.st_size : 0;
+                    double jtol = job_expect * 0.01; if (jtol < 1.0) jtol = 1.0;
+                    double jdiff = jd - job_expect; if (jdiff < 0) jdiff = -jdiff;
+                    if (jd > 0.0 && jdiff <= jtol) {
+                        printf("  %s  (%.1f MB, %.1fs)\n", base_of(joined).c_str(),
+                               (double)jsz / 1048576.0, jd);
+                        printf("  The whole input as one file, built from the %d slices above.\n",
+                               (int)job_outputs.size());
+                    } else {
+                        printf("  %s was written but runs %.1fs against the input's %.1fs — keep the "
+                               "slices; the join may have dropped the tail.\n",
+                               base_of(joined).c_str(), jd > 0.0 ? jd : 0.0, job_expect);
+                    }
+                } else {
+                    printf("  join FAILED — %s.\n", jr.second.c_str());
+                    printf("  The %d slices above are intact; concatenate them yourself or re-run.\n",
+                           (int)job_outputs.size());
+                }
+            }
             else printf("  ⇒ INCOMPLETE — %.1fs of %.1fs. The split LOST footage; do not report it as ok.\n",
                         job_expect - got, job_expect);
         }

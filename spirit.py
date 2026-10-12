@@ -820,10 +820,11 @@ def doctor(db, as_json=False):
 
 
 # ── fg: can THIS card actually carry frame-gen / upscale for a game? ────────────────────
-# Measured on the dev box 2026-10-09 (dma_buf bridge, RADV, pipelined, 64 MiB): the import lands in a
-# HOST-VISIBLE aperture heap, so these are aperture rates, NOT peer-VRAM rates. Re-measure on any
-# other machine — the numbers are a property of the LINKS, not of the tool.
-HANDOFF_GBPS = {"card0": 0.76, "card2": 0.25, "card3": 2.91}
+# The per-card transfer rates used here come from each card's OWN measured link (`link.gbps_max`),
+# so they are a property of the LINKS, not of the tool — re-measure on another machine.
+# ★ A by-card-name table of dev-box measurements (`HANDOFF_GBPS`) used to sit here and was NEVER READ
+# once fg() moved to link-derived rates. Deleted 2026-10-12 rather than left as a trap for the next
+# reader (outside read): a keyed table that looks measured and is dead is worse than no table.
 FRAME_MIB = {"1080p": 8.29, "1440p": 14.75, "4k": 33.18}
 
 
@@ -1109,10 +1110,22 @@ def _main_card(db):
     ★ RETURNS None ON A MACHINE WITH NO GPUs ( blocking item 7). It used to be `max([])`,
     which raised ValueError with a traceback in both `doctor` and `boost`. Every caller must handle
     None — a machine with no cards is a real (if rare) shape, not a crash.
+
+    ★ THE CARD ACTUALLY DRIVING A DISPLAY OUTRANKS A CARD MERELY PLUGGED IN (fix 2026-10-12, from the
+    outside read). `has_output` is built from a connector reading `connected` — and a cable in a port
+    that is not driving (DPMS off, a KVM, a second seat) reads `connected` too. So a strong card with a
+    cable in it and no lit output could out-score the real display card and take the game. `doctor` has
+    always judged the display card by the ACTIVE CRTC (`enabled`); `play` judged it by `has_output` +
+    score — two definitions of the single most important decision this tool makes, and they could
+    disagree. Order now: active CRTC, then connected, then top scorer. (On a FIXTURE there is no sysfs,
+    so `_enabled_connectors` is empty and this falls through exactly as it did before.)
     """
     gpus = db.get("gpus") or []
     if not gpus:
         return None
+    driving = [g for g in gpus if _enabled_connectors(g.get("card") or "")]
+    if driving:
+        return max(driving, key=score)
     panel = [g for g in gpus if g.get("has_output")]
     return max(panel or gpus, key=score)
 
@@ -1142,24 +1155,27 @@ def _va_driver(g):
 def _marginal(g):
     """Why this card's link is marginal, or None if it is fine.
 
-    ★ A REAL JOB DOES NOT REACH A MARGINAL CARD UNLESS THE USER NAMES IT (from outside design review,
-    2026-10-11). The incident this rule exists for is specific and already in the log: a benchmark that
-    enumerated every display device reached a card sitting on an external dock, the card latched its own
-    thermal alarm, and the machine went down. A user typing `spirit play --work film.mp4 -- game` did not
-    ask for that. A card on a narrow link is usable — it is just not a default we assume on their behalf.
-    `--spare <node>` includes it, and this is SAID, not done quietly.
+    ★ A REAL JOB DOES NOT REACH A NARROW-LINK CARD UNLESS THE USER NAMES IT (from outside design
+    review, and tightened 2026-10-12). The incident this rule exists for is specific and already in
+    the log: a benchmark that enumerated every display device reached a card sitting on an external
+    dock, the card latched its own thermal alarm, and the machine went down. A user typing `spirit
+    play --work film.mp4 -- game` did not ask for that. `--spare <node>` includes it, and this is
+    SAID, not done quietly.
+
+    ★ THE DEFAULT REQUIRES AN x8-OR-WIDER HOST LINK. It used to require only "wider than x4", which
+    excluded an x1 card but let an x4 card through — and x4 is exactly the shape the incident was:
+    an externally-docked card, an M.2/external adapter, or a shared-port card. The rule is on the
+    HOST link width, never on the card's own bridge ( see below), so a stranger's x4 slot card is
+    caught by the same line — it is usable, just not assumed. Name it with --spare to include it.
 
     ★ `capped_by_topology` IS NOT A PROXY FOR "BEHIND AN EXTERNAL BRIDGE" ( a blocking finding2).
-    It fires whenever the card's OWN bridge reports wider than the host gives — which is the NORMAL case
-    for every modern AMD card, because Vega, Navi and RDNA all contain an internal PCIe switch. An x8 or
-    x4 slot then read as "marginal" and was excluded by default, which is most of the "old card in a
-    drawer" audience this tool addresses: on the dev box it cut `spirit play --work film.mp4 --split --
-    game` down to ONE encoder (the integrated card) instead of the sample. A wide-but-capped card is not
-    the dock shape. A genuinely NARROW link (below x4) is, and that is the only rule left here.
+    It fires whenever the card's OWN bridge reports wider than the host gives — which is the NORMAL
+    case for every modern AMD card, because Vega, Navi and RDNA all contain an internal PCIe switch.
+    A wide-but-capped card is not the dock shape, so width is read from the HOST link only.
     """
     link = g.get("link") or {}
     w = link.get("max_width")
-    if w is not None and w < 4:
+    if w is not None and w < 8:
         return "x%s link at the host — too narrow to use unasked" % w
     return None
 
@@ -1246,6 +1262,46 @@ def _start_work(node, src, outdir, seg=None, va="radeonsi"):
             "-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-b:v", "8M", out]
     return out, subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                  env={**os.environ, "LIBVA_DRIVER_NAME": va})
+
+
+def _join_slices(parts, out_path):
+    """Concatenate the split pieces into ONE file, stream-copy (no re-encode).
+
+    ★ WHY THIS EXISTS (a held-release defect, 2026-10-12): `--split` divided a job correctly and
+    then handed the user N partial files with no way to get their video back as one file. The
+    division is the demonstration; the DELIVERABLE is the whole video. So once the split check
+    passes, the pieces are joined and the joined file is the output.
+
+    The pieces are KEPT beside it. They are the evidence that the work really was divided, and
+    deleting a user's files is not this tool's business.
+
+    Returns `(ok, detail)`. Never raises — a missing ffmpeg or an unwritable path is reported, not
+    thrown. `detail` carries NO interpolated OS/runtime error text, so all three builds agree.
+    """
+    lst = out_path + ".concat.txt"
+    try:
+        with open(lst, "w", encoding="utf-8") as fh:
+            for p in parts:
+                fh.write("file '%s'\n" % os.path.abspath(p).replace("'", "'\\''"))
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                            "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", out_path],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3600)
+        if r.returncode != 0 or not os.path.isfile(out_path):
+            return False, "ffmpeg could not join the pieces (rc=%d)" % r.returncode
+        return True, ""
+    except subprocess.SubprocessError:
+        return False, "the join did not finish in time (use the pieces)"
+    except OSError:
+        return False, "the join could not be started (check ffmpeg and the output path)"
+    finally:
+        try:
+            os.remove(lst)
+        except OSError:
+            pass
 
 
 # ── ORIGIN — the mark. Every run prints it; break it and the tool says so, loudly, forever.
@@ -2013,6 +2069,29 @@ def play(db, cmd, do_offload=True, scale=None, framegen=None, overlay=False,
             print("  original duration   : %.1fs" % job_expect)
             if written == len(job_outputs) and abs(total - job_expect) <= max(1.0, job_expect * 0.01):
                 print("  ⇒ COMPLETE — the pieces reconstruct the whole input (within 1%).")
+                # ★ ONE FILE BACK (a held-release defect, 2026-10-12). The split above proved the
+                # work was DIVIDED; this gives the user their video as ONE file again. The pieces
+                # stay on disk as the evidence; see _join_slices.
+                jstem = os.path.splitext(os.path.basename(work))[0] or "job"
+                joined = os.path.join(outdir, "%s.joined.mp4" % jstem)
+                ok_j, why_j = _join_slices([o for (_n, o, _p) in job_outputs], joined)
+                print("  ── ONE OUTPUT FILE " + "─" * 52)
+                if ok_j:
+                    jd = _media_duration(joined)
+                    if jd and abs(jd - job_expect) <= max(1.0, job_expect * 0.01):
+                        print("  %s  (%.1f MB, %.1fs)"
+                              % (os.path.basename(joined),
+                                 os.path.getsize(joined) / 1048576.0, jd))
+                        print("  The whole input as one file, built from the %d slices above."
+                              % len(job_outputs))
+                    else:
+                        print("  %s was written but runs %.1fs against the input's %.1fs — keep the "
+                              "slices; the join may have dropped the tail."
+                              % (os.path.basename(joined), jd or 0.0, job_expect))
+                else:
+                    print("  join FAILED — %s." % why_j)
+                    print("  The %d slices above are intact; concatenate them yourself or re-run."
+                          % len(job_outputs))
             else:
                 print("  ⇒ INCOMPLETE — %.1fs of %.1fs. The split LOST footage; do not report it as ok."
                       % (job_expect - total, job_expect))

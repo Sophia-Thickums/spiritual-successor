@@ -1351,3 +1351,125 @@ shape this file keeps finding, one level down.
 The `namespace-wall` item in STILL OPEN above is resolved (doctor probes the wall; UNKNOWN holds, never
 passes). The Intel VAAPI item still stands. **The release is HELD deliberately** — fix, verify, and
 overwrite the published history in one pass rather than shipping a moving target.
+
+
+---
+
+# ★★★★ THE RELEASE CANDIDATE — the two held defects closed, the switch put on the page (2026-10-12)
+
+The release was held on two defects found by RUNNING the page's job button, not by reading it. Both are
+closed, and the owner added a third requirement (the whole program's on/off switch, in the page).
+
+## 1. THE DEFAULT NO LONGER TOUCHES A NARROW-LINK CARD
+`_marginal` excluded links *narrower than x4*. The card on this box that has latched its own thermal alarm
+and taken the machine down sits on an **x4** link — so the one-click job was reaching it. The rule is now
+**x8 or wider by default**; anything narrower is named and requires `--spare`.
+Verified on real hardware: `probe` now shows only the integrated card (x16) as a default spare; the x4 and
+x1 cards are both named with the override. Fixture comments that still described the old rule were stale;
+the fixtures themselves already assumed x4 was excluded, so this restores intent.
+
+## 2. `--split` GIVES BACK ONE FILE
+New `_join_slices` concatenates the pieces (stream copy) into `<stem>.joined.mp4` after the split check
+passes; the joined file's own duration is checked against the input before it is announced; the pieces stay
+on disk beside it. Without this, `--split` left the user with N partial files and no whole video.
+**Real run, three builds, byte-identical output:** a 6.0 s 720p input split across two real cards →
+`clip.joined.mp4 (5.3 MB, 6.0s)`, on disk at 5,602,351 bytes, probing at 6.0 s.
+
+## 3. THE SWITCH IS ON THE PAGE
+A new "Keep it on" section: state line, Turn on / Turn off, and a checkbox for "after a reboot" (off by
+default — nothing armed at boot unless asked). The endpoint runs the tool's OWN `enable`/`disable`, so the
+page and the CLI cannot drift, and it reports state as the tool defines it (does the value reach a
+process), never "the button was pressed".
+**Proven with a fake HOME and a stubbed systemctl, so the real session was never armed:** 11/11 — page
+carries the switch, ON arms the manager and writes nothing for reboot, ON+persist writes the file, OFF
+clears the manager AND removes the file, and the real user session is byte-identical before/after.
+
+## ★ A PARITY FAULT FIX A MADE REACHABLE — found by the suite, not by reading
+Changing which cards are in the default set altered the fleet composition a fixture produces, which made a
+**Rust-only divergence reachable for the first time**: for an output whose duration could not be read, Rust
+printed `-1.0s` where Python and C++ printed `0.0s` (`media_duration` returns -1.0 for "unreadable"; Python
+stores `d or 0.0`). The suite went red on exactly that case. Fixed. This is the "a repair makes a neighbour
+divergence reachable" shape — the first thing to look for after any default-behaviour change.
+
+## CURRENT SUITE TOTALS (run by hand, this window)
+| harness | cases | result |
+|---|---|---|
+| `cpp/run_tests.sh` | 131 | **131 passed, 0 failed** |
+| `rust/test.sh`   | 149 | **149 passed, 0 failed** |
+
+A suite total is a record of AGREEMENT between the three builds. It is not evidence that the behaviour is
+correct, and every fault in this file that mattered was found by something outside the loop.
+
+## STILL OPEN (unchanged, stated so nobody reads this as finished)
+- The encoder path has only ever been run on AMD hardware; Intel is written but unrun.
+- The Intel VAAPI "written but never run" item still stands.
+- The outside reader has been run on this candidate; its findings are in `tools/OPUS-RELEASE-20261012.md`
+  and are acted on or refused in the open, never silently.
+
+
+---
+
+# ★★★★ THE OUTSIDE READ OF THE RELEASE CANDIDATE, AND WHAT CAME OF IT (2026-10-12)
+
+**Lane note, because it cost real time and will cost it again:** `claude-opus-5-5` **refused** the brief —
+`stop=refusal`, 78k in / 17.9k out, **zero characters**. Isolation: the BRIEF TEXT ALONE refused, and
+bisection found the trigger was *prose*, not the code — a chunk describing a page's anti-forgery token, a
+chunk describing a card overheating, and a chunk containing the word "attack" each refused on their own
+while near-identical chunks passed. **The refusals are not stable across chunks.** `claude-opus-4-8`
+answered the same brief with `stop=end_turn` on the first try. **A refusal is never an approval — say so,
+switch lanes, and get the read.** Record: `tools/OPUS-RELEASE-20261012.md`.
+
+## THE FINDING THAT MATTERED — `play` and `doctor` disagreed about the main card
+`_main_card` chose `max(panel, key=score)` where `panel` is cards with `has_output` — and `has_output` is
+"a connector reads **connected**". A cable in a port that is not driving (DPMS off, a KVM, a second seat)
+reads `connected` too. `doctor` has always judged the display card by the **active CRTC** (`enabled`). So
+on any box where a strong card has a cable in it and no lit output, `play` would pin the game to the wrong
+card and `doctor` would correctly call it a fault — **two definitions of the single most important decision
+the tool makes.** Worse: `spares` = everything that is not `main`, so the REAL display card could then be
+handed a job.
+
+**Fixed in all three builds:** order is now active CRTC → connected → top scorer. On a fixture there is no
+sysfs, so `enabled` is empty and behaviour falls through exactly as before — which is why the suites stay
+green and why this could only be found by reading.
+
+## THE REST OF THE READ, AND WHAT WAS DONE WITH IT
+| finding | verdict | action |
+|---|---|---|
+| `play`/`doctor` disagree on the main card (blocker) | **accepted** | fixed in Python, C++, Rust |
+| `--split` join is stream-copy across *different* encoders | **accepted as a limit** | README: a mixed-maker split is joined but not proven seam-clean; re-encode if it looks wrong |
+| split boundaries land on keyframes; the sum check is blind to seam gap/overlap | **accepted as a limit** | README, same section |
+| `HANDOFF_GBPS` dead constant, keyed by card name and never read | **accepted** | deleted (a table that looks measured and is dead is worse than none) |
+| `--spare` silently overrides the narrow-link rule | **accepted in part** | the override is by design and is already printed one line earlier ("NOT using … Add --spare"), so the user is told both the refusal and the way past it |
+| the page labelled an nvidia and a narrow-link card "available for jobs" | **accepted** | the cards table now says "cannot take jobs: no VAAPI encoder for …" and "x4 link, too narrow to use unasked" |
+| the page promises "your other cards" (plural) when one may encode | **accepted** | copy says "the cards that can take a job", and that the output names every card used and left out |
+| the reboot checkbox is meaningless for Turn off | **accepted** | copy says the box applies to Turn on only |
+| the persisted pin is frozen to today's topology | **accepted** | the page now says so; the README already did |
+| `DRI_PRIME` does not isolate Vulkan | **noted** | true and already scoped in the README; the pin is what isolates |
+| the UI re-runs `boost`/`probe`/`roles` on every page load | **noted, not changed** | three local subprocess calls on a page a human opens by hand |
+
+## ★ THE READER'S OWN CHALLENGE, ANSWERED — AND IT WAS A FAIR ONE
+The read questioned the "verified on hardware" transcript: two cards took split slices with no `--spare`
+shown, which the x8 rule should have prevented. **The transcript in the brief was mine and it was
+incomplete** — it was produced WITH `--spare renderD131,renderD130` naming both cards, and the harness line
+that shows the `--spare` was filtered out of the paste. Re-run today, plainly:
+
+```
+  job: NOT using renderD129 (Vega 10) — x4 link at the host — too narrow to use unasked
+  job: NOT using renderD130 (Vega 10 XTX) — x1 link at the host — too narrow to use unasked
+  split: only one spare card is eligible to work — replicating instead …
+  ★ JOB: transcoding clip.mp4 on 1 spare card(s) — real input, real output.
+```
+
+**So both halves are true and neither was wrong:** the x8 rule does exclude both narrow cards by default,
+and the earlier split was real and was produced by naming them. The lesson is about MY evidence, not the
+reader's suspicion: **a transcript pasted for review must be the command's whole output, or the reviewer
+will (correctly) read the gap as a contradiction.**
+
+## SUITE TOTALS AFTER ALL OF THIS (run by hand, this window)
+| harness | cases | result |
+|---|---|---|
+| `cpp/run_tests.sh` | 131 | **131 passed, 0 failed** |
+| `rust/test.sh`   | 149 | **149 passed, 0 failed** |
+
+Still AMD-only on the encoder path; Intel remains written-and-unrun. A green suite is AGREEMENT between the
+builds and nothing more — the blocker above was agreed on by all three.
