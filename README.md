@@ -160,6 +160,46 @@ way it cannot see what was added, which is why the tool carries its own witness.
 What the witness does not tell you is whether the invented frames *look right*. No counter can. That one
 you look at.
 
+## Offloading a job — the switch, and what it actually sets
+
+There are two ways to give your other cards work.
+
+**1. The built-in one — a transcode while you play.** This is the job the tool does itself:
+
+```
+spirit play --work lecture.mp4 --split -- ./yourgame
+```
+
+**2. The general one — pin any command to any card.** `spirit roles` says what each card is for; this
+puts a command on the card you name:
+
+```
+spirit run --role <role> --card <card> -- <your command>
+```
+
+| role | what it sets | for |
+|---|---|---|
+| `encode` | `SPIRIT_VAAPI_DEVICE` to that card's render node | recording, streaming, any ffmpeg VAAPI job — off the card your game is on |
+| `compute` | the Vulkan device pin plus `GGML_VK_VISIBLE_DEVICES` | a local model, Blender, an agent — process-level compute on a card that has the VRAM |
+| `analysis` | the same, aimed at the batch lane | video analysis, proxies, preview bakes — work with no deadline |
+
+Stream or record on a card that is not the one rendering your game:
+
+```
+spirit run --role encode --card card3 -- ffmpeg -vaapi_device "$SPIRIT_VAAPI_DEVICE" ...
+```
+
+Run a local model on the card with the most VRAM:
+
+```
+spirit run --role compute --card card0 -- ollama serve
+```
+
+**The honest limit: it sets the environment and pins the process — you bring the command.** There is no
+`spirit stream` or `spirit transcribe`, and nothing here knows what your command is for. What it
+guarantees is narrower and true: the process runs on the card you named, sees that card and not the
+others, and never touches the one your game is on.
+
 ## Install
 
 ```
@@ -208,6 +248,7 @@ spirit --version     print the version and exit
 spirit probe         list your cards and how each one is actually wired (the GB/s column is an estimate)
 spirit roles         describe what each card is and what it could take
 spirit play -- CMD   run a game on the right card; add --work FILE for a job on the others
+spirit run --role R --card N -- CMD   run CMD pinned to one card, and only that card (see Offloading a job)
 spirit boost         what extra frames this machine can give you, right now
 spirit ui            a local page showing your cards and what is available here
 ```
