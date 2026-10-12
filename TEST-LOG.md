@@ -1517,3 +1517,30 @@ was verified in all three builds and under a narrow `COLUMNS=20` terminal, so a 
 not misled. Changing the brace-list would either refactor the command dispatch (a three-build parity
 sweep) or hard-code a `usage:` string that contradicts the `positional arguments:` block argparse
 prints under it. Not worth it; the redundancy is harmless.
+
+### ★ CORRECTION to the suite totals above (same day, ~14:55) — a WEDGED CARD, not the build
+
+The paragraph above reads "on a BUSY box three live-box cases time out … the BOX, not the build." That was
+the right instinct and the wrong cause: **the machine was not busy — a card had left the PCI bus.** The
+MI25 wedged at 13:43:41 and the kernel looped its failed reset (about ten events a second), so
+`vulkaninfo` blocked on every invocation and doctor's per-card test child timed out on all four cards
+(4 × its 30 s timeout ≈ the 125 s doctor). That is what the suite's three failing cases reduce to — the
+two doctor cases and the real-gamescope case, all downstream of the same block. The dead card was removed
+from the bus; `vulkaninfo --summary` then returned in **22 ms** instead of hanging (one measurement, not a
+benchmark).
+
+**Both suites — ONE pass each, by hand, with the dead card removed:**
+| harness | cases | result |
+|---|---|---|
+| `cpp/run_tests.sh` | 132 | 132 passed, 0 failed |
+| `rust/test.sh`   | 150 | 150 passed, 0 failed |
+
+`doctor exit code 0 (all checks passed)` passed in that run. **The claim is narrower than "the suites are
+green":** it is green on this box with the wedged card gone. A pass with a working MI25 present is the
+earlier reading, not this one. Nothing in the new regression case or the C++ wording fix was implicated —
+the 129/3 and 149/1 readings were the wedge, and they were reported as the box at the time.
+
+**★ AND THE HAZARD IS STILL OPEN — this was a physical removal, not a code fix.** A card can leave the bus
+again; the kernel will loop its failed reset again; `vulkaninfo` will block again; and doctor will time out
+per card again. Doctor has no bounded liveness probe that tells "slow" from "dead". That gap is the real
+lesson here, and it is NOT closed.
